@@ -179,21 +179,24 @@ def _get_snippet(text_content: str, match_start: int, match_end: int, window_cha
 def extract_numbers_with_snippets_from_text(
     text_content: str,
     source_url: str,
+    original_input_company_name: str, # Added
     target_country_codes: Optional[List[str]] = None,
     snippet_window_chars: int = 300 # Default to 300 chars (150 on each side)
 ) -> List[Dict[str, str]]:
     """
-    Extracts phone numbers from text content, along with contextual snippets and source URL.
-    Snippets are character-based.
+    Extracts phone numbers from text content, along with contextual snippets, source URL,
+    and the original input company name. Snippets are character-based.
 
     Args:
         text_content (str): The text content to search within.
         source_url (str): The URL from which this text content was obtained.
+        original_input_company_name (str): The company name from the original input row.
         target_country_codes (Optional[List[str]]): Hints for parsing non-international numbers.
         snippet_window_chars (int): Total characters for the snippet (half before, half after match).
 
     Returns:
-        List[Dict[str, str]]: A list of dictionaries, each with "number", "snippet", "source_url".
+        List[Dict[str, str]]: A list of dictionaries, each with "number", "snippet",
+                                "source_url", and "original_input_company_name".
     """
     if not text_content.strip():
         logger.info(f"Text content from {source_url} is empty or contains only whitespace.")
@@ -233,9 +236,10 @@ def extract_numbers_with_snippets_from_text(
             results.append({
                 "number": e164_number,
                 "snippet": snippet,
-                "source_url": source_url
+                "source_url": source_url,
+                "original_input_company_name": original_input_company_name # Added
             })
-            logger.debug(f"Extracted for {source_url}: {e164_number}, Snippet around chars {match.start}-{match.end}")
+            logger.debug(f"Extracted for {source_url} (Orig Comp: {original_input_company_name}): {e164_number}, Snippet around chars {match.start}-{match.end}")
 
     except Exception as e:
         logger.error(f"Error during phone number matching/snippet extraction for {source_url}: {e}", exc_info=True)
@@ -244,25 +248,28 @@ def extract_numbers_with_snippets_from_text(
     return results
 
 
-def extract_phone_numbers_from_file(
+def extract_phone_numbers_from_file( # This function is mostly for testing/standalone use
     file_path: str,
+    original_input_company_name_for_file: str = "FromFile", # Added default for standalone use
     target_country_codes: Optional[List[str]] = None,
-    snippet_window_chars: int = 300 # Changed from lines to chars
+    snippet_window_chars: int = 300
 ) -> List[Dict[str, str]]:
     """
     Extracts phone numbers with context snippets from a text file.
+    (Primarily for testing/standalone use of this component)
 
     Reads text content from the file and uses `extract_numbers_with_snippets_from_text`
-    to get numbers, their surrounding text snippets, and the source URL (which will be
-    the file_path itself in this context).
+    to get numbers, their surrounding text snippets, the source URL (file_path),
+    and an original company name.
 
     Args:
         file_path (str): Path to the text file.
+        original_input_company_name_for_file (str): Company name to associate with this file.
         target_country_codes (Optional[List[str]]): Region hints for parsing.
         snippet_window_chars (int): Total characters for the snippet.
 
     Returns:
-        List[Dict[str, str]]: List of dicts, each with "number", "snippet", "source_url".
+        List[Dict[str, str]]: List of dicts, each with "number", "snippet", "source_url", "original_input_company_name".
     """
     if not file_path:
         logger.warning("File path is empty, cannot extract phone numbers.")
@@ -283,7 +290,8 @@ def extract_phone_numbers_from_file(
     # with the true source URL of the scraped page.
     return extract_numbers_with_snippets_from_text(
         text_content=text_content,
-        source_url=file_path, # Using file_path as source_url in this limited context
+        source_url=file_path,
+        original_input_company_name=original_input_company_name_for_file, # Pass it through
         target_country_codes=target_country_codes,
         snippet_window_chars=snippet_window_chars
     )

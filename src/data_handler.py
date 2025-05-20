@@ -321,17 +321,54 @@ def apply_phone_normalization(df: pd.DataFrame, phone_column: str = "GivenPhoneN
     return df
 
 
-def get_classification_priority(classification: str) -> int:
-    """Assigns a numerical priority to classifications for sorting/selection."""
-    priority_map = {
+def get_classification_priority(classification: str, phone_type: str) -> tuple[int, int]:
+    """
+    Assigns a numerical priority for sorting.
+    Primary key: classification.
+    Secondary key: phone_type preference.
+    Lower numbers are higher priority.
+    """
+    classification_priority_map = {
         "Primary": 1,
         "Secondary": 2,
         "Support": 3,
         "Low Relevance": 4,
         "Non-Business": 5,
-        "Unknown": 6 # Should ideally not be a final classification from LLM based on prompt
+        "Unknown": 6
     }
-    return priority_map.get(classification, 99) # Default to low priority if unknown
+    primary_prio = classification_priority_map.get(classification, 99)
+
+    # Define preference for types, especially within the same classification
+    # Lower number means it comes earlier in sort (higher preference)
+    type_priority_map = {
+        # Most preferred types
+        "Main Line": 1,
+        "Mainline": 1, # Alias
+        "Headquarters": 2,
+        "Zentrale": 2, # Alias for Headquarters/Main
+        "Reception": 3,
+        # Departmental / Specific important lines
+        "Sales": 10,
+        "Sales Department": 10,
+        "Customer Service": 11,
+        "Support": 12,
+        "Support Hotline": 12,
+        "Technical Support": 13,
+        "Info-Hotline": 15, # Give Info-Hotline a slightly lower preference than direct support/service
+        "RA-MICRO Online": 20, # Specific types from example
+        "Vertragsmanagement": 21, # Contract Management
+        "Direct Dial": 25,
+        "Mobile": 30,
+        # Less preferred, but still business relevant
+        "Fax": 80,
+        # Default for unknown/other types
+        "Unknown": 99
+    }
+    # Normalize type for lookup (e.g. lowercase, remove spaces if needed, though current types are fairly clean)
+    # For now, direct lookup.
+    secondary_prio = type_priority_map.get(phone_type, 90) # Default for types not explicitly listed
+
+    return (primary_prio, secondary_prio)
 
 def process_and_consolidate_contact_data(
     llm_results: List[PhoneNumberLLMOutput],
@@ -398,7 +435,8 @@ def process_and_consolidate_contact_data(
         current_number_info = ConsolidatedPhoneNumberSource(
             type=llm_item.type,
             source_path=source_path,
-            original_full_url=llm_item.source_url
+            original_full_url=llm_item.source_url,
+            original_input_company_name=llm_item.original_input_company_name # Added
         )
 
         if llm_item.number not in consolidated_numbers_map:
@@ -410,8 +448,6 @@ def process_and_consolidate_contact_data(
         else:
             # Number already seen, add this new source and update classification if higher priority
             existing_consolidated_number = consolidated_numbers_map[llm_item.number]
-            # Avoid adding duplicate source entries if the exact same path/type combo is somehow processed twice for the same number
-            # This check might be overly cautious if llm_results are inherently unique per source_url for a number
             is_duplicate_source = False
             for existing_source in existing_consolidated_number.sources:
                 if existing_source.original_full_url == current_number_info.original_full_url and \
@@ -421,15 +457,24 @@ def process_and_consolidate_contact_data(
             if not is_duplicate_source:
                 existing_consolidated_number.sources.append(current_number_info)
             
-            # Update classification if the new one is "better" (lower number is better)
-            current_priority = get_classification_priority(llm_item.classification)
-            existing_priority = get_classification_priority(existing_consolidated_number.classification)
-            if current_priority < existing_priority:
+            # Update classification if the new one is "better" (based on tuple comparison)
+            current_full_priority = get_classification_priority(llm_item.classification, llm_item.type)
+            existing_full_priority = get_classification_priority(existing_consolidated_number.classification, existing_consolidated_number.sources[0].type if existing_consolidated_number.sources else "Unknown") # Use type of first source as representative for existing
+
+            # Python's tuple comparison: (1, 10) < (1, 15) is True; (1, 10) < (2, 1) is True
+            if current_full_priority < existing_full_priority:
                 existing_consolidated_number.classification = llm_item.classification
+                # Note: The 'type' of the ConsolidatedPhoneNumber itself isn't a field.
+                # The overall classification is updated. The individual sources retain their original types.
     
     final_consolidated_list = sorted(
         list(consolidated_numbers_map.values()),
-        key=lambda x: get_classification_priority(x.classification)
+        # Sort by classification (primary key) then by the type of the *first source* as a secondary key.
+        # This assumes the first source's type is representative enough if multiple sources exist for a number.
+        # A more robust way might be to determine a "primary type" for the ConsolidatedPhoneNumber if types differ across sources.
+        # For now, using the type from the source that set the best classification, or just the first source.
+        # The classification itself is already the "best" one found.
+        key=lambda cons_phone: get_classification_priority(cons_phone.classification, cons_phone.sources[0].type if cons_phone.sources else "Unknown")
     )
 
     return CompanyContactDetails(

@@ -135,7 +135,7 @@ def main() -> None:
         'OtherRelevantNumbers': lambda: [[] for _ in range(len(df))], # Potentially for future use
         'ConfidenceScore': None, # Potentially for future use
         'LLMExtractedNumbers': lambda: [[] for _ in range(len(df))], # Stores raw list from LLM for a canonical URL - USAGE MAY CHANGE
-        'AllCompanyContacts': lambda: [None for _ in range(len(df))], # New column to store CompanyContactDetails object per input row
+        # 'AllCompanyContacts': lambda: [None for _ in range(len(df))], # Removed as per plan docs/top_contacts_report_refactor_plan_20250520_140819.md
         'LLMContextPath': '',
         'Notes': '',
         # New columns for the revised summary report
@@ -170,10 +170,11 @@ def main() -> None:
     globally_processed_urls: Set[str] = set() # Initialize the global set
     all_flattened_rows: List[Dict[str, Any]] = [] # For the detailed flattened report
     all_tertiary_rows: List[Dict[str, Any]] = [] # For the new tertiary report
-    # This will now store the CompanyContactDetails object, not just raw LLM outputs
-    canonical_site_consolidated_data: Dict[str, Optional[CompanyContactDetails]] = {}
-    canonical_site_scraper_status: Dict[str, str] = {} # Keep this to track scraper status for canonical URLs
-    input_to_canonical_map: Dict[str, Optional[str]] = {}
+    # This will store raw LLM outputs keyed by the pathful canonical URL from the scraper
+    canonical_site_raw_llm_outputs: Dict[str, List[PhoneNumberLLMOutput]] = {}
+    # This will store the scraper status keyed by the pathful canonical URL from the scraper
+    canonical_site_pathful_scraper_status: Dict[str, str] = {}
+    input_to_canonical_map: Dict[str, Optional[str]] = {} # Maps original input URL to its true_base_domain_for_row
 
     for i, (index, row_series) in enumerate(df.iterrows()):
         row: pd.Series = row_series
@@ -277,16 +278,20 @@ def main() -> None:
                 scrape_website(processed_url, run_output_dir, company_name, globally_processed_urls)
             )
             df.at[index, 'ScrapingStatus'] = scraper_status
-            df.at[index, 'CanonicalEntryURL'] = final_canonical_entry_url # Store it
+            # Store the TRUE BASE DOMAIN as the CanonicalEntryURL for the input row
+            true_base_domain_for_row = get_canonical_base_url(final_canonical_entry_url) if final_canonical_entry_url else None
+            df.at[index, 'CanonicalEntryURL'] = true_base_domain_for_row
             current_row_scraper_status = scraper_status # Keep for local logging within this iteration
             given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input" # Ensure it's defined for the current row
-            input_to_canonical_map[given_url_original_str_key] = final_canonical_entry_url
+            # input_to_canonical_map now maps original input URL to its true_base_domain_for_row
+            input_to_canonical_map[given_url_original_str_key] = true_base_domain_for_row
 
-            logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status: {current_row_scraper_status}, Canonical URL: {final_canonical_entry_url}")
+            logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status: {current_row_scraper_status}, Pathful Canonical URL from Scraper: {final_canonical_entry_url}, True Base Domain: {true_base_domain_for_row}")
 
-            if current_row_scraper_status == "Success" and final_canonical_entry_url:
-                if final_canonical_entry_url not in canonical_site_consolidated_data: # Process this canonical site for the first time
-                    logger.info(f"Processing new canonical URL for consolidation: {final_canonical_entry_url} (from input {given_url_original})")
+            if current_row_scraper_status == "Success" and final_canonical_entry_url: # final_canonical_entry_url is pathful here
+                # We collect raw LLM outputs per pathful_canonical_url. Consolidation per true_base_domain happens after this loop.
+                if final_canonical_entry_url not in canonical_site_raw_llm_outputs: # Process this pathful canonical URL for the first time
+                    logger.info(f"Processing new pathful canonical URL for LLM data collection: {final_canonical_entry_url} (from input {given_url_original})")
                     all_candidate_items_for_llm: List[Dict[str, str]] = []
                     if scraped_pages_details:
                         target_codes_raw: Any = row.get('TargetCountryCodes', [])
@@ -307,8 +312,11 @@ def main() -> None:
                                 try:
                                     with open(page_content_file, 'r', encoding='utf-8') as f_content:
                                         text_content = f_content.read()
+                                    # company_name is from the current input row (df.iterrows)
                                     page_candidate_items: List[Dict[str, str]] = extract_numbers_with_snippets_from_text(
-                                        text_content=text_content, source_url=source_page_url,
+                                        text_content=text_content,
+                                        source_url=source_page_url,
+                                        original_input_company_name=company_name, # Pass the original company name
                                         target_country_codes=target_codes_list_for_regex,
                                         snippet_window_chars=app_config.snippet_window_chars
                                     )
@@ -337,15 +345,9 @@ def main() -> None:
                                 prompt_template_abs_path = os.path.join(project_root_dir_local, prompt_template_abs_path)
 
                             if not os.path.exists(prompt_template_abs_path):
-                                logger.error(f"LLM prompt template file not found at {prompt_template_abs_path}. Cannot process canonical URL {final_canonical_entry_url}.")
-                                # Store empty consolidated data
-                                consolidated_data_for_site = process_and_consolidate_contact_data(
-                                    llm_results=[], # No LLM results due to prompt error
-                                    company_name_from_input=company_name, # company_name of the first row that triggered this canonical
-                                    initial_given_url=final_canonical_entry_url # Use canonical as the "initial" for this context
-                                )
-                                canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_for_site
-                                canonical_site_scraper_status[final_canonical_entry_url] = "Error_LLM_PromptMissing"
+                                logger.error(f"LLM prompt template file not found at {prompt_template_abs_path}. Cannot process pathful canonical URL {final_canonical_entry_url}.")
+                                canonical_site_raw_llm_outputs[final_canonical_entry_url] = [] # Store empty LLM results
+                                canonical_site_pathful_scraper_status[final_canonical_entry_url] = "Error_LLM_PromptMissing"
                             else:
                                 # Save LLM input candidates file, perhaps named with canonical URL context
                                 safe_canonical_name_for_file = "".join(c if c.isalnum() else "_" for c in final_canonical_entry_url.replace("http://","").replace("https://",""))
@@ -362,14 +364,8 @@ def main() -> None:
                                     llm_context_dir=llm_context_dir,
                                     file_identifier_prefix=f"CANONICAL_{safe_canonical_name_for_file}"
                                 )
-                                # Now, process and consolidate these LLM outputs
-                                consolidated_data_for_site = process_and_consolidate_contact_data(
-                                    llm_results=llm_classified_outputs,
-                                    company_name_from_input=company_name, # company_name of the first row that triggered this canonical
-                                    initial_given_url=final_canonical_entry_url # Use canonical as the "initial" for this context
-                                )
-                                canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_for_site
-                                canonical_site_scraper_status[final_canonical_entry_url] = current_row_scraper_status # Should be "Success"
+                                canonical_site_raw_llm_outputs[final_canonical_entry_url] = llm_classified_outputs
+                                canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status # Should be "Success"
                                 
                                 llm_raw_output_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_raw_output.json"
                                 llm_raw_output_filepath = os.path.join(llm_context_dir, llm_raw_output_filename)
@@ -379,26 +375,20 @@ def main() -> None:
                                     logger.info(f"LLM classification for canonical {final_canonical_entry_url} complete. Raw output saved to {llm_raw_output_filepath}")
                                 except IOError as e: logger.error(f"IOError saving raw LLM output for {final_canonical_entry_url} to {llm_raw_output_filepath}: {e}")
                         except Exception as llm_exc:
-                            logger.error(f"Error during LLM processing for canonical {final_canonical_entry_url}: {llm_exc}", exc_info=True)
-                            consolidated_data_on_error = process_and_consolidate_contact_data(
-                                llm_results=[], company_name_from_input=company_name, initial_given_url=final_canonical_entry_url
-                            )
-                            canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_on_error
-                            canonical_site_scraper_status[final_canonical_entry_url] = "Error_LLM_Processing"
-                    else: # No candidate items from regex for this new canonical site
-                        logger.info(f"No candidate snippets for LLM from canonical {final_canonical_entry_url}. Processing with empty LLM result.")
-                        consolidated_data_no_snippets = process_and_consolidate_contact_data(
-                            llm_results=[], company_name_from_input=company_name, initial_given_url=final_canonical_entry_url
-                        )
-                        canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_no_snippets
-                        canonical_site_scraper_status[final_canonical_entry_url] = current_row_scraper_status # "Success"
-                else: # This canonical URL's consolidated data is already cached.
-                    logger.info(f"Consolidated data for canonical URL {final_canonical_entry_url} already cached. Input row {given_url_original} maps to it.")
+                            logger.error(f"Error during LLM processing for pathful canonical {final_canonical_entry_url}: {llm_exc}", exc_info=True)
+                            canonical_site_raw_llm_outputs[final_canonical_entry_url] = []
+                            canonical_site_pathful_scraper_status[final_canonical_entry_url] = "Error_LLM_Processing"
+                    else: # No candidate items from regex for this new pathful canonical site
+                        logger.info(f"No candidate snippets for LLM from pathful canonical {final_canonical_entry_url}. Storing empty LLM result.")
+                        canonical_site_raw_llm_outputs[final_canonical_entry_url] = []
+                        canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status # "Success"
+                else: # Raw LLM data for this pathful canonical URL is already cached.
+                    logger.info(f"Raw LLM data for pathful canonical URL {final_canonical_entry_url} already cached. Input row {given_url_original} maps to it.")
             
             elif current_row_scraper_status != "Success": # Scraping failed for this input_row
                 logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status '{current_row_scraper_status}'. No LLM processing for this input.")
-                if final_canonical_entry_url and final_canonical_entry_url not in canonical_site_scraper_status: # Store failure status for canonical if not already there
-                    canonical_site_scraper_status[final_canonical_entry_url] = current_row_scraper_status
+                if final_canonical_entry_url and final_canonical_entry_url not in canonical_site_pathful_scraper_status: # Store failure status for pathful canonical if not already there
+                    canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status
                 # For summary report, ensure Overall_VerificationStatus reflects this scrape failure
                 df.at[index, 'Overall_VerificationStatus'] = f'Unverified_Scrape_{current_row_scraper_status}'
                 df.at[index, 'Original_Number_Status'] = f'Scrape_{current_row_scraper_status}' if row.get('NormalizedGivenPhoneNumber') else 'Original_Not_Provided'
@@ -429,11 +419,95 @@ def main() -> None:
                 df.at[index, 'Original_Number_Status'] = 'Error_Pass1_RowProcessing'
 
     # --- After the main loop (End of Pass 1) ---
-    logger.info(f"Pass 1 (Scraping and Data Consolidation) complete. Processed {len(df)} input rows.")
-    logger.info(f"Unique canonical sites for which data consolidation was attempted/cached: {len(canonical_site_consolidated_data)}")
-    logger.debug(f"Canonical site consolidated data cache keys: {list(canonical_site_consolidated_data.keys())}")
-    logger.debug(f"Canonical site scraper status cache: {list(canonical_site_scraper_status.keys())}") # Log keys for brevity
-    logger.debug(f"Input to Canonical URL map entries: {len(input_to_canonical_map)}")
+    logger.info(f"Pass 1 (Scraping and Raw LLM Data Collection) complete. Processed {len(df)} input rows.")
+    logger.info(f"Unique pathful canonical sites for which raw LLM data was collected: {len(canonical_site_raw_llm_outputs)}")
+    logger.debug(f"Pathful canonical site raw LLM data cache keys: {list(canonical_site_raw_llm_outputs.keys())}")
+    logger.debug(f"Pathful canonical site scraper status cache: {list(canonical_site_pathful_scraper_status.keys())}")
+    logger.debug(f"Input to True Base Domain map entries: {len(input_to_canonical_map)}")
+
+    # --- New Global Consolidation Step (Consolidate raw LLM outputs by TRUE BASE DOMAIN) ---
+    logger.info("Starting Global Consolidation of LLM data by True Base Domain...")
+    final_consolidated_data_by_true_base: Dict[str, Optional[CompanyContactDetails]] = {}
+    # Map: true_base_domain -> list of pathful_canonical_urls that belong to it
+    true_base_to_pathful_map: Dict[str, List[str]] = {}
+    # Map: true_base_domain -> list of original company names from input that map to it
+    true_base_to_input_company_names: Dict[str, Set[str]] = {}
+    # Map: true_base_domain -> final scraper status (e.g. if one path succeeded, it's success)
+    true_base_scraper_status: Dict[str, str] = {}
+
+
+    for pathful_url_key, raw_llm_list in canonical_site_raw_llm_outputs.items():
+        true_base = get_canonical_base_url(pathful_url_key)
+        if not true_base:
+            logger.warning(f"Could not get true_base_domain for pathful_url_key '{pathful_url_key}' during global consolidation. Skipping.")
+            continue
+        
+        if true_base not in true_base_to_pathful_map:
+            true_base_to_pathful_map[true_base] = []
+            true_base_to_input_company_names[true_base] = set()
+            true_base_scraper_status[true_base] = "Unknown" # Initialize
+        
+        true_base_to_pathful_map[true_base].append(pathful_url_key)
+        
+        # Update scraper status for the true_base_domain
+        current_pathful_status = canonical_site_pathful_scraper_status.get(pathful_url_key, "Unknown")
+        if true_base_scraper_status[true_base] == "Unknown" or \
+           (current_pathful_status == "Success" and true_base_scraper_status[true_base] != "Success") or \
+           ("Error" not in current_pathful_status and "Error" in true_base_scraper_status[true_base]): # Prefer non-error or success
+            true_base_scraper_status[true_base] = current_pathful_status
+
+
+    # Collect original company names for each true_base_domain by looking up input_df
+    # This assumes df['CanonicalEntryURL'] now stores the true_base_domain
+    if 'CanonicalEntryURL' in df.columns and 'CompanyName' in df.columns:
+        for true_base_domain_key in true_base_to_pathful_map.keys():
+            # Find all input rows that map to this true_base_domain_key
+            # Ensure df['CanonicalEntryURL'] is not None before comparing
+            mask = df['CanonicalEntryURL'].notna() & (df['CanonicalEntryURL'] == true_base_domain_key)
+            matching_companies = df.loc[mask, 'CompanyName'].dropna().astype(str).unique()
+            if len(matching_companies) > 0:
+                 true_base_to_input_company_names[true_base_domain_key].update(matching_companies)
+            else: # Fallback if no direct match in df (e.g. if df['CanonicalEntryURL'] wasn't perfectly set)
+                 # Try to find first company name from the pathful URLs that triggered this true_base
+                 first_pathful_for_base = true_base_to_pathful_map[true_base_domain_key][0]
+                 # This requires iterating df again to find which input row led to first_pathful_for_base
+                 # This part is complex to get right without more context on how initial company name was passed to process_and_consolidate
+                 # For now, we'll rely on the df lookup. If empty, the company name in CompanyContactDetails will be from the *first* pathful URL's trigger.
+                 logger.warning(f"No matching company names found in df for true_base_domain '{true_base_domain_key}'. Company name in report might be from first pathful trigger.")
+
+
+    for true_base_domain, list_of_pathful_urls in true_base_to_pathful_map.items():
+        all_llm_results_for_this_true_base: List[PhoneNumberLLMOutput] = []
+        for pathful_url_item in list_of_pathful_urls:
+            all_llm_results_for_this_true_base.extend(canonical_site_raw_llm_outputs.get(pathful_url_item, []))
+        
+        # Determine a representative company name for this true_base_domain for process_and_consolidate_contact_data
+        # This name is primarily for the CompanyContactDetails object, not necessarily the final report name.
+        # The final report name will be constructed later using all names from true_base_to_input_company_names.
+        representative_company_name_for_consolidation = "Unknown"
+        if true_base_to_input_company_names.get(true_base_domain):
+            representative_company_name_for_consolidation = sorted(list(true_base_to_input_company_names[true_base_domain]))[0]
+        elif list_of_pathful_urls: # Fallback: try to find an original company name from one of the input rows that led to these pathful URLs
+            # This is tricky; for now, use a generic or the first one found during earlier processing if available.
+            # The `company_name` argument to `process_and_consolidate_contact_data` is Optional.
+            # Let's find the company name from the first input row that generated any of the pathful_urls.
+            # This requires iterating df again or having a map from pathful_url to original input company name.
+            # For simplicity now, we might pass None or a generic name if not easily found.
+            # The `company_name` field in `CompanyContactDetails` is optional.
+            # The `company_name` used in `process_and_consolidate_contact_data` is the one from the *first* input row that triggered the processing of a *pathful* canonical URL.
+            # We can try to retrieve that.
+            # Find an input row that generated one of these pathful URLs.
+            # This is complex. Let's pass the first company name from the collected set for this true_base_domain.
+            pass
+
+
+        final_consolidated_data_by_true_base[true_base_domain] = process_and_consolidate_contact_data(
+            llm_results=all_llm_results_for_this_true_base,
+            company_name_from_input=representative_company_name_for_consolidation, # Use the representative name
+            initial_given_url=true_base_domain # Use the true_base_domain as the "initial URL" for this consolidation scope
+        )
+    logger.info(f"Global Consolidation complete. {len(final_consolidated_data_by_true_base)} true base domains processed.")
+
 
 # Define column order for Excel exports (moved here for clarity before Pass 2)
     detailed_columns_order = [
@@ -474,7 +548,7 @@ def main() -> None:
         'CompanyName',
         'GivenURL',
         'CanonicalEntryURL',
-        'Description',
+        # 'Description', # Removed as per plan docs/top_contacts_report_refactor_plan_20250520_140819.md
         'ScrapingStatus', # This will map to ScrapingStatus_Canonical
         'PhoneNumber_1',
         'PhoneNumber_2',
@@ -488,6 +562,7 @@ def main() -> None:
     logger.info("Starting Pass 2: Building Detailed Flattened and Summary Reports...")
 
     # A. Detailed Flattened Report - Populate all_flattened_rows
+    # This report iterates original input rows. For each, it finds the consolidated data for its true base domain.
     classification_precedence = { # Define once for de-duplication
         'Primary': 1, 'Secondary': 2, 'Support': 3,
         'Low Relevance': 4, 'Non-Business': 5, None: 99
@@ -499,12 +574,15 @@ def main() -> None:
         canonical_url_pass2 = original_row_data.get('CanonicalEntryURL')
         scraper_status_pass2 = original_row_data.get('ScrapingStatus')
 
-        # Access consolidated data
+        # Access consolidated data using the true_base_domain_for_row (which is canonical_url_pass2)
         company_contact_details_pass2: Optional[CompanyContactDetails] = None
-        if canonical_url_pass2 and canonical_url_pass2 in canonical_site_consolidated_data:
-            company_contact_details_pass2 = canonical_site_consolidated_data[canonical_url_pass2]
+        if canonical_url_pass2 and canonical_url_pass2 in final_consolidated_data_by_true_base: # Use new global data
+            company_contact_details_pass2 = final_consolidated_data_by_true_base[canonical_url_pass2]
+        
+        # Use scraper status for the true_base_domain
+        scraper_status_for_true_base_detailed = true_base_scraper_status.get(str(canonical_url_pass2), "Unknown") if canonical_url_pass2 else "Unknown_NoTrueBase"
 
-        if scraper_status_pass2 == "Success" and company_contact_details_pass2 and company_contact_details_pass2.consolidated_numbers:
+        if scraper_status_for_true_base_detailed == "Success" and company_contact_details_pass2 and company_contact_details_pass2.consolidated_numbers:
             # Iterate through sorted consolidated numbers
             for consolidated_number_item in company_contact_details_pass2.consolidated_numbers:
                 # For the detailed report, we want to show each unique number and its aggregated sources.
@@ -532,7 +610,7 @@ def main() -> None:
                     'LLM_Type': llm_type_str, # Aggregated types
                     'LLM_Classification': consolidated_number_item.classification, # Best classification for this number
                     'LLM_Source_URL': llm_source_url_str, # Aggregated source URLs
-                    'ScrapingStatus': canonical_site_scraper_status.get(str(canonical_url_pass2), scraper_status_pass2) if canonical_url_pass2 else scraper_status_pass2,
+                    'ScrapingStatus': scraper_status_for_true_base_detailed, # Use status of true_base_domain
                     'TargetCountryCodes': original_row_data.get('TargetCountryCodes'),
                     'RunID': run_id # Uses the date/time-based run_id
                 }
@@ -540,61 +618,116 @@ def main() -> None:
             # else: No unique relevant numbers from LLM for this successfully scraped canonical site - no row in detailed.
         # else: Scraping failed or no canonical URL or no consolidated data for this canonical - no row in detailed.
         
-        # C. Tertiary Report - Populate all_tertiary_rows
-        # This report is per input row, showing top 3 numbers from its canonical URL
+        # Old Tertiary report logic removed here. It will be rebuilt after this loop.
+
+    # --- End of Loop for Detailed Flattened Report (and old Tertiary) ---
+
+    # --- New Aggregation Step for Top_Contacts_Report (Tertiary Report) ---
+    logger.info("Starting Aggregation for Top_Contacts_Report...")
+    top_contacts_aggregation_map: Dict[str, Dict[str, Any]] = {}
+
+    if 'CanonicalEntryURL' not in df.columns:
+        logger.error("'CanonicalEntryURL' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to None.")
+        df['CanonicalEntryURL'] = None
+    if 'CompanyName' not in df.columns:
+        logger.error("'CompanyName' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to 'Unknown_Input_Company'.")
+        df['CompanyName'] = "Unknown_Input_Company"
+    if 'GivenURL' not in df.columns:
+        logger.error("'GivenURL' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to 'Unknown_Input_GivenURL'.")
+        df['GivenURL'] = "Unknown_Input_GivenURL"
+
+    # This loop iterates through final_consolidated_data_by_true_base which is already keyed by true_base_domain
+    for true_base_domain_key_agg, company_contact_details_object in final_consolidated_data_by_true_base.items():
+        if company_contact_details_object is None:
+            logger.warning(f"Skipping true_base_domain '{true_base_domain_key_agg}' for Top_Contacts_Report aggregation as its CompanyContactDetails is None.")
+            continue
+
+        # Find all original input rows from df that map to this true_base_domain_key_agg
+        # df['CanonicalEntryURL'] should store the true_base_domain
+        matching_input_rows = df[df['CanonicalEntryURL'].astype(str) == str(true_base_domain_key_agg)]
+
+        unique_original_company_names: Set[str]
+        unique_original_given_urls: Set[str]
+
+        if matching_input_rows.empty:
+            logger.warning(f"No input rows found in df mapping to true_base_domain '{true_base_domain_key_agg}'. "
+                           f"Using company name ('{company_contact_details_object.company_name}') from CompanyContactDetails and its original_input_urls as fallback.")
+            unique_original_company_names = {str(company_contact_details_object.company_name)} if company_contact_details_object.company_name else {"Unknown_Company"}
+            unique_original_given_urls = set(map(str, company_contact_details_object.original_input_urls))
+        else:
+            unique_original_company_names = set(matching_input_rows['CompanyName'].dropna().astype(str))
+            unique_original_given_urls = set(matching_input_rows['GivenURL'].dropna().astype(str))
+            if not unique_original_company_names:
+                 unique_original_company_names = {str(company_contact_details_object.company_name)} if company_contact_details_object.company_name else {"Unknown_Company"}
+            if not unique_original_given_urls:
+                 unique_original_given_urls = set(map(str, company_contact_details_object.original_input_urls))
+
+        report_company_name = f"{true_base_domain_key_agg} - {' - '.join(sorted(list(unique_original_company_names)))}"
+        report_given_urls = ", ".join(sorted(list(unique_original_given_urls)))
         
-        # Reuse unique_sorted_llm_numbers from summary report logic if already computed for this canonical_url_pass2
-        # For tertiary report, we need to re-fetch/re-calculate unique_sorted_llm_numbers based on original_row_data's canonical URL
+        top_contacts_aggregation_map[true_base_domain_key_agg] = {
+            "report_company_name": report_company_name,
+            "report_given_urls": report_given_urls,
+            "canonical_entry_url": true_base_domain_key_agg, # This is the true base domain
+            "scraper_status": true_base_scraper_status.get(true_base_domain_key_agg, "Unknown"), # Use status for true_base_domain
+            "contact_details": company_contact_details_object,
+            "all_input_companies_for_canonical": sorted(list(unique_original_company_names))
+        }
+    logger.info(f"Aggregation for Top_Contacts_Report complete. Found {len(top_contacts_aggregation_map)} unique canonical URLs to report on.")
+
+    # C. Top_Contacts_Report (formerly Tertiary Report) - Populate all_tertiary_rows from aggregated data
+    logger.info("Building Top_Contacts_Report (formerly Tertiary) from aggregated data...")
+    all_tertiary_rows.clear()
+
+    for aggregated_entry in top_contacts_aggregation_map.values():
+        company_contact_details_for_report = aggregated_entry["contact_details"]
         
-        # company_contact_details_pass2 is already fetched above
-        
-        # The consolidated_numbers list is already sorted by classification priority
-        sorted_consolidated_numbers_for_tertiary: List[ConsolidatedPhoneNumber] = []
-        if company_contact_details_pass2:
-            sorted_consolidated_numbers_for_tertiary = company_contact_details_pass2.consolidated_numbers
-            
         new_tertiary_row: Dict[str, Any] = {
-            'CompanyName': company_name_pass2,
-            'GivenURL': given_url_pass2,
-            'CanonicalEntryURL': canonical_url_pass2,
-            'Description': original_row_data.get('Description'),
-            'ScrapingStatus': canonical_site_scraper_status.get(str(canonical_url_pass2), scraper_status_pass2) if canonical_url_pass2 else scraper_status_pass2,
+            'CompanyName': aggregated_entry["report_company_name"],
+            'GivenURL': aggregated_entry["report_given_urls"],
+            'CanonicalEntryURL': aggregated_entry["canonical_entry_url"],
+            'ScrapingStatus': aggregated_entry["scraper_status"],
             'PhoneNumber_1': None, 'PhoneNumber_2': None, 'PhoneNumber_3': None,
             'SourceURL_1': None, 'SourceURL_2': None, 'SourceURL_3': None
         }
 
-        if sorted_consolidated_numbers_for_tertiary:
-            num_item = sorted_consolidated_numbers_for_tertiary[0]
-            types_ter_1 = ", ".join(list(set(s.type for s in num_item.sources))) # Unique types
-            sources_ter_1 = ", ".join(list(set(s.original_full_url for s in num_item.sources))) # Unique URLs
-            new_tertiary_row['PhoneNumber_1'] = f"{num_item.number} ({types_ter_1})" if types_ter_1 else num_item.number
-            new_tertiary_row['SourceURL_1'] = sources_ter_1
-        if len(sorted_consolidated_numbers_for_tertiary) > 1:
-            num_item = sorted_consolidated_numbers_for_tertiary[1]
-            types_ter_2 = ", ".join(list(set(s.type for s in num_item.sources)))
-            sources_ter_2 = ", ".join(list(set(s.original_full_url for s in num_item.sources)))
-            new_tertiary_row['PhoneNumber_2'] = f"{num_item.number} ({types_ter_2})" if types_ter_2 else num_item.number
-            new_tertiary_row['SourceURL_2'] = sources_ter_2
-        if len(sorted_consolidated_numbers_for_tertiary) > 2:
-            num_item = sorted_consolidated_numbers_for_tertiary[2]
-            types_ter_3 = ", ".join(list(set(s.type for s in num_item.sources)))
-            sources_ter_3 = ", ".join(list(set(s.original_full_url for s in num_item.sources)))
-            new_tertiary_row['PhoneNumber_3'] = f"{num_item.number} ({types_ter_3})" if types_ter_3 else num_item.number
-            new_tertiary_row['SourceURL_3'] = sources_ter_3
+        if company_contact_details_for_report and company_contact_details_for_report.consolidated_numbers:
+            # all_input_companies_str = ", ".join(aggregated_entry["all_input_companies_for_canonical"]) # Keep this for the main CompanyName column if needed, but for individual numbers, derive from sources.
+
+            for i, consolidated_number_item in enumerate(company_contact_details_for_report.consolidated_numbers[:3]):
+                phone_num_key = f'PhoneNumber_{i+1}'
+                source_url_key = f'SourceURL_{i+1}'
+                
+                number_str = consolidated_number_item.number
+                types_str = ", ".join(sorted(list(set(s.type for s in consolidated_number_item.sources))))
+                
+                # Get unique original input company names specifically for *this* phone number's sources
+                companies_for_this_number = sorted(list(set(
+                    s.original_input_company_name
+                    for s in consolidated_number_item.sources
+                    if s.original_input_company_name
+                )))
+                companies_for_this_number_str = ", ".join(companies_for_this_number) if companies_for_this_number else "UnknownCompany" # Fallback if somehow empty
+
+                new_tertiary_row[phone_num_key] = f"{number_str} ({types_str}) [{companies_for_this_number_str}]"
+                new_tertiary_row[source_url_key] = ", ".join(sorted(list(set(s.original_full_url for s in consolidated_number_item.sources))))
         
         all_tertiary_rows.append(new_tertiary_row)
+    logger.info(f"Finished building Top_Contacts_Report. {len(all_tertiary_rows)} rows created.")
 
 
-    # B. Summary Report - Populate specific columns in main 'df'
+    # B. Summary Report - Populate specific columns in main 'df' (This section remains per-input-row)
     for index, row_summary in df.iterrows():
         given_url_summary = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
+        # canonical_url_summary is the true_base_domain for this input row
         canonical_url_summary = row_summary.get('CanonicalEntryURL')
-        scraper_status_summary = row_summary.get('ScrapingStatus')
+        # scraper_status_summary_original_pass1 is the original scraper status from Pass 1 for the input row's specific pathful URL processing
+        scraper_status_summary_original_pass1 = row_summary.get('ScrapingStatus')
 
-        # Get the consolidated data for this canonical URL
+        # Get the globally consolidated data for this true_base_domain (canonical_url_summary)
         company_contact_details_summary: Optional[CompanyContactDetails] = None
-        if canonical_url_summary and canonical_url_summary in canonical_site_consolidated_data:
-            company_contact_details_summary = canonical_site_consolidated_data[canonical_url_summary]
+        if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base:
+            company_contact_details_summary = final_consolidated_data_by_true_base[canonical_url_summary]
 
         # The consolidated_numbers list is already de-duplicated and sorted by classification
         unique_sorted_consolidated_numbers: List[ConsolidatedPhoneNumber] = []
@@ -649,30 +782,37 @@ def main() -> None:
         # Determine Overall_VerificationStatus (This is a general status for the row, can be simplified or enhanced based on new top numbers)
         # For now, let's base it on whether any top LLM number was found.
         overall_status = "Unverified" # Default
-        if scraper_status_summary != "Success":
-            overall_status = f"Unverified_Scrape_{scraper_status_summary}"
-        elif unique_sorted_consolidated_numbers: # If any top number was found
+        # Determine overall_status based on the true_base_domain's consolidated data and scraper status
+        scraper_status_for_true_base_domain_summary = true_base_scraper_status.get(str(canonical_url_summary), "Unknown") if canonical_url_summary else "Unknown_NoTrueBase"
+
+        if scraper_status_for_true_base_domain_summary != "Success":
+            overall_status = f"Unverified_Scrape_{scraper_status_for_true_base_domain_summary}"
+        elif unique_sorted_consolidated_numbers: # If any top number was found in the consolidated data for the true_base_domain
             overall_status = "Verified_LLM_Match_Found"
-        # If consolidated data exists for this canonical URL but has no numbers
-        elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers:
-            overall_status = "Unverified_LLM_NoRelevantNumbers" # Simplified
-        elif canonical_url_summary and canonical_site_scraper_status.get(canonical_url_summary) == "Error_LLM_Processing":
+        elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers: # True base domain processed, but no relevant numbers
+            overall_status = "Unverified_LLM_NoRelevantNumbers"
+        elif scraper_status_for_true_base_domain_summary == "Error_LLM_Processing":
             overall_status = "Error_LLM_Processing_For_Canonical"
-        elif canonical_url_summary and canonical_site_scraper_status.get(canonical_url_summary) == "Error_LLM_PromptMissing":
+        elif scraper_status_for_true_base_domain_summary == "Error_LLM_PromptMissing":
             overall_status = "Error_LLM_PromptMissing_For_Canonical"
-        # else: stays "Unverified" if scrape was success but no LLM results for canonical (e.g. no regex snippets, or LLM not triggered)
+        # else: remains "Unverified" if true_base_domain was success but LLM found nothing relevant (covered by Unverified_LLM_NoRelevantNumbers)
+        # else: stays "Unverified"
         
         # Prepend redirect info if applicable
+        # input_to_canonical_map stores true_base_domain for the original input URL
         original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
-        if canonical_url_summary and input_to_canonical_map.get(original_input_url_for_map) != original_input_url_for_map : # Check if it was actually different from input
-             # Check if the original input URL (if valid) is different from the canonical one
-            normalized_original_for_comparison = normalize_url(original_input_url_for_map) if original_input_url_for_map != "None_GivenURL_Input" else None
-            if normalized_original_for_comparison and normalized_original_for_comparison != canonical_url_summary:
-                 overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
+        true_base_domain_from_map = input_to_canonical_map.get(original_input_url_for_map) # This is already a true base domain
+
+        # Compare the original input URL (after normalization to a base domain) with the true_base_domain stored for the row
+        normalized_original_input_base = get_canonical_base_url(original_input_url_for_map) if original_input_url_for_map != "None_GivenURL_Input" else None
+        
+        if canonical_url_summary and normalized_original_input_base and normalized_original_input_base != canonical_url_summary:
+            # This means the original input URL's base domain was different from the final canonical base domain for this row (e.g. major redirect)
+            overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
         
         df.at[index, 'Overall_VerificationStatus'] = overall_status
-        df.at[index, 'ScrapingStatus_Canonical'] = canonical_site_scraper_status.get(str(canonical_url_summary), scraper_status_summary) if canonical_url_summary is not None else scraper_status_summary
-        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None else (canonical_site_scraper_status.get(str(canonical_url_summary), "Not_Processed_Or_Scrape_Failed") if canonical_url_summary is not None else "Not_Processed_Or_Scrape_Failed")
+        df.at[index, 'ScrapingStatus_Canonical'] = scraper_status_for_true_base_domain_summary # Use status of true_base_domain
+        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None else scraper_status_for_true_base_domain_summary
 
 
     # Create and save Detailed Flattened Report

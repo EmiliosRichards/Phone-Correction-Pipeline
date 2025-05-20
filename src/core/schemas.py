@@ -18,11 +18,14 @@ class PhoneNumberLLMOutput(BaseModel):
                               'Secondary', 'Support', 'Low Relevance', 'Non-Business').
         source_url (Optional[str]): The source URL from which the number was originally found.
                                     This field is populated programmatically, not by the LLM.
+        original_input_company_name (Optional[str]): The company name from the original input row
+                                                     that led to this number being found via this source_url.
     """
     number: str = Field(description="The phone number, ideally in E.164 international format.")
     type: str = Field(description="The type or context of the number (e.g., 'Main Line', 'Sales', 'Support', 'Fax').")
     classification: str = Field(description="LLM's quality/relevance assessment (e.g., 'Primary', 'Secondary', 'Support', 'Low Relevance', 'Non-Business').")
     source_url: Optional[str] = Field(default=None, description="The source URL from which the number was originally found.")
+    original_input_company_name: Optional[str] = Field(default=None, description="Original input company name for this source.")
 
 class LLMExtractionResult(BaseModel):
     """
@@ -47,6 +50,7 @@ class ConsolidatedPhoneNumberSource(BaseModel):
     type: str = Field(description="The perceived type of the number from this specific source (e.g., 'Sales', 'Support').")
     source_path: str = Field(description="The path or specific part of the URL where this number type was identified (e.g., '/contact', '/about/locations/berlin').")
     original_full_url: str = Field(description="The original full URL from which this number was extracted.")
+    original_input_company_name: Optional[str] = Field(default=None, description="Original input company name associated with this specific source.")
 
 class ConsolidatedPhoneNumber(BaseModel):
     """

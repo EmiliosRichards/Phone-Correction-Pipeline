@@ -179,9 +179,9 @@ class GeminiLLMExtractor:
         Args:
             candidate_items (List[Dict[str, str]]): A list of dictionaries, where each
                                                    dictionary contains "candidate_number",
-                                                   "snippet", and "source_url".
-            prompt_template_path (str): The file path to the prompt template. The template
-                                        should expect a JSON list of these candidate items.
+                                                   "snippet", "source_url", and "original_input_company_name".
+           prompt_template_path (str): The file path to the prompt template. The template
+                                       should expect a JSON list of these candidate items.
             llm_context_dir (str): The directory path to save LLM context files.
             file_identifier_prefix (str): A prefix for naming LLM context files (e.g., "CANONICAL_domain_com").
 
@@ -284,25 +284,25 @@ class GeminiLLMExtractor:
 
                         # Create a mapping from input candidate_number to its source_url
                         # The candidate_items are available in the outer scope of this method.
-                        # candidate_items: List[Dict[str, str]], where each dict has "number", "source_url", "snippet"
-                        source_url_map = {
-                            item['number']: item['source_url']
+                        # Each dict in candidate_items now also has "original_input_company_name".
+                        candidate_details_map = {
+                            item['number']: {
+                                'source_url': item['source_url'],
+                                'original_input_company_name': item.get('original_input_company_name') # Use .get for safety
+                            }
                             for item in candidate_items
                         }
 
-                        # Populate source_url and re-normalize phone numbers
+                        # Populate source_url, original_input_company_name and re-normalize phone numbers
                         for llm_output in validated_numbers:
-                            # Populate source_url
-                            # llm_output.number should already be E.164 normalized by the LLM or earlier regex stage.
-                            # If not, this matching might be less reliable.
-                            # Assuming llm_output.number is the key to find in source_url_map.
-                            # The input candidate_number to LLM is already E.164.
-                            # The LLM is asked to return the original E.164 number.
-                            # The post-LLM normalization step also ensures it's E.164.
                             original_candidate_number = llm_output.number # This is the number LLM returned
-                            llm_output.source_url = source_url_map.get(original_candidate_number)
-                            if not llm_output.source_url:
-                                logger.warning(f"Could not find source_url for LLM output number: {original_candidate_number}. Map keys: {list(source_url_map.keys())[:5]}")
+                            
+                            candidate_details = candidate_details_map.get(original_candidate_number)
+                            if candidate_details:
+                                llm_output.source_url = candidate_details.get('source_url')
+                                llm_output.original_input_company_name = candidate_details.get('original_input_company_name')
+                            else:
+                                logger.warning(f"Could not find details (source_url, original_input_company_name) for LLM output number: {original_candidate_number}. Map keys: {list(candidate_details_map.keys())[:5]}")
                             
                             # Re-normalize phone numbers (existing logic)
                             if llm_output.number: # Number might be None if LLM fails for an entry

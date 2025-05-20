@@ -16,8 +16,12 @@ The pipeline follows these main stages:
 2.  **Web Scraping**: Intelligently navigates company websites using an advanced link prioritization and scoring system to gather text content, focusing on pages most likely to contain contact information.
 3.  **Regex Extraction**: Applies regular expressions to the scraped text to identify potential phone number patterns and their surrounding context.
 4.  **LLM Extraction**: Utilizes a Large Language Model (Google Gemini) to analyze the scraped text and contextual snippets to extract, confirm, and classify phone numbers.
-5.  **Data Consolidation & Verification**: Consolidates data by canonical URLs (handling redirects) and cross-references findings.
-6.  **Reporting**: Generates two primary Excel reports: a detailed, flattened report with all unique phone numbers per canonical site, and a summary report (one row per original input) highlighting key findings and statuses. Additionally, detailed logs and intermediate data dumps are created for each run.
+5.  **Data Consolidation & Verification**: Consolidates data by true base domain (scheme + netloc), handling redirects and merging information from multiple input rows that point to the same core website. Phone numbers are de-duplicated per true base domain, and all their original sources and types are aggregated.
+6.  **Reporting**: Generates three primary Excel reports:
+    *   A **Detailed Flattened Report** (`All_LLM_Extractions_Report_...`) listing all unique phone numbers found by the LLM per company (based on original input), with aggregated types and source URLs.
+    *   A **Summary Report** (`phone_validation_output_...`) providing one row per original input entry, highlighting top phone numbers and verification statuses.
+    *   A **Top Contacts Report** (`Top_Contacts_Report_...`) designed for direct use, presenting one consolidated entry per unique true base domain. This report features aggregated company names and a prioritized list of phone numbers with detailed source and type annotations.
+    Additionally, detailed logs and intermediate data dumps are created for each run.
 
 ## Key Features & Technologies
 
@@ -25,8 +29,8 @@ The pipeline follows these main stages:
 *   **Advanced Link Prioritization & Scoring**: Web scraper uses a multi-tier scoring system to focus on relevant pages.
 *   **Multi-Modal Extraction**: Combines regex and LLM techniques for robust extraction.
 *   **Flexible LLM Output Handling**: LLM returns text-based JSON, parsed and validated by the application.
-*   **URL Consolidation**: Efficiently processes unique websites once, even if multiple input URLs redirect to them.
-*   **Dual Excel Reporting**: Provides both a detailed, granular report and a summary report per input.
+*   **True Base Domain Consolidation**: Efficiently processes unique websites (scheme + netloc) once. Data from multiple input rows (even with different company names) that resolve to the same true base domain is intelligently merged for the `Top_Contacts_Report`.
+*   **Triple Excel Reporting**: Provides a detailed extraction log, a per-input summary, and a consolidated `Top_Contacts_Report` optimized for outreach.
 *   **Comprehensive Logging**: Generates run-specific logs and dumps key intermediate data for traceability.
 *   **Highly Configurable**: Behavior can be customized extensively via a `.env` file (e.g., scraper behavior, LLM parameters, logging levels).
 *   **Configurable Filename Lengths**: Prevents path length errors by allowing configuration of company name length in output filenames.
@@ -80,8 +84,9 @@ phone_validation_pipeline/
         ├── llm_context/
         │   ├── ..._llm_prompt_input.txt # Full prompt sent to LLM
         │   └── ..._llm_raw_output.json  # Raw LLM response
-        ├── phone_validation_output_{RunID}.xlsx       # Summary report
-        └── phone_validation_detailed_output_{RunID}.xlsx # Detailed flattened report
+        ├── phone_validation_output_{RunID}.xlsx       # Summary report (per input row)
+        ├── All_LLM_Extractions_Report_{RunID}.xlsx    # Detailed flattened report (was phone_validation_detailed_output)
+        └── Top_Contacts_Report_{RunID}.xlsx           # Consolidated top contacts report (per true base domain)
 ```
 
 ## Setup Instructions
@@ -131,8 +136,9 @@ This script will:
 *   Read data from the `INPUT_EXCEL_FILE_PATH` specified in your `.env` file.
 *   Perform scraping, extraction, and validation according to the configured settings.
 *   Save output files to a run-specific subdirectory within `output_data/` (e.g., `output_data/YYYYMMDD_HHMMSS/`). This includes:
-    *   The main summary report (`phone_validation_output_{RunID}.xlsx`).
-    *   The detailed flattened report (`phone_validation_detailed_output_{RunID}.xlsx`).
+    *   The Summary Report (`phone_validation_output_{RunID}.xlsx`).
+    *   The Detailed Flattened Report (`All_LLM_Extractions_Report_{RunID}.xlsx`).
+    *   The Top Contacts Report (`Top_Contacts_Report_{RunID}.xlsx`).
     *   A comprehensive run log (`pipeline_run_{RunID}.log`).
     *   Subdirectories for scraped content, intermediate data (regex snippets), and LLM context (prompts, raw responses).
 
