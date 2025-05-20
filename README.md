@@ -6,7 +6,7 @@ The Phone Validation Pipeline is a Python-based application designed to automate
 
 The pipeline reads company data from a spreadsheet, performs web scraping with advanced link prioritization, extracts potential phone numbers using regular expressions and a Large Language Model (LLM), and generates comprehensive reports.
 
-For a detailed summary of recent enhancements and a deeper dive into specific features, please see the [Project Overview & Recent Updates](./docs/project_summary_and_updates.md) document.
+For a detailed summary of recent enhancements and a deeper dive into specific features, please see the [Pipeline Enhancements Summary](./docs/pipeline_enhancements_summary_20250520_165353.md) document.
 
 ## High-Level Workflow
 
@@ -16,12 +16,12 @@ The pipeline follows these main stages:
 2.  **Web Scraping**: Intelligently navigates company websites using an advanced link prioritization and scoring system to gather text content, focusing on pages most likely to contain contact information.
 3.  **Regex Extraction**: Applies regular expressions to the scraped text to identify potential phone number patterns and their surrounding context.
 4.  **LLM Extraction**: Utilizes a Large Language Model (Google Gemini) to analyze the scraped text and contextual snippets to extract, confirm, and classify phone numbers.
-5.  **Data Consolidation & Verification**: Consolidates data by true base domain (scheme + netloc), handling redirects and merging information from multiple input rows that point to the same core website. Phone numbers are de-duplicated per true base domain, and all their original sources and types are aggregated.
-6.  **Reporting**: Generates three primary Excel reports:
-    *   A **Detailed Flattened Report** (`All_LLM_Extractions_Report_...`) listing all unique phone numbers found by the LLM per company (based on original input), with aggregated types and source URLs.
-    *   A **Summary Report** (`phone_validation_output_...`) providing one row per original input entry, highlighting top phone numbers and verification statuses.
-    *   A **Top Contacts Report** (`Top_Contacts_Report_...`) designed for direct use, presenting one consolidated entry per unique true base domain. This report features aggregated company names and a prioritized list of phone numbers with detailed source and type annotations.
-    Additionally, detailed logs and intermediate data dumps are created for each run.
+5.  **Data Consolidation & Verification**: Consolidates all extracted data globally by *true base domain* (e.g., `http://example.com`). This handles variations in input URLs and ensures each unique website is processed efficiently. Phone numbers are de-duplicated per true base domain, and their original sources (including input company names and specific page URLs) and types are aggregated.
+6.  **Reporting**: Generates three primary Excel reports for each run:
+    *   **Top Contacts Report** (`Top_Contacts_Report_{RunID}.xlsx`): One consolidated entry per unique true base domain. Features aggregated company names, a filtered and prioritized list of up to 3 phone numbers (with their types and original sourcing company names), and source URLs. This is the primary report for outreach.
+    *   **Summary Report** (`phone_validation_output_{RunID}.xlsx`): One row per original input entry, showing top numbers found for its corresponding true base domain and verification statuses.
+    *   **Detailed LLM Extractions Report** (`All_LLM_Extractions_Report_{RunID}.xlsx`): Lists all unique phone numbers found by the LLM for each true base domain, with aggregated types and source URLs.
+    Additionally, detailed (and now rotating) logs and intermediate data dumps are created for traceability.
 
 ## Key Features & Technologies
 
@@ -29,10 +29,15 @@ The pipeline follows these main stages:
 *   **Advanced Link Prioritization & Scoring**: Web scraper uses a multi-tier scoring system to focus on relevant pages.
 *   **Multi-Modal Extraction**: Combines regex and LLM techniques for robust extraction.
 *   **Flexible LLM Output Handling**: LLM returns text-based JSON, parsed and validated by the application.
-*   **True Base Domain Consolidation**: Efficiently processes unique websites (scheme + netloc) once. Data from multiple input rows (even with different company names) that resolve to the same true base domain is intelligently merged for the `Top_Contacts_Report`.
-*   **Triple Excel Reporting**: Provides a detailed extraction log, a per-input summary, and a consolidated `Top_Contacts_Report` optimized for outreach.
-*   **Comprehensive Logging**: Generates run-specific logs and dumps key intermediate data for traceability.
-*   **Highly Configurable**: Behavior can be customized extensively via a `.env` file (e.g., scraper behavior, LLM parameters, logging levels).
+*   **True Base Domain Consolidation**: All data is globally consolidated by the true base domain (e.g., `http://example.com`), ensuring efficient processing and unified reporting for each unique website, regardless of input URL variations.
+*   **Refined Triple Excel Reporting**:
+    *   `Top_Contacts_Report`: Optimized for outreach, one row per true base domain, with filtered, prioritized contacts and aggregated company/source details.
+    *   `Summary Report`: Per-input-row overview.
+    *   `Detailed_LLM_Extractions_Report`: Comprehensive log of all numbers found by LLM per true base domain.
+*   **Robust LLM Interaction**: Includes retry mechanisms for API calls to Google Gemini.
+*   **Enhanced Logging**: Features rotating log files to manage size during long runs.
+*   **Advanced Scraper Configuration**: Includes options like `SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT` for fine-tuned scraping.
+*   **Highly Configurable**: Behavior can be customized extensively via a `.env` file.
 *   **Configurable Filename Lengths**: Prevents path length errors by allowing configuration of company name length in output filenames.
 
 **Technologies Used:**
@@ -58,9 +63,9 @@ phone_validation_pipeline/
 ├── data/                  # Default directory for input data files
 │   └── data_to_be_inputed.csv # Example input
 ├── docs/                  # Project documentation
-│   ├── project_summary_and_updates.md # Overview of features & recent changes
-│   ├── scraper_enhancement_plan.md
-│   └── ... (other specific plan documents)
+│   ├── pipeline_enhancements_summary_20250520_165353.md # Detailed summary of recent features
+│   └── archive/                 # Older planning and summary documents
+│       └── ...
 ├── prompts/               # Directory for LLM prompt templates
 │   └── gemini_phone_validation_v1.txt
 ├── src/                   # Source code
@@ -151,4 +156,4 @@ For more detailed information on:
 *   Advanced configuration options and best practices.
 *   Troubleshooting common issues.
 
-Please refer to the [**USAGE.md**](./USAGE.md) file and the [**Project Overview & Recent Updates**](./docs/project_summary_and_updates.md) document.
+Please refer to the [**USAGE.md**](./USAGE.md) file and the [**Pipeline Enhancements Summary**](./docs/pipeline_enhancements_summary_20250520_165353.md) document.

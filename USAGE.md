@@ -137,26 +137,26 @@ When executed, `main_pipeline.py` performs the following steps:
 1.  **Initialization**: Loads configuration from `.env` (via `src/core/config.py`). Sets up logging (file and console). Generates a unique `RunID` (timestamp-based) for the current execution.
 2.  **Data Loading**: Reads the input data from the file specified by `INPUT_EXCEL_FILE_PATH`.
 3.  **Processing Loop (Pass 1 - Scraping, LLM Processing, Caching)**: Iterates through each input row:
-    *   Determines the `GivenURL`.
-    *   Calls the `scrape_website` function, which uses advanced link prioritization and scoring to navigate the site and gather content. It returns scraped page details, a scraper status, and the final canonical entry URL for the site.
-    *   If the canonical URL hasn't been processed yet in this run (checked against a cache):
-        *   The `RegexExtractorComponent` processes scraped text for phone number patterns.
-        *   The `LLMExtractorComponent` sends relevant text snippets and context to the Google Gemini API (which returns text that the application parses as JSON) to identify, confirm, and classify phone numbers.
-        *   Raw LLM outputs for this pathful canonical URL are cached.
-    *   The mapping from the original `GivenURL` to its true base domain (scheme + netloc) is stored.
-4.  **Global Data Consolidation**: After processing all input rows, raw LLM outputs are aggregated by their true base domain. `process_and_consolidate_contact_data` is then called once per true base domain to de-duplicate phone numbers and aggregate their sources.
-5.  **Output Generation (Pass 2 - Report Building)**: Uses the globally consolidated data:
-    *   **Detailed Flattened Report** (`All_LLM_Extractions_Report_...`): Lists all unique phone numbers found by the LLM, associated with the original input `CompanyName`, but using data consolidated at the true base domain level. Includes aggregated types and source URLs for each number.
-    *   **Summary Report** (`phone_validation_output_...`): Remains one row per original input entry. Populates top phone numbers and statuses by looking up the globally consolidated data for the input row's true base domain.
-    *   **Top Contacts Report** (`Top_Contacts_Report_...`): Generates one consolidated row per unique true base domain. Features an aggregated company name (e.g., `[TrueBaseDomain] - OriginalCompA - OriginalCompB`), aggregated original GivenURLs, and a prioritized list of up to 3 phone numbers. Each phone number shows its aggregated types and a list of all original input companies that sourced that specific number for the true base domain.
-    *   All reports, along with detailed logs and intermediate data dumps, are saved to a run-specific output directory.
+    *   Determines the `GivenURL` and pre-processes it.
+    *   Calls `scrape_website` to navigate the site. This function uses advanced link prioritization and scoring. It returns scraped page details, a scraper status, and the *pathful canonical entry URL* for the site (e.g., `http://www.example.com/en/contact/`).
+    *   If this *pathful canonical entry URL* hasn't been processed yet in this run (checked against `globally_processed_urls` cache):
+        *   Regex extraction is performed on scraped content.
+        *   The `LLMExtractorComponent` (now with retry logic) sends candidate numbers and context to Google Gemini.
+        *   Raw LLM outputs for this *pathful canonical entry URL* are cached in `canonical_site_raw_llm_outputs`.
+    *   The *true base domain* (e.g., `http://example.com`) for the input row is determined and stored.
+4.  **Global Data Consolidation**: After Pass 1, all raw LLM outputs (from `canonical_site_raw_llm_outputs`, keyed by pathful canonical URLs) are aggregated based on their *true base domain*. The `process_and_consolidate_contact_data` function is then called once per unique true base domain. This function de-duplicates phone numbers found across all pages of that true base domain, aggregates their source details (including original input company names and specific page URLs), determines the best classification, and sorts them.
+5.  **Output Generation (Pass 2 - Report Building)**: Uses the globally consolidated data (keyed by true base domain):
+    *   **Top Contacts Report** (`Top_Contacts_Report_{RunID}.xlsx`): Generates one consolidated row per unique true base domain. Features an aggregated company name (e.g., `[TrueBaseDomain] - OriginalCompA - OriginalCompB`), aggregated original `GivenURL`s, and a prioritized list of up to 3 *eligible* phone numbers (filtered by type and 'Non-Business' classification). Each phone number shows its aggregated types and a list of all original input companies that sourced that specific number for the true base domain.
+    *   **Summary Report** (`phone_validation_output_{RunID}.xlsx`): Remains one row per original input entry. Populates top phone numbers and statuses by looking up the globally consolidated data for the input row's true base domain.
+    *   **Detailed LLM Extractions Report** (`All_LLM_Extractions_Report_{RunID}.xlsx`): Lists all unique phone numbers found by the LLM for each true base domain, with aggregated types, best classification, and source URLs.
+    *   All reports, along with rotating detailed logs and intermediate data dumps, are saved to a run-specific output directory.
 
 ### Outputs
 The main pipeline generates several outputs, organized within a run-specific directory:
 
-*   **Summary Report**: An Excel file (e.g., `output_data/[RunID]/phone_validation_output_[RunID].xlsx`) as described above. The exact filename is configured by `OUTPUT_EXCEL_FILE_NAME_TEMPLATE`.
-*   **Detailed Flattened Report**: An Excel file (e.g., `output_data/[RunID]/All_LLM_Extractions_Report_[RunID].xlsx`).
-*   **Top Contacts Report**: An Excel file (e.g., `output_data/[RunID]/Top_Contacts_Report_[RunID].xlsx`). The exact filename is configured by `TERTIARY_REPORT_FILE_NAME_TEMPLATE`.
+*   **Top Contacts Report**: An Excel file (e.g., `output_data/[RunID]/Top_Contacts_Report_[RunID].xlsx`). Filename configured by `TERTIARY_REPORT_FILE_NAME_TEMPLATE`. This is the primary report for outreach.
+*   **Summary Report**: An Excel file (e.g., `output_data/[RunID]/Pipeline_Summary_Report_[RunID].xlsx`). Filename configured by `OUTPUT_EXCEL_FILE_NAME_TEMPLATE`.
+*   **Detailed LLM Extractions Report**: An Excel file (e.g., `output_data/[RunID]/All_LLM_Extractions_Report_[RunID].xlsx`).
 *   **Run Log File**: A comprehensive log of the pipeline's execution (e.g., `output_data/[RunID]/pipeline_run_[RunID].log`).
 *   **Scraped Content Files**: Cleaned text content from each successfully scraped webpage, stored in `output_data/[RunID]/scraped_content/cleaned_pages_text/`.
 *   **Regex Snippets File**: JSON file containing aggregated regex-extracted snippets for each company, in `output_data/[RunID]/intermediate_data/`.
@@ -177,10 +177,11 @@ output_data/
     │   └── CompanyName_RowX_regex_snippets.json
     │   └── ...
     ├── llm_context/
-    │   ├── CompanyName_RowX_llm_prompt_input.txt
-    │   ├── CompanyName_RowX_llm_raw_output.json (or similar, based on actual implementation)
+    │   ├── CANONICAL_example_com_llm_full_prompt.txt
+    │   ├── CANONICAL_example_com_llm_input_data.json
+    │   ├── CANONICAL_example_com_llm_raw_output.json
     │   └── ...
-    ├── phone_validation_output_20240520_113000.xlsx       # Summary Report
+    ├── Pipeline_Summary_Report_20240520_113000.xlsx       # Summary Report
     ├── All_LLM_Extractions_Report_20240520_113000.xlsx    # Detailed Report
     └── Top_Contacts_Report_20240520_113000.xlsx           # Top Contacts Report
 ```
@@ -213,7 +214,7 @@ Below is a detailed explanation of important variables you can set in your `.env
     *   Default: `output_data`
 *   **`OUTPUT_EXCEL_FILE_NAME_TEMPLATE`**
     *   Description: Template for the summary output Excel file. `{run_id}` is replaced by a timestamp.
-    *   Default: `Pipeline_Summary_Report_{run_id}.xlsx` (Note: Default in `config.py` might differ, check `.env.example`)
+    *   Default: `Pipeline_Summary_Report_{run_id}.xlsx`
 *   **`TERTIARY_REPORT_FILE_NAME_TEMPLATE`**
     *   Description: Template for the "Top Contacts Report" Excel file. `{run_id}` is replaced.
     *   Default: `Top_Contacts_Report_{run_id}.xlsx`
@@ -270,7 +271,7 @@ These settings fine-tune how the scraper discovers and prioritizes links:
     *   Description: When `SCRAPER_MAX_PAGES_PER_DOMAIN` is hit, only links scoring at/above this threshold will be processed, up to `SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT`.
     *   Default: `80`
 *   **`SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT`**:
-    *   Description: After `SCRAPER_MAX_PAGES_PER_DOMAIN` is met, this is the maximum number of *additional* pages that can be scraped if they meet/exceed `SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS`. Helps to get a few very high-priority pages without scraping too many if a site is large.
+    *   Description: After `SCRAPER_MAX_PAGES_PER_DOMAIN` is met, this is the maximum number of *additional* pages that can be scraped if their link score meets/exceeds `SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS`. This allows the scraper to fetch a few crucial pages (like 'contact' or 'impressum') even if the general page limit for the domain has been reached, ensuring key contact pages are not missed on large websites.
     *   Default: `5`
 
 #### LLM (Gemini) Settings
@@ -295,6 +296,7 @@ These settings fine-tune how the scraper discovers and prioritizes links:
     *   Default: `INFO`
 *   **`CONSOLE_LOG_LEVEL`**: Log level for console output.
     *   Default: `WARNING` (to keep console less verbose)
+    *   Note: Log files now use rotation (10MB chunks, 5 backups) to manage size during long runs.
 
 ## 6. Troubleshooting
 
@@ -303,7 +305,7 @@ These settings fine-tune how the scraper discovers and prioritizes links:
 *   **`FileNotFoundError` for input**: Verify `INPUT_EXCEL_FILE_PATH` in `.env` is correct and relative to project root.
 *   **Scraping issues (blocks, CAPTCHAs)**: Adjust timeouts. For persistent blocks, advanced techniques (not currently in scope) may be needed. Check `RESPECT_ROBOTS_TXT`.
 *   **Incorrect phone parsing**: Check `TARGET_COUNTRY_CODES`, `DEFAULT_REGION_CODE`. Refine regex or LLM prompt if needed.
-*   **`ModuleNotFoundError`**: Ensure venv is active and `pip install -r requirements.txt` was successful.
+*   **`ModuleNotFoundError`**: Ensure venv is active and `pip install -r requirements.txt` was successful. If `tenacity` is missing, this is the cause.
 *   **Scraper not finding enough/too many pages**:
     *   Adjust `TARGET_LINK_KEYWORDS`: too broad might find too much, too narrow might miss pages.
     *   Tune `SCRAPER_CRITICAL_PRIORITY_KEYWORDS` and `SCRAPER_HIGH_PRIORITY_KEYWORDS` for pages you absolutely need.
