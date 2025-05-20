@@ -2,34 +2,41 @@
 
 ## Project Overview
 
-The Phone Validation Pipeline is a Python-based application designed to validate and enrich phone numbers from a given spreadsheet. It automates the process of finding correct phone numbers for companies by performing a series of steps: data ingestion, web scraping, regex-based phone number extraction, LLM-based phone number extraction, final verification, and reporting.
+The Phone Validation Pipeline is a Python-based application designed to automate the process of finding, validating, and enriching phone numbers for a given list of companies. It aims to improve the accuracy of contact information by intelligently navigating websites, extracting data using multiple methods, and processing information through a configurable workflow.
 
-The primary goal is to improve the accuracy of contact information, particularly for businesses where phone numbers might be missing, outdated, or incorrectly formatted in an initial dataset.
+The pipeline reads company data from a spreadsheet, performs web scraping with advanced link prioritization, extracts potential phone numbers using regular expressions and a Large Language Model (LLM), and generates comprehensive reports.
+
+For a detailed summary of recent enhancements and a deeper dive into specific features, please see the [Project Overview & Recent Updates](./docs/project_summary_and_updates.md) document.
 
 ## High-Level Workflow
 
 The pipeline follows these main stages:
 
 1.  **Data Ingestion**: Reads company data (name, website URL, existing phone number) from an input Excel/CSV file.
-2.  **Web Scraping**: Navigates to the provided company websites to gather text content, focusing on pages likely to contain contact information (e.g., "Contact Us", "About Us", "Impressum").
-3.  **Regex Extraction**: Applies regular expressions to the scraped text to identify potential phone number patterns.
-4.  **LLM Extraction**: Utilizes a Large Language Model (Google Gemini) to analyze the scraped text and extract or confirm phone numbers, especially in cases where regex might fail or context is needed.
-5.  **Verification**: Cross-references and validates the findings from regex and LLM methods.
-6.  **Reporting**: Generates a processed output file with enriched data and a separate report highlighting entries that may require manual review.
+2.  **Web Scraping**: Intelligently navigates company websites using an advanced link prioritization and scoring system to gather text content, focusing on pages most likely to contain contact information.
+3.  **Regex Extraction**: Applies regular expressions to the scraped text to identify potential phone number patterns and their surrounding context.
+4.  **LLM Extraction**: Utilizes a Large Language Model (Google Gemini) to analyze the scraped text and contextual snippets to extract, confirm, and classify phone numbers.
+5.  **Data Consolidation & Verification**: Consolidates data by canonical URLs (handling redirects) and cross-references findings.
+6.  **Reporting**: Generates two primary Excel reports: a detailed, flattened report with all unique phone numbers per canonical site, and a summary report (one row per original input) highlighting key findings and statuses. Additionally, detailed logs and intermediate data dumps are created for each run.
 
 ## Key Features & Technologies
 
 *   **Automated Phone Number Retrieval**: Scrapes websites and intelligently extracts phone numbers.
+*   **Advanced Link Prioritization & Scoring**: Web scraper uses a multi-tier scoring system to focus on relevant pages.
 *   **Multi-Modal Extraction**: Combines regex and LLM techniques for robust extraction.
-*   **Configurable**: Behavior can be customized via a `.env` file.
-*   **Reporting**: Provides clear outputs for validated data and items needing review.
+*   **Flexible LLM Output Handling**: LLM returns text-based JSON, parsed and validated by the application.
+*   **URL Consolidation**: Efficiently processes unique websites once, even if multiple input URLs redirect to them.
+*   **Dual Excel Reporting**: Provides both a detailed, granular report and a summary report per input.
+*   **Comprehensive Logging**: Generates run-specific logs and dumps key intermediate data for traceability.
+*   **Highly Configurable**: Behavior can be customized extensively via a `.env` file (e.g., scraper behavior, LLM parameters, logging levels).
+*   **Configurable Filename Lengths**: Prevents path length errors by allowing configuration of company name length in output filenames.
 
 **Technologies Used:**
 
 *   **Python 3.x**
 *   **Pandas**: For data manipulation and Excel/CSV file handling.
 *   **Playwright**: For robust web scraping, including dynamic content.
-*   **Beautiful Soup (bs4)**: For HTML parsing (used alongside Playwright).
+*   **Beautiful Soup (bs4)**: For HTML parsing.
 *   **python-phonenumbers**: For parsing, formatting, and validating phone numbers.
 *   **Google Gemini API**: For LLM-based extraction and reasoning.
 *   **python-dotenv**: For managing environment variables.
@@ -41,10 +48,15 @@ The pipeline follows these main stages:
 phone_validation_pipeline/
 ├── .env.example           # Example environment variable configuration
 ├── main_pipeline.py       # Main script to run the entire pipeline
-├── generate_report.py     # Script to generate summary reports
 ├── README.md              # This file
 ├── requirements.txt       # Python package dependencies
 ├── USAGE.md               # Detailed usage and configuration guide
+├── data/                  # Default directory for input data files
+│   └── data_to_be_inputed.csv # Example input
+├── docs/                  # Project documentation
+│   ├── project_summary_and_updates.md # Overview of features & recent changes
+│   ├── scraper_enhancement_plan.md
+│   └── ... (other specific plan documents)
 ├── prompts/               # Directory for LLM prompt templates
 │   └── gemini_phone_validation_v1.txt
 ├── src/                   # Source code
@@ -59,10 +71,17 @@ phone_validation_pipeline/
 │       ├── __init__.py
 │       └── scraper_logic.py
 └── output_data/           # Default directory for pipeline outputs (created on run)
-    └── [RunID]/           # Outputs for a specific pipeline run
-        ├── scraped_content/ # Raw scraped HTML/text
-        ├── llm_context/     # LLM prompts and raw responses
-        └── processed_data_with_phones.xlsx # Main output file
+    └── [RunID]/           # Outputs for a specific pipeline run (e.g., 20240520_110000)
+        ├── pipeline_run_{RunID}.log # Main log file for the run
+        ├── scraped_content/
+        │   └── cleaned_pages_text/  # Cleaned text from scraped pages
+        ├── intermediate_data/
+        │   └── ..._regex_snippets.json # Regex extracted snippets
+        ├── llm_context/
+        │   ├── ..._llm_prompt_input.txt # Full prompt sent to LLM
+        │   └── ..._llm_raw_output.json  # Raw LLM response
+        ├── phone_validation_output_{RunID}.xlsx       # Summary report
+        └── phone_validation_detailed_output_{RunID}.xlsx # Detailed flattened report
 ```
 
 ## Setup Instructions
@@ -70,92 +89,60 @@ phone_validation_pipeline/
 Follow these steps to set up and run the Phone Validation Pipeline:
 
 1.  **Clone the Repository (Conceptual)**:
-    If this project were hosted on a Git platform (like GitHub), you would clone it using:
-    ```bash
-    git clone <repository_url>
-    cd phone_validation_pipeline
-    ```
-    For now, ensure you have all the project files in a local directory.
+    If this project were hosted on a Git platform (like GitHub), you would clone it. For now, ensure you have all the project files in a local directory.
 
 2.  **Set up a Python Virtual Environment**:
-    It's highly recommended to use a virtual environment to manage dependencies.
+    It's highly recommended to use a virtual environment.
     ```bash
     python -m venv venv
     ```
-    Activate the virtual environment:
-    *   On Windows:
-        ```bash
-        .\venv\Scripts\activate
-        ```
-    *   On macOS/Linux:
-        ```bash
-        source venv/bin/activate
-        ```
+    Activate it:
+    *   Windows: `.\venv\Scripts\activate`
+    *   macOS/Linux: `source venv/bin/activate`
 
 3.  **Install Dependencies**:
-    Install all required Python packages using the `requirements.txt` file:
     ```bash
     pip install -r requirements.txt
     ```
 
 4.  **Install Playwright Browsers**:
-    Playwright requires browser binaries to be installed. Run the following command:
     ```bash
     playwright install
     ```
-    This will download the default set of browsers (Chromium, Firefox, WebKit).
 
 5.  **Set up the `.env` File**:
-    The application uses a `.env` file to manage sensitive information and configurations.
     *   Copy the example file:
-        ```bash
-        # On Windows
-        copy .env.example .env
-
-        # On macOS/Linux
-        cp .env.example .env
-        ```
-    *   Open the newly created `.env` file in a text editor.
-    *   Fill in the required values, especially:
-        *   `GEMINI_API_KEY`: Your API key for Google Gemini.
-        *   `INPUT_EXCEL_FILE_PATH`: Path to your input data file (e.g., `data_to_be_inputed.csv` or `data_to_be_inputed.xlsx`). This path is relative to the `phone_validation_pipeline` directory.
-        *   Review other variables and adjust if necessary (see [`.env.example`](./.env.example) for all options).
+        *   Windows: `copy .env.example .env`
+        *   macOS/Linux: `cp .env.example .env`
+    *   Open `.env` and fill in required values, especially:
+        *   `GEMINI_API_KEY`
+        *   `INPUT_EXCEL_FILE_PATH` (relative to the project root, e.g., `data/your_input_file.csv`)
+    *   Review all other variables in [`.env.example`](./.env.example) and adjust them based on the new features and your needs (e.g., scraper keywords, page limits, logging levels).
 
 ## Basic Usage
 
 ### Running the Main Pipeline
 
-To process your input file and generate the enriched data:
+To process your input file and generate the enriched data and reports:
 ```bash
 python main_pipeline.py
 ```
 This script will:
 *   Read data from the `INPUT_EXCEL_FILE_PATH` specified in your `.env` file.
-*   Perform scraping, extraction, and validation.
-*   Save output files (processed data, scraped content, LLM context) to a run-specific subdirectory within `output_data/` (e.g., `output_data/YYYYMMDD_HHMMSS/`).
-
-### Running the Reporting Script
-
-After the main pipeline has run, you can generate a summary report and a file for manual review:
-```bash
-python generate_report.py <path_to_processed_excel_file>
-```
-Replace `<path_to_processed_excel_file>` with the actual path to the `processed_data_with_phones.xlsx` (or similarly named) file generated by `main_pipeline.py`. For example:
-```bash
-python generate_report.py output_data/20240516_103000/processed_data_with_phones.xlsx
-```
-You can also specify an output directory and run ID for the report:
-```bash
-python generate_report.py output_data/20240516_103000/processed_data_with_phones.xlsx --output_dir reports/ --run_id 20240516_103000
-```
+*   Perform scraping, extraction, and validation according to the configured settings.
+*   Save output files to a run-specific subdirectory within `output_data/` (e.g., `output_data/YYYYMMDD_HHMMSS/`). This includes:
+    *   The main summary report (`phone_validation_output_{RunID}.xlsx`).
+    *   The detailed flattened report (`phone_validation_detailed_output_{RunID}.xlsx`).
+    *   A comprehensive run log (`pipeline_run_{RunID}.log`).
+    *   Subdirectories for scraped content, intermediate data (regex snippets), and LLM context (prompts, raw responses).
 
 ## Advanced Usage & Configuration
 
 For more detailed information on:
-*   All environment variables and their effects.
+*   All environment variables and their effects (including the new scraper and logging configurations).
 *   Input data format specifications.
-*   Detailed explanation of pipeline outputs.
-*   Advanced configuration options.
+*   Detailed explanation of pipeline outputs and report structures.
+*   Advanced configuration options and best practices.
 *   Troubleshooting common issues.
 
-Please refer to the [**USAGE.md**](./USAGE.md) file.
+Please refer to the [**USAGE.md**](./USAGE.md) file and the [**Project Overview & Recent Updates**](./docs/project_summary_and_updates.md) document.

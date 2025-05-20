@@ -19,14 +19,17 @@ This document provides detailed instructions for setting up, configuring, and ru
     - [Operation](#operation)
     - [Outputs](#outputs)
     - [Output Directory Structure](#output-directory-structure)
-  - [5. Running the Reporting Script (`generate_report.py`)](#5-running-the-reporting-script-generate_reportpy)
-    - [Command](#command-1)
-    - [Arguments](#arguments)
-    - [Outputs](#outputs-1)
-  - [6. Configuration](#6-configuration)
-    - [Via `.env` File](#via-env-file)
-    - [Via `src/core/config.py`](#via-srccoreconfigpy)
-  - [7. Troubleshooting](#7-troubleshooting)
+  - [5. Configuration Details](#5-configuration-details)
+    - [Primary Configuration: `.env` File](#primary-configuration-env-file)
+    - [Core Configuration Class: `src/core/config.py`](#core-configuration-class-srccoreconfigpy)
+    - [Key Configuration Variables Explained](#key-configuration-variables-explained)
+      - [General Project Settings](#general-project-settings)
+      - [Web Scraper Settings](#web-scraper-settings)
+      - [Advanced Link Prioritization \& Control](#advanced-link-prioritization--control)
+      - [LLM (Gemini) Settings](#llm-gemini-settings)
+      - [Phone Number Normalization](#phone-number-normalization)
+      - [Logging Settings](#logging-settings)
+  - [6. Troubleshooting](#6-troubleshooting)
 
 ## 1. Prerequisites
 
@@ -66,7 +69,7 @@ It is strongly recommended to use a Python virtual environment to manage project
 
 ### Install Dependencies
 
-All required Python packages are listed in the [`requirements.txt`](./requirements.txt:1) file. Install them using pip:
+All required Python packages are listed in the [`requirements.txt`](./requirements.txt) file. Install them using pip:
 ```bash
 pip install -r requirements.txt
 ```
@@ -78,14 +81,14 @@ Playwright uses browser binaries for web automation. You need to install these b
 ```bash
 playwright install
 ```
-This command downloads and sets up the necessary browser drivers (Chromium, Firefox, WebKit) that Playwright will use. If you only want a specific browser, you can specify it, e.g., `playwright install chromium`.
+This command downloads and sets up the necessary browser drivers (Chromium, Firefox, WebKit) that Playwright will use.
 
 ### Environment Variables (`.env` file)
 
 The application uses a `.env` file to manage configurations, API keys, and file paths. This keeps sensitive information out of the codebase and allows for easy customization.
 
 1.  **Create the `.env` file**:
-    Copy the example file [`.env.example`](./.env.example:1) to a new file named `.env` in the `phone_validation_pipeline` root directory:
+    Copy the example file [`.env.example`](./.env.example) to a new file named `.env` in the project root directory:
     ```bash
     # On Windows
     copy .env.example .env
@@ -95,84 +98,9 @@ The application uses a `.env` file to manage configurations, API keys, and file 
     ```
 
 2.  **Edit the `.env` file**:
-    Open the `.env` file with a text editor and fill in the values. Below are explanations for each variable defined in [`.env.example`](./.env.example:1) and used by [`src/core/config.py`](./src/core/config.py:1):
-
-    *   **`GEMINI_API_KEY`** (Required)
-        *   Description: Your API key for the Google Gemini service. This is essential for the LLM extraction component.
-        *   Example: `GEMINI_API_KEY="AIzaSyYOURACTUALAPIKEYHERE"`
-
-    *   **`INPUT_EXCEL_FILE_PATH`** (Required)
-        *   Description: The path to your input data file (Excel or CSV). This path should be relative to the `phone_validation_pipeline` directory.
-        *   Example: `INPUT_EXCEL_FILE_PATH="data_to_be_inputed.xlsx"` or `INPUT_EXCEL_FILE_PATH="../data_sources/my_companies.csv"`
-
-    *   **`SCRAPER_USER_AGENT`**
-        *   Description: The User-Agent string the scraper will use for HTTP requests.
-        *   Default: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36`
-
-    *   **`SCRAPER_PAGE_TIMEOUT_MS`**
-        *   Description: Default timeout for Playwright page operations in milliseconds (e.g., waiting for a page to load).
-        *   Default: `30000` (30 seconds)
-
-    *   **`SCRAPER_NAVIGATION_TIMEOUT_MS`**
-        *   Description: Default timeout for Playwright navigation actions in milliseconds.
-        *   Default: `60000` (60 seconds)
-
-    *   **`SCRAPER_MAX_RETRIES`**
-        *   Description: Maximum number of retries for a failed scraping attempt on a URL.
-        *   Default: `2`
-
-    *   **`SCRAPER_RETRY_DELAY_SECONDS`**
-        *   Description: Delay in seconds between scraping retries.
-        *   Default: `5`
-
-    *   **`TARGET_LINK_KEYWORDS`**
-        *   Description: Comma-separated list of keywords used to identify relevant internal links to scrape (e.g., "contact", "about us"). Case-insensitive.
-        *   Default: `contact,about,support,impressum,kontakt,legal,privacy,terms`
-
-    *   **`MAX_DEPTH_INTERNAL_LINKS`**
-        *   Description: Maximum depth to follow internal links from the initial company URL. A depth of `0` means only the initial URL is scraped. A depth of `1` means the initial URL and any direct links from it (matching keywords) are scraped.
-        *   Default: `1`
-
-    *   **`RESPECT_ROBOTS_TXT`**
-        *   Description: Whether the scraper should respect the `robots.txt` file of websites. Set to `True` or `False`.
-        *   Default: `True`
-
-    *   **`ROBOTS_TXT_USER_AGENT`**
-        *   Description: The user-agent string to use when checking `robots.txt`. `*` means it applies to all user-agents.
-        *   Default: `*`
-
-    *   **`OUTPUT_BASE_DIR`**
-        *   Description: The base directory where all output files (processed data, scraped content, LLM context) will be saved. This path is relative to the `phone_validation_pipeline` directory. The directory will be created if it doesn't exist.
-        *   Default: `output_data`
-
-    *   **`LLM_MODEL_NAME`**
-        *   Description: The specific Google Gemini model to use for extraction.
-        *   Default: `gemini-1.5-pro-latest`
-        *   Other options: `gemini-1.5-flash-latest`, etc. (ensure your API key has access).
-
-    *   **`LLM_TEMPERATURE`**
-        *   Description: Controls the randomness of the LLM's output. Higher values (e.g., 0.8) make output more random, while lower values (e.g., 0.2) make it more deterministic.
-        *   Default: `0.5`
-
-    *   **`LLM_MAX_TOKENS`**
-        *   Description: Maximum number of tokens the LLM can generate in its response.
-        *   Default: `2048`
-
-    *   **`LLM_PROMPT_TEMPLATE_PATH`**
-        *   Description: Path to the text file containing the prompt template for the LLM. Relative to the `phone_validation_pipeline` directory.
-        *   Default: `prompts/gemini_phone_validation_v1.txt`
-
-    *   **`TARGET_COUNTRY_CODES`**
-        *   Description: Comma-separated list of ISO 3166-1 alpha-2 country codes (e.g., US, GB, DE) to help the `python-phonenumbers` library parse numbers more accurately. Numbers will be validated against these regions.
-        *   Default: `DE,CH,AT` (Germany, Switzerland, Austria)
-
-    *   **`DEFAULT_REGION_CODE`**
-        *   Description: A default ISO 3166-1 alpha-2 country code to use if a phone number cannot be parsed with a specific country context. This helps in formatting numbers that don't have an international prefix.
-        *   Default: `DE`
-
-    *   **`OUTPUT_EXCEL_FILE_NAME_TEMPLATE`**
-        *   Description: Template for the main output Excel file name. `{run_id}` will be replaced with the actual run ID (timestamp).
-        *   Default: `phone_validation_output_{run_id}.xlsx`
+    Open the `.env` file with a text editor and fill in the values. Detailed explanations for each variable are provided in the [Key Configuration Variables Explained](#key-configuration-variables-explained) section below. At a minimum, you will need to set:
+    *   `GEMINI_API_KEY`
+    *   `INPUT_EXCEL_FILE_PATH`
 
 ## 3. Input Data Format
 
@@ -185,164 +113,196 @@ The pipeline expects an input file (Excel `.xlsx` or CSV `.csv`) specified by `I
 *   **`GivenPhoneNumber`** (Optional but Recommended): The existing phone number for the company, if available. This can be in various formats.
     *   Type: Text
 
-**Example `data_to_be_inputed.csv`:**
+**Example `data/data_to_be_inputed.csv`:**
 ```csv
 CompanyName,GivenURL,GivenPhoneNumber
 Example Corp,https://www.example.com,+1-555-123-4567
 Test Inc.,http://test-site.org,089/123456
 Another Biz,www.anotherbiz.de,
 ```
-
 If using an Excel file, these should be the headers in the first row of the first sheet.
 
 ## 4. Running the Pipeline (`main_pipeline.py`)
 
-The [`main_pipeline.py`](./main_pipeline.py:1) script is the entry point to execute the entire phone validation process.
+The [`main_pipeline.py`](./main_pipeline.py) script is the entry point to execute the entire phone validation process.
 
 ### Command
-Navigate to the `phone_validation_pipeline` directory in your terminal (ensure your virtual environment is activated) and run:
+Navigate to the project root directory in your terminal (ensure your virtual environment is activated) and run:
 ```bash
 python main_pipeline.py
 ```
 
 ### Operation
 When executed, `main_pipeline.py` performs the following steps:
-1.  **Initialization**: Loads configuration from `.env` and `src/core/config.py`. Sets up logging. Generates a unique `RunID` (timestamp based) for the current execution.
-2.  **Data Loading**: Reads the input data from the file specified by `INPUT_EXCEL_FILE_PATH` using the `DataHandler`.
-3.  **Processing Loop**: Iterates through each row (company) in the input data:
-    *   **Scraping**: Uses the `ScraperLogic` to visit the `GivenURL` and relevant internal pages. Scraped text content is saved.
-    *   **Regex Extraction**: The `RegexExtractorComponent` processes the scraped text to find phone numbers using predefined patterns.
-    *   **LLM Extraction**: If regex fails or for further validation, the `LLMExtractorComponent` sends the scraped text (and other context) to the Google Gemini API to identify or confirm phone numbers.
-    *   **Verification & Normalization**: Results from regex and LLM are compared. Found phone numbers are parsed, validated, and formatted using `python-phonenumbers` and the configured country codes.
-    *   **Data Aggregation**: All extracted information (scraped text paths, found numbers, confidence scores, errors, etc.) is collected.
-4.  **Output Generation**:
-    *   The `DataHandler` saves the processed data, including new phone numbers and validation status, to an Excel file (e.g., `processed_data_with_phones.xlsx`) in the run-specific output directory.
-    *   Raw scraped content and LLM interaction logs (context files) are also saved in subdirectories.
+1.  **Initialization**: Loads configuration from `.env` (via `src/core/config.py`). Sets up logging (file and console). Generates a unique `RunID` (timestamp-based) for the current execution.
+2.  **Data Loading**: Reads the input data from the file specified by `INPUT_EXCEL_FILE_PATH`.
+3.  **Processing Loop (Pass 1 - Scraping, LLM Processing, Caching)**: Iterates through each input row:
+    *   Determines the `GivenURL`.
+    *   Calls the `scrape_website` function, which uses advanced link prioritization and scoring to navigate the site and gather content. It returns scraped page details, a scraper status, and the final canonical entry URL for the site.
+    *   If the canonical URL hasn't been processed yet in this run (checked against a cache):
+        *   The `RegexExtractorComponent` processes scraped text for phone number patterns.
+        *   The `LLMExtractorComponent` sends relevant text snippets and context to the Google Gemini API (which returns text that the application parses as JSON) to identify, confirm, and classify phone numbers.
+        *   Results (scraper status, LLM outputs) for this canonical URL are cached.
+    *   The mapping from the original `GivenURL` to its canonical URL is stored.
+4.  **Output Generation (Pass 2 - Report Building)**: After processing all input rows:
+    *   **Detailed Flattened Report**: Generated by iterating through the input data, looking up cached results for each company's canonical URL, de-duplicating LLM-extracted numbers, and creating one row per unique phone number. This report includes `CompanyName`, original `GivenURL`, `Canonical_URL`, `ScrapingStatus` (of the canonical site), and detailed LLM fields for each number.
+    *   **Summary Report**: The original input DataFrame is augmented. For each input row, it populates top phone numbers (Primary, Secondary), their types and source URLs, an `Original_Number_Status`, and an `Overall_VerificationStatus` (which includes redirect information and the processing status of the canonical site).
+    *   Both reports, along with detailed logs and intermediate data dumps, are saved to a run-specific output directory.
 
 ### Outputs
 The main pipeline generates several outputs, organized within a run-specific directory:
 
-*   **Main Processed Data File**: An Excel file (e.g., `output_data/[RunID]/phone_validation_output_[RunID].xlsx` or `processed_data_with_phones.xlsx` depending on older configurations) containing the original input data augmented with:
-    *   Scraped URLs
-    *   Status of scraping for each URL
-    *   Phone numbers found by Regex
-    *   Phone numbers found by LLM
-    *   The final selected/validated phone number
-    *   Confidence scores or notes about the findings
-    *   Error messages if any step failed
-*   **Scraped Content Files**: Raw HTML or text content saved from each successfully scraped webpage. These are typically stored in `output_data/[RunID]/scraped_content/`.
-*   **LLM Context Files**: Files containing the prompts sent to the LLM and the raw responses received. These are useful for debugging and understanding LLM behavior, typically stored in `output_data/[RunID]/llm_context/`.
+*   **Summary Report**: An Excel file (e.g., `output_data/[RunID]/phone_validation_output_[RunID].xlsx`) containing one row per original input entry, augmented with key findings like top phone numbers, canonical URL, and overall status.
+*   **Detailed Flattened Report**: An Excel file (e.g., `output_data/[RunID]/phone_validation_detailed_output_[RunID].xlsx`) containing one row per unique LLM-extracted phone number, grouped by canonical URL, providing granular details.
+*   **Run Log File**: A comprehensive log of the pipeline's execution (e.g., `output_data/[RunID]/pipeline_run_[RunID].log`).
+*   **Scraped Content Files**: Cleaned text content from each successfully scraped webpage, stored in `output_data/[RunID]/scraped_content/cleaned_pages_text/`.
+*   **Regex Snippets File**: JSON file containing aggregated regex-extracted snippets for each company, in `output_data/[RunID]/intermediate_data/`.
+*   **LLM Prompt Input File**: The full prompt sent to the LLM for each company, in `output_data/[RunID]/llm_context/`.
+*   **LLM Raw Output File**: The raw response received from the LLM, in `output_data/[RunID]/llm_context/`.
 
 ### Output Directory Structure
 The default output directory structure looks like this:
 ```
 output_data/
-└── [RunID]/  (e.g., 20240516_113000)
+└── [RunID]/  (e.g., 20240520_113000)
+    ├── pipeline_run_20240520_113000.log
     ├── scraped_content/
-    │   ├── example.com_contact.html
-    │   └── ... (other scraped files)
+    │   └── cleaned_pages_text/
+    │       └── CompanyName__domain_hash_cleaned.txt
+    │       └── ... (other cleaned text files)
+    ├── intermediate_data/
+    │   └── CompanyName_RowX_regex_snippets.json
+    │   └── ...
     ├── llm_context/
-    │   ├── example.com_llm_prompt.txt
-    │   ├── example.com_llm_response.json
-    │   └── ... (other LLM files)
-    ├── phone_validation_output_20240516_113000.xlsx (or processed_data_with_phones.xlsx)
-    └── pipeline.log (if logging to file is configured for the run)
+    │   ├── CompanyName_RowX_llm_prompt_input.txt
+    │   ├── CompanyName_RowX_llm_raw_output.json (or similar, based on actual implementation)
+    │   └── ...
+    ├── phone_validation_output_20240520_113000.xlsx       # Summary Report
+    └── phone_validation_detailed_output_20240520_113000.xlsx # Detailed Report
 ```
-The `[RunID]` is typically a timestamp like `YYYYMMDD_HHMMSS` to ensure each run's outputs are kept separate.
+The `[RunID]` is a timestamp like `YYYYMMDD_HHMMSS`.
 
-## 5. Running the Reporting Script (`generate_report.py`)
+## 5. Configuration Details
 
-The [`generate_report.py`](./generate_report.py:1) script is used to generate a summary report from the main pipeline's output Excel file. It also creates a queue of entries that might require manual review.
+### Primary Configuration: `.env` File
+The primary method for configuring the pipeline is by creating and editing a `.env` file in the project's root directory. This file allows you to set various parameters without modifying the source code. Copy [`.env.example`](./.env.example) to `.env` and customize the values.
 
-### Command
-```bash
-python generate_report.py <path_to_processed_excel_file> [--output_dir <directory>] [--run_id <identifier>]
-```
+### Core Configuration Class: `src/core/config.py`
+The [`src/core/config.py`](./src/core/config.py) file defines the `AppConfig` class. This class is responsible for:
+1.  Loading configuration values from environment variables (defined in the `.env` file).
+2.  Providing default values for settings if they are not specified in the `.env` file.
+All configurable aspects of the pipeline are managed through this class.
 
-### Arguments
+### Key Configuration Variables Explained
 
-*   **`<path_to_processed_excel_file>`** (Required):
-    *   The full path to the main Excel output file generated by `main_pipeline.py`.
-    *   Example: `output_data/20240516_113000/processed_data_with_phones.xlsx`
+Below is a detailed explanation of important variables you can set in your `.env` file. Refer to [`.env.example`](./.env.example) for a complete list and default examples.
 
-*   **`--output_dir <directory>`** (Optional):
-    *   Specifies the directory where the report files (like `manual_review_queue.xlsx`) should be saved.
-    *   If not provided, defaults to a `reports` subdirectory within the directory of the input Excel file, or the current directory if that fails.
-    *   Example: `--output_dir custom_reports/`
+#### General Project Settings
+*   **`INPUT_EXCEL_FILE_PATH`** (Required)
+    *   Description: Path to your input data file (Excel or CSV), relative to the project root.
+    *   Example: `INPUT_EXCEL_FILE_PATH="data/my_companies.csv"`
+*   **`ROW_PROCESSING_RANGE`**
+    *   Description: Specifies a range or number of rows to process from the input. Examples: "10-20" (rows 10-20), "20" (first 20), "10-" (row 10 to end), "" (all rows).
+    *   Default: `""` (process all)
+*   **`OUTPUT_BASE_DIR`**
+    *   Description: Base directory for all output files, relative to the project root.
+    *   Default: `output_data`
+*   **`OUTPUT_EXCEL_FILE_NAME_TEMPLATE`**
+    *   Description: Template for the summary output Excel file. `{run_id}` is replaced by a timestamp.
+    *   Default: `phone_validation_output_{run_id}.xlsx`
+    *   Note: The detailed report uses a similar pattern: `phone_validation_detailed_output_{run_id}.xlsx`.
+*   **`FILENAME_COMPANY_NAME_MAX_LEN`**
+    *   Description: Maximum length for the sanitized company name part in generated filenames (e.g., for scraped content). Helps prevent path length errors.
+    *   Default: `25`
+    *   Guidance: Adjust based on your system's path length limits and your project's root path length. See [`.env.example`](./.env.example) for calculation guidance.
 
-*   **`--run_id <identifier>`** (Optional):
-    *   A string identifier to include in the report output or filenames. If not provided, it might be inferred from the input file path or omitted.
-    *   Example: `--run_id "Run_May16_Morning"`
+#### Web Scraper Settings
+*   **`SCRAPER_USER_AGENT`**: User-Agent string for scraping.
+    *   Default: A common browser User-Agent.
+*   **`SCRAPER_PAGE_TIMEOUT_MS`**: Timeout for page operations (ms).
+    *   Default: `30000` (30s)
+*   **`SCRAPER_NAVIGATION_TIMEOUT_MS`**: Timeout for navigation actions (ms).
+    *   Default: `60000` (60s)
+*   **`SCRAPER_MAX_RETRIES`**: Max retries for a failed scrape attempt.
+    *   Default: `2`
+*   **`SCRAPER_RETRY_DELAY_SECONDS`**: Delay between scrape retries (s).
+    *   Default: `5`
+*   **`SCRAPER_NETWORKIDLE_TIMEOUT_MS`**: Timeout for Playwright's networkidle wait (ms). `0` to disable.
+    *   Default: `3000` (3s)
+*   **`MAX_DEPTH_INTERNAL_LINKS`**: Maximum depth to follow internal links. `0` = initial URL only, `1` = initial URL + direct relevant links.
+    *   Default: `1`
+*   **`RESPECT_ROBOTS_TXT`**: Whether to respect `robots.txt` (`True`/`False`).
+    *   Default: `True`
+*   **`ROBOTS_TXT_USER_AGENT`**: User-agent for `robots.txt` checks.
+    *   Default: `*`
 
-### Outputs
+#### Advanced Link Prioritization & Control
+These settings fine-tune how the scraper discovers and prioritizes links:
+*   **`TARGET_LINK_KEYWORDS`**:
+    *   Description: Comma-separated general keywords. A link's text or URL must contain one of these to be considered for scoring. Acts as an initial gate.
+    *   Example: `TARGET_LINK_KEYWORDS=contact,impressum,kontakt,legal,privacy,terms,ueber-uns,about,support,hilfe,datenschutz`
+*   **`SCRAPER_CRITICAL_PRIORITY_KEYWORDS`**:
+    *   Description: Keywords for top-priority pages (e.g., "Impressum") if found as a standalone segment in a URL path.
+    *   Example: `SCRAPER_CRITICAL_PRIORITY_KEYWORDS=impressum,kontakt,contact,imprint`
+*   **`SCRAPER_HIGH_PRIORITY_KEYWORDS`**:
+    *   Description: Keywords for high-priority pages (e.g., "Legal") if found as a standalone segment.
+    *   Example: `SCRAPER_HIGH_PRIORITY_KEYWORDS=legal,privacy,terms,datenschutz,ueber-uns,about,about-us`
+*   **`SCRAPER_MAX_KEYWORD_PATH_SEGMENTS`**:
+    *   Description: Max path segments for a priority keyword (critical/high) to retain its highest score tier. Longer paths get a slight score penalty.
+    *   Default: `3`
+*   **`SCRAPER_EXCLUDE_LINK_PATH_PATTERNS`**:
+    *   Description: Comma-separated URL path patterns. Links containing these are hard-excluded.
+    *   Example: `SCRAPER_EXCLUDE_LINK_PATH_PATTERNS=/media/,/blog/,/video/,/hilfe-video/`
+*   **`SCRAPER_MAX_PAGES_PER_DOMAIN`**:
+    *   Description: Max pages to scrape per domain. `0` for no limit.
+    *   Default: `20`
+*   **`SCRAPER_MIN_SCORE_TO_QUEUE`**:
+    *   Description: Minimum score a link needs from `find_internal_links` to be added to the scrape queue.
+    *   Default: `40`
+*   **`SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS`**:
+    *   Description: When `SCRAPER_MAX_PAGES_PER_DOMAIN` is hit, only links scoring at/above this threshold will be processed.
+    *   Default: `80`
 
-*   **Console Summary**: The script prints a summary to the console, including:
-    *   Total records processed.
-    *   Number of phone numbers found/validated.
-    *   Number of entries flagged for manual review.
-*   **`manual_review_queue.xlsx`**: An Excel file created in the specified (or default) output directory. This file contains a subset of the processed data, specifically those entries where:
-    *   No phone number could be found.
-    *   Multiple conflicting phone numbers were found.
-    *   The confidence in the found number is low.
-    *   Errors occurred during processing.
+#### LLM (Gemini) Settings
+*   **`GEMINI_API_KEY`** (Required): Your Google Gemini API key.
+*   **`LLM_MODEL_NAME`**: Specific Gemini model.
+    *   Default: `gemini-1.5-pro-latest`
+*   **`LLM_TEMPERATURE`**: Controls LLM output randomness (0.0-1.0).
+    *   Default: `0.5`
+*   **`LLM_MAX_TOKENS`**: Max tokens for LLM response.
+    *   Default: `8192` (increased from older default)
+*   **`LLM_PROMPT_TEMPLATE_PATH`**: Path to LLM prompt template file, relative to project root.
+    *   Default: `prompts/gemini_phone_validation_v1.txt`
 
-## 6. Configuration
+#### Phone Number Normalization
+*   **`TARGET_COUNTRY_CODES`**: Comma-separated ISO country codes (e.g., DE, CH, AT) for parsing hints.
+    *   Default: `DE,CH,AT`
+*   **`DEFAULT_REGION_CODE`**: Default region if a number can't be parsed with specific context.
+    *   Default: `DE`
 
-The pipeline's behavior can be customized in two main ways:
+#### Logging Settings
+*   **`LOG_LEVEL`**: Log level for the main run log file (DEBUG, INFO, WARNING, ERROR).
+    *   Default: `INFO`
+*   **`CONSOLE_LOG_LEVEL`**: Log level for console output.
+    *   Default: `WARNING` (to keep console less verbose)
 
-### Via `.env` File
-This is the primary method for configuration. As detailed in the [Environment Variables](#environment-variables-env-file) section, you can adjust scraper settings, LLM parameters, file paths, and more by editing the `.env` file in the `phone_validation_pipeline` root. Changes to `.env` are loaded when the scripts start.
+## 6. Troubleshooting
 
-### Via `src/core/config.py`
-The [`src/core/config.py`](./src/core/config.py:1) file defines the `AppConfig` class, which loads values from environment variables and provides default fallbacks.
-*   **Modifying Defaults**: You can change the default values directly in `config.py` if an environment variable is not set. However, this is generally discouraged for instance-specific settings; `.env` is preferred.
-*   **Adding New Configurations**: If new configurable parameters are needed for the application, they should be:
-    1.  Added as attributes to the `AppConfig` class in `config.py`.
-    2.  Loaded from `os.getenv()` within the `AppConfig.__init__` method, with a sensible default.
-    3.  Documented with a corresponding entry in `.env.example`.
+*   **`GEMINI_API_KEY` errors**: Ensure key is correct in `.env`, file is loaded, and key is active with permissions.
+*   **Playwright browser issues**: Run `playwright install` in your venv.
+*   **`FileNotFoundError` for input**: Verify `INPUT_EXCEL_FILE_PATH` in `.env` is correct and relative to project root.
+*   **Scraping issues (blocks, CAPTCHAs)**: Adjust timeouts. For persistent blocks, advanced techniques (not currently in scope) may be needed. Check `RESPECT_ROBOTS_TXT`.
+*   **Incorrect phone parsing**: Check `TARGET_COUNTRY_CODES`, `DEFAULT_REGION_CODE`. Refine regex or LLM prompt if needed.
+*   **`ModuleNotFoundError`**: Ensure venv is active and `pip install -r requirements.txt` was successful.
+*   **Scraper not finding enough/too many pages**:
+    *   Adjust `TARGET_LINK_KEYWORDS`: too broad might find too much, too narrow might miss pages.
+    *   Tune `SCRAPER_CRITICAL_PRIORITY_KEYWORDS` and `SCRAPER_HIGH_PRIORITY_KEYWORDS` for pages you absolutely need.
+    *   Modify `SCRAPER_MIN_SCORE_TO_QUEUE`: a higher value makes it more selective.
+    *   Adjust `SCRAPER_MAX_PAGES_PER_DOMAIN` to control volume.
+    *   Use `SCRAPER_EXCLUDE_LINK_PATH_PATTERNS` to explicitly ignore irrelevant sections.
+    *   Check `MAX_DEPTH_INTERNAL_LINKS`.
+*   **Path too long errors (Windows)**:
+    *   Reduce `FILENAME_COMPANY_NAME_MAX_LEN` in `.env`.
+    *   Ensure your project root path is not excessively long.
 
-## 7. Troubleshooting
-
-Here are some common issues and potential solutions:
-
-*   **`GEMINI_API_KEY` not found or invalid**:
-    *   **Symptom**: Errors related to "API key not valid" or "Authentication failed" when the LLM component runs.
-    *   **Solution**:
-        1.  Ensure your `GEMINI_API_KEY` in the `.env` file is correct and active.
-        2.  Verify that the `.env` file is in the `phone_validation_pipeline` root directory and is being loaded (check for warning messages when scripts start).
-        3.  Check your Google AI Studio or Cloud Console to ensure the API key is enabled and has the necessary permissions for the Gemini models.
-
-*   **Playwright browser issues (e.g., "browser not found")**:
-    *   **Symptom**: Errors during the scraping phase indicating Playwright cannot find or launch a browser.
-    *   **Solution**:
-        1.  Run `playwright install` again from your activated virtual environment to ensure browsers are correctly installed for the current Python environment.
-        2.  Check for any conflicting Playwright installations or system PATH issues.
-
-*   **Input file not found (`FileNotFoundError`)**:
-    *   **Symptom**: `main_pipeline.py` exits early with a `FileNotFoundError`.
-    *   **Solution**:
-        1.  Verify that the `INPUT_EXCEL_FILE_PATH` in your `.env` file is correct.
-        2.  Ensure the path is relative to the `phone_validation_pipeline` directory (e.g., `data/my_input.xlsx` if the file is in `phone_validation_pipeline/data/`).
-        3.  Check for typos in the filename or path.
-
-*   **Scraping issues (sites blocking, CAPTCHAs, dynamic content)**:
-    *   **Symptom**: Scraper fails to retrieve content, gets empty pages, or encounters errors like timeouts or access denied.
-    *   **Solution**:
-        1.  Adjust `SCRAPER_PAGE_TIMEOUT_MS` and `SCRAPER_NAVIGATION_TIMEOUT_MS` in `.env` if sites are slow to load.
-        2.  The current scraper has basic retry logic. For persistent blocks, more advanced techniques (proxy rotation, CAPTCHA solving services, more human-like interaction simulation) might be needed, which are beyond the current scope.
-        3.  Ensure `RESPECT_ROBOTS_TXT` is set appropriately. Some sites may block if `robots.txt` is ignored.
-
-*   **Incorrect phone number parsing/validation**:
-    *   **Symptom**: Valid phone numbers are missed, or invalid ones are accepted.
-    *   **Solution**:
-        1.  Check `TARGET_COUNTRY_CODES` and `DEFAULT_REGION_CODE` in `.env`. Ensure they are relevant to the geographical scope of your input data.
-        2.  The regex patterns in `regex_extractor_component.py` might need refinement for specific or unusual phone number formats.
-        3.  The LLM prompt in `prompts/gemini_phone_validation_v1.txt` can be adjusted to improve its accuracy for phone number identification and formatting instructions.
-
-*   **Dependencies not installed / ModuleNotFoundError**:
-    *   **Symptom**: Python raises `ModuleNotFoundError` for a package like `pandas`, `playwright`, etc.
-    *   **Solution**:
-        1.  Ensure your virtual environment is activated.
-        2.  Run `pip install -r requirements.txt` again to install any missing packages.
-
-For issues not covered here, check the application logs (usually printed to the console, or in `pipeline.log` if configured) for more detailed error messages.
+For other issues, consult the run log file in the `output_data/[RunID]/` directory.

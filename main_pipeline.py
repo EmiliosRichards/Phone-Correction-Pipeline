@@ -5,12 +5,14 @@ from src.scraper import scrape_website
 from src.regex_extractor_component import extract_numbers_with_snippets_from_text
 from src.llm_extractor_component import GeminiLLMExtractor
 from src.core.schemas import PhoneNumberLLMOutput # LLMExtractionResult not directly used for typing here
+from src.scraper.scraper_logic import normalize_url
 from src.core.logging_config import setup_logging
 from src.core.config import AppConfig
 import logging
 import os
 import asyncio
 from datetime import datetime
+import time
 import json
 import re
 from urllib.parse import urlparse, quote
@@ -105,6 +107,12 @@ def main() -> None:
         df = load_and_preprocess_data(INPUT_FILE_PATH, app_config_instance=app_config)
         if df is not None:
             logger.info(f"Successfully loaded and preprocessed data from {INPUT_FILE_PATH}. Shape: {df.shape}")
+            logger.info(f"DataFrame columns: {df.columns.tolist()}") # Log column names
+            if 'GivenURL' in df.columns:
+                logger.info(f"First 5 'GivenURL' values: {df['GivenURL'].head().tolist()}")
+            else:
+                logger.warning("'GivenURL' column not found in the loaded DataFrame.")
+                logger.info(f"First 2 rows of loaded DataFrame for inspection:\n{df.head(2).to_string()}")
             logger.debug(f"Loaded DataFrame head:\n{df.head().to_string()}")
         else:
             logger.error(f"Failed to load data from {INPUT_FILE_PATH}. DataFrame is None.")
@@ -308,16 +316,18 @@ def main() -> None:
                             else:
                                 # Save LLM input candidates file, perhaps named with canonical URL context
                                 safe_canonical_name_for_file = "".join(c if c.isalnum() else "_" for c in final_canonical_entry_url.replace("http://","").replace("https://",""))
-                                llm_input_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_input.json"
+                                llm_input_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_input_data.json"
                                 llm_input_filepath = os.path.join(llm_context_dir, llm_input_filename)
                                 try:
                                     with open(llm_input_filepath, 'w', encoding='utf-8') as f_in: json.dump(all_candidate_items_for_llm, f_in, indent=2)
-                                    logger.info(f"Saved LLM input candidates for {final_canonical_entry_url} to {llm_input_filepath}")
-                                except IOError as e: logger.error(f"IOError saving LLM input for {final_canonical_entry_url}: {e}")
+                                    logger.info(f"Saved LLM input data for {final_canonical_entry_url} to {llm_input_filepath}")
+                                except IOError as e: logger.error(f"IOError saving LLM input data for {final_canonical_entry_url}: {e}")
 
                                 llm_classified_outputs, llm_raw_response = llm_extractor.extract_phone_numbers(
                                     candidate_items=all_candidate_items_for_llm,
-                                    prompt_template_path=prompt_template_abs_path
+                                    prompt_template_path=prompt_template_abs_path,
+                                    llm_context_dir=llm_context_dir,
+                                    file_identifier_prefix=f"CANONICAL_{safe_canonical_name_for_file}"
                                 )
                                 canonical_site_llm_results[final_canonical_entry_url] = llm_classified_outputs
                                 canonical_site_scraper_status[final_canonical_entry_url] = current_row_scraper_status # Should be "Success"
@@ -498,213 +508,129 @@ def main() -> None:
             df.at[index, 'Original_Number_Status'] = 'Original_InvalidFormat'
         else:
             df.at[index, 'Original_Number_Status'] = 'Original_Not_Provided'
-
+        
         # Determine Overall_VerificationStatus
-        overall_status_prefix = ""
-        # Check if this input_row's given_url was different from its final canonical_url
-        # AND if this final_canonical_url was also the target of *another* input_url.
-        # This requires checking if other input_urls in input_to_canonical_map point to canonical_url_summary.
-        # For simplicity, we can just note if it was a redirect.
-        if canonical_url_summary and given_url_summary != canonical_url_summary :
-             overall_status_prefix = f"RedirectedTo[{canonical_url_summary}]_"
-
-
+        overall_status = "Unverified" # Default
         if scraper_status_summary != "Success":
-            df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + f'Unverified_Scrape_{scraper_status_summary}'
-        elif canonical_url_summary and canonical_url_summary in canonical_site_llm_results:
-            # If LLM processing for the canonical URL itself had an error (e.g. prompt missing)
-            if canonical_site_scraper_status.get(canonical_url_summary) and canonical_site_scraper_status[canonical_url_summary] != "Success":
-                 df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + canonical_site_scraper_status[canonical_url_summary] # e.g. Error_LLM_PromptMissing
-            elif primary_numbers_summary:
-                df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'Primary_Found'
-            elif secondary_numbers_summary:
-                df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'Secondary_Found'
-            elif support_numbers_summary:
-                df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'Support_Only_Found'
-            elif low_relevance_summary:
-                df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'LowRelevance_Only_Found'
-            elif not llm_outputs_for_summary : # LLM ran for canonical but yielded no items
-                 df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'LLM_NoOutput_For_Canonical'
-            else: # Only Non-Business or unclassified from LLM
-                df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'No_Relevant_Phones_LLM'
-        else: # Scraped successfully, but canonical URL somehow not in LLM results (e.g. no regex candidates)
-            df.at[index, 'Overall_VerificationStatus'] = overall_status_prefix + 'NoSnippets_For_LLM'
+            overall_status = f"Unverified_Scrape_{scraper_status_summary}"
+        elif primary_numbers_summary:
+            overall_status = "Verified_Primary_Found"
+        elif secondary_numbers_summary:
+            overall_status = "Verified_Secondary_Found"
+        elif support_numbers_summary: # Only if no primary/secondary
+            overall_status = "Verified_Support_Found"
+        elif low_relevance_summary: # Only if no primary/secondary/support
+            overall_status = "Verified_LowRelevance_Found"
+        elif llm_outputs_for_summary: # LLM ran, found items, but none matched above categories
+            overall_status = "Unverified_LLM_NoHighValueMatch"
+        elif canonical_url_summary and canonical_url_summary in canonical_site_llm_results and not llm_outputs_for_summary:
+            # LLM ran for this canonical URL but returned absolutely nothing
+            overall_status = "Unverified_LLM_OutputEmpty"
+        elif canonical_url_summary and canonical_site_scraper_status.get(canonical_url_summary) == "Error_LLM_Processing":
+            overall_status = "Error_LLM_Processing_For_Canonical"
+        elif canonical_url_summary and canonical_site_scraper_status.get(canonical_url_summary) == "Error_LLM_PromptMissing":
+            overall_status = "Error_LLM_PromptMissing_For_Canonical"
+        # else: stays "Unverified" if scrape was success but no LLM results for canonical (e.g. no regex snippets)
+
+        # Prepend redirect info if applicable
+        original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
+        if canonical_url_summary and input_to_canonical_map.get(original_input_url_for_map) != original_input_url_for_map : # Check if it was actually different from input
+             # Check if the original input URL (if valid) is different from the canonical one
+            normalized_original_for_comparison = normalize_url(original_input_url_for_map) if original_input_url_for_map != "None_GivenURL_Input" else None
+            if normalized_original_for_comparison and normalized_original_for_comparison != canonical_url_summary:
+                 overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
+        
+        df.at[index, 'Overall_VerificationStatus'] = overall_status
+        df.at[index, 'ScrapingStatus_Canonical'] = canonical_site_scraper_status.get(str(canonical_url_summary), scraper_status_summary) if canonical_url_summary is not None else scraper_status_summary
+        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if canonical_url_summary and canonical_url_summary in canonical_site_llm_results else (canonical_site_scraper_status.get(str(canonical_url_summary), "Not_Processed_Or_Scrape_Failed") if canonical_url_summary is not None else "Not_Processed_Or_Scrape_Failed")
 
 
-    # --- Excel Saving Logic ---
-    # (This part is already mostly correct from line 538 onwards, just needs to be un-commented / placed correctly)
-    # 1. Create and save the Detailed Flattened Report
+    # Create and save Detailed Flattened Report
     if all_flattened_rows:
         df_detailed_flattened = pd.DataFrame(all_flattened_rows)
-        if 'LLM_Classification' in df_detailed_flattened.columns:
-            # Define categories for sorting, excluding None from the explicit category list for pd.Categorical
-            valid_categories = [k for k in classification_precedence.keys() if k is not None]
-            df_detailed_flattened['LLM_Classification'] = pd.Categorical(
-                df_detailed_flattened['LLM_Classification'],
-                categories=valid_categories, # Use defined order without None
-                ordered=True
-            )
-            sort_by_cols_detailed = [col for col in ['CompanyName', 'Canonical_URL', 'LLM_Classification'] if col in df_detailed_flattened.columns]
-            if sort_by_cols_detailed:
-                df_detailed_flattened.sort_values(by=sort_by_cols_detailed, ascending=[True]*len(sort_by_cols_detailed), inplace=True, na_position='last')
         
-        for col in detailed_columns_order: # detailed_columns_order defined after Pass 1 logs
-            if col not in df_detailed_flattened.columns: df_detailed_flattened[col] = pd.NA
-        df_detailed_flattened = df_detailed_flattened[detailed_columns_order]
-    else:
-        df_detailed_flattened = pd.DataFrame(columns=detailed_columns_order)
-
-    detailed_output_excel_path: str = os.path.join(run_output_dir, f"phone_validation_detailed_output_{run_id}.xlsx")
-    try:
-        with pd.ExcelWriter(detailed_output_excel_path, engine='openpyxl') as writer:
-            df_detailed_flattened.to_excel(writer, index=False, sheet_name='Detailed_LLM_Output')
-            worksheet = writer.sheets['Detailed_LLM_Output']
-            for idx, col_name_iter in enumerate(df_detailed_flattened.columns):
-                series = df_detailed_flattened[col_name_iter]
-                max_len = max(series.astype(str).map(len).max(), len(str(series.name))) + 2
-                if pd.isna(max_len): max_len = len(str(col_name_iter)) + 2
-                worksheet.column_dimensions[get_column_letter(idx + 1)].width = max_len
-        logger.info(f"Detailed flattened report saved to {detailed_output_excel_path}")
-    except Exception as e:
-        logger.error(f"Error saving detailed flattened Excel: {e}", exc_info=True)
-
-    # 2. Prepare and save the Summary Report (the main 'df')
-    for col in summary_columns_order: # summary_columns_order defined after Pass 1 logs
-        if col not in df.columns: df[col] = pd.NA
-    df_summary_export = df[summary_columns_order].copy()
-
-    summary_output_excel_path: str = os.path.join(run_output_dir, app_config.output_excel_file_name_template.format(run_id=run_id))
-    try:
-        if 'TargetCountryCodes' in df_summary_export.columns:
-            df_summary_export['TargetCountryCodes'] = df_summary_export['TargetCountryCodes'].apply(
-                lambda x: json.dumps(x) if isinstance(x, list) else str(x)
-            )
-        with pd.ExcelWriter(summary_output_excel_path, engine='openpyxl') as writer:
-            df_summary_export.to_excel(writer, index=False, sheet_name='Summary_Report')
-            worksheet = writer.sheets['Summary_Report']
-            for idx, col_name_iter in enumerate(df_summary_export.columns):
-                series = df_summary_export[col_name_iter]
-                max_len = max(series.astype(str).map(len).max(), len(str(series.name))) + 2
-                if pd.isna(max_len): max_len = len(str(col_name_iter)) + 2
-                worksheet.column_dimensions[get_column_letter(idx + 1)].width = max_len
-        logger.info(f"Summary report saved to {summary_output_excel_path} with auto-adjusted column widths.")
-    except Exception as e:
-        logger.error(f"Error saving summary output Excel: {e}", exc_info=True)
-
-    logger.info("Phone validation pipeline finished.")
-
-    # 1. Create and save the Detailed Flattened Report
-    detailed_columns_order = [ # Define column order first
-        'CompanyName', 'GivenURL', 'Description', 'ScrapingStatus',
-        'LLM_Source_URL', 'LLM_Number', 'LLM_Type', 'LLM_Classification',
-        'TargetCountryCodes', 'RunID' # Moved to end
-    ]
-
-    if all_flattened_rows: # Only process if there's data
-        df_detailed_flattened = pd.DataFrame(all_flattened_rows)
+        # Custom sort for LLM_Classification
+        classification_sort_order = ['Primary', 'Secondary', 'Support', 'Low Relevance', 'Non-Business']
+        df_detailed_flattened['LLM_Classification_Sort'] = pd.Categorical(
+            df_detailed_flattened['LLM_Classification'],
+            categories=classification_sort_order,
+            ordered=True
+        )
+        df_detailed_flattened = df_detailed_flattened.sort_values(
+            by=['CompanyName', 'Canonical_URL', 'LLM_Classification_Sort', 'LLM_Number'],
+            na_position='last' # Ensure NaNs in sort key are handled if any
+        ).drop(columns=['LLM_Classification_Sort'])
         
-        # Define classification order for sorting
-        classification_order = ['Primary', 'Secondary', 'Support', 'Low Relevance', 'Non-Business']
-        if 'LLM_Classification' in df_detailed_flattened.columns:
-            df_detailed_flattened['LLM_Classification'] = pd.Categorical(
-                df_detailed_flattened['LLM_Classification'],
-                categories=classification_order,
-                ordered=True
-            )
-            sort_by_columns = ['CompanyName', 'LLM_Classification']
-            # Ensure CompanyName exists for sorting
-            if 'CompanyName' not in df_detailed_flattened.columns:
-                logger.warning("CompanyName column missing in df_detailed_flattened before sorting. Sorting by LLM_Classification only.")
-                sort_by_columns = ['LLM_Classification']
-            elif not all(col in df_detailed_flattened.columns for col in sort_by_columns): # Check if both exist
-                 logger.warning(f"One or more sort_by_columns ({sort_by_columns}) missing in df_detailed_flattened. Skipping sort or using available.")
-                 sort_by_columns = [col for col in sort_by_columns if col in df_detailed_flattened.columns]
-
-
-            if sort_by_columns: # Only sort if there are valid columns to sort by
-                df_detailed_flattened.sort_values(
-                    by=sort_by_columns,
-                    ascending=[True] * len(sort_by_columns), # Match ascending list length to sort_by_columns
-                    inplace=True,
-                    na_position='last'
-                )
-            else:
-                logger.warning("No valid columns to sort df_detailed_flattened by.")
-
-        # Ensure all desired columns exist and are in order
+        # Ensure all columns are present, fill missing with None or empty string
         for col in detailed_columns_order:
             if col not in df_detailed_flattened.columns:
-                df_detailed_flattened[col] = pd.NA
-        df_detailed_flattened = df_detailed_flattened[detailed_columns_order] # Reorder and select
-    else: # No data for detailed report
-        logger.info("No data to populate the detailed flattened report. An empty sheet will be created.")
-        df_detailed_flattened = pd.DataFrame(columns=detailed_columns_order)
+                df_detailed_flattened[col] = None # Or appropriate default like ''
+        
+        df_detailed_export = df_detailed_flattened[detailed_columns_order].copy()
 
+        detailed_output_filename = f"phone_validation_detailed_output_{run_id}.xlsx"
+        detailed_output_excel_path = os.path.join(run_output_dir, detailed_output_filename)
+        try:
+            logger.info(f"Attempting to save detailed report to: {detailed_output_excel_path}")
+            with pd.ExcelWriter(detailed_output_excel_path, engine='openpyxl') as writer:
+                df_detailed_export.to_excel(writer, index=False, sheet_name='Detailed_Phone_Data')
+                # Auto-adjust column widths for detailed report
+                for column in df_detailed_export:
+                    column_length = max(df_detailed_export[column].astype(str).map(len).max(), len(str(column)))
+                    col_letter = get_column_letter(list(df_detailed_export.columns).index(str(column)) + 1)
+                    writer.sheets['Detailed_Phone_Data'].column_dimensions[col_letter].width = column_length + 2
+            logger.info(f"Detailed report saved successfully to {detailed_output_excel_path}")
+        except Exception as e_detailed:
+            logger.error(f"Error saving detailed report to {detailed_output_excel_path}: {e_detailed}", exc_info=True)
+    else:
+        logger.info("No data for detailed flattened report. Skipping file creation.")
 
-    detailed_output_excel_path: str = os.path.join(run_output_dir, f"phone_validation_detailed_output_{run_id}.xlsx")
-    try:
-        with pd.ExcelWriter(detailed_output_excel_path, engine='openpyxl') as writer:
-            df_detailed_flattened.to_excel(writer, index=False, sheet_name='Detailed_LLM_Output')
-            worksheet = writer.sheets['Detailed_LLM_Output']
-            for idx, col_name in enumerate(df_detailed_flattened.columns):
-                series = df_detailed_flattened[col_name]
-                max_len = max(
-                    series.astype(str).map(len).max(),
-                    len(str(series.name))
-                ) + 2
-                if pd.isna(max_len): max_len = len(str(col_name)) + 2 # Handle empty series case
-                worksheet.column_dimensions[get_column_letter(idx + 1)].width = max_len
-        logger.info(f"Detailed flattened report saved to {detailed_output_excel_path}")
-    except Exception as e:
-        logger.error(f"Error saving detailed flattened Excel: {e}", exc_info=True)
-
-    # 2. Prepare and save the Summary Report (modifying the original 'df')
-    summary_columns_order = [
-        'CompanyName', 'GivenURL', 'GivenPhoneNumber', 'NormalizedGivenPhoneNumber', 'Description',
-        'ScrapingStatus', 'Original_Number_Status', 'Overall_VerificationStatus',
-        'Primary_Number_1', 'Primary_Type_1', 'Primary_SourceURL_1',
-        'Secondary_Number_1', 'Secondary_Type_1', 'Secondary_SourceURL_1',
-        'Secondary_Number_2', 'Secondary_Type_2', 'Secondary_SourceURL_2',
-        'TargetCountryCodes', 'RunID' # Moved to end
-    ]
-    # Select and reorder columns for the summary DataFrame 'df'
-    # Ensure all columns exist before trying to select/reorder them
+    # Prepare and save Summary Report (from the modified main df)
+    # Ensure all expected columns exist in df before selecting/reordering
     for col in summary_columns_order:
         if col not in df.columns:
-            df[col] = pd.NA # Or appropriate default like empty string
-            
-    # Ensure all summary columns exist in df, fill with NA if not, then select and reorder
-    for col in summary_columns_order:
-        if col not in df.columns:
-            df[col] = pd.NA
-    df_summary_export = df[summary_columns_order].copy() # Create the final summary df
+            # Initialize missing columns that should have been created by data_handler or this script
+            if col in ['CanonicalEntryURL', 'ScrapingStatus_Canonical', 'LLM_Processing_Status_Canonical', 'Overall_VerificationStatus', 'Original_Number_Status',
+                       'Primary_Number_1', 'Primary_Type_1', 'Primary_SourceURL_1', 
+                       'Secondary_Number_1', 'Secondary_Type_1', 'Secondary_SourceURL_1',
+                       'Secondary_Number_2', 'Secondary_Type_2', 'Secondary_SourceURL_2']:
+                df[col] = None # Or appropriate default like ''
+            elif col == 'RunID':
+                df[col] = run_id
+            # 'TargetCountryCodes' should come from input or be added by data_handler
+            # 'CompanyName', 'GivenURL' are expected from input.
+            # If other critical columns are missing, it indicates an earlier problem.
+            # For now, just ensure they exist to prevent KeyError on selection.
+            elif col not in df.columns: # Catch-all for any other defined in summary_columns_order
+                 df[col] = None
 
-    summary_output_excel_path: str = os.path.join(run_output_dir, app_config.output_excel_file_name_template.format(run_id=run_id))
+
+    df_summary_export = df[[col for col in summary_columns_order if col in df.columns]].copy()
+    
+    summary_output_filename = app_config.output_excel_file_name_template.format(run_id=run_id)
+    summary_output_excel_path = os.path.join(run_output_dir, summary_output_filename)
     try:
-        # Convert only necessary columns to string for Excel (e.g., lists like TargetCountryCodes)
-        # Other LLM related fields (Primary_*, Secondary_*) should be primitive types by now.
-        if 'TargetCountryCodes' in df_summary_export.columns:
-            df_summary_export['TargetCountryCodes'] = df_summary_export['TargetCountryCodes'].apply(
-                lambda x: json.dumps(x) if isinstance(x, list) else str(x)
-            )
-        # Add any other list/dict columns here if they exist in summary_columns_order and need string conversion
-
+        logger.info(f"Attempting to save summary report to: {summary_output_excel_path}")
         with pd.ExcelWriter(summary_output_excel_path, engine='openpyxl') as writer:
-            df_summary_export.to_excel(writer, index=False, sheet_name='Summary_Report')
-            worksheet = writer.sheets['Summary_Report']
-            for idx, col_name in enumerate(df_summary_export.columns):
-                series = df_summary_export[col_name]
-                max_len = max(
-                    series.astype(str).map(len).max(),
-                    len(str(series.name))
-                ) + 2
-                if pd.isna(max_len): max_len = len(str(col_name)) + 2
-                worksheet.column_dimensions[get_column_letter(idx + 1)].width = max_len
-        logger.info(f"Summary report saved to {summary_output_excel_path} with auto-adjusted column widths.")
-    except Exception as e:
-        logger.error(f"Error saving summary output Excel: {e}", exc_info=True)
+            df_summary_export.to_excel(writer, index=False, sheet_name='Phone_Validation_Summary')
+            # Auto-adjust column widths for summary report
+            for column in df_summary_export:
+                column_length = max(df_summary_export[column].astype(str).map(len).max(), len(str(column)))
+                col_letter = get_column_letter(list(df_summary_export.columns).index(str(column)) + 1)
+                writer.sheets['Phone_Validation_Summary'].column_dimensions[col_letter].width = column_length + 2
+        logger.info(f"Summary report saved successfully to {summary_output_excel_path}")
+    except Exception as e_summary:
+        logger.error(f"Error saving summary report to {summary_output_excel_path}: {e_summary}", exc_info=True)
 
-    logger.info("Phone validation pipeline finished.")
+    logger.info(f"Pipeline run {run_id} finished.")
+    total_duration = time.time() - datetime.strptime(run_id, "%Y%m%d_%H%M%S").timestamp()
+    logger.info(f"Total pipeline duration: {total_duration:.2f} seconds.")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
+    # This basic setup is for when the script is run directly.
+    # The main() function will then call the more detailed setup_logging.
+    if not logger.hasHandlers(): # Ensure basic config if run directly and not imported
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     main()

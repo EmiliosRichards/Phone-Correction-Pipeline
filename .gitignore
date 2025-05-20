@@ -163,4 +163,6 @@ ms-playwright/
 # Excel input file
 data_to_be_inputed.xlsx
 
+# Data files
 old_output_data/
+output_data

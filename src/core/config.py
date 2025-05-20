@@ -42,28 +42,42 @@ class AppConfig:
         default_navigation_timeout (int): Default timeout for navigation actions in milliseconds.
         scrape_max_retries (int): Maximum retries for a failed scrape attempt.
         scrape_retry_delay_seconds (int): Delay in seconds between scrape retries.
-        target_link_keywords (List[str]): Keywords to identify relevant internal links.
+        
+        target_link_keywords (List[str]): General keywords to identify potentially relevant internal links.
+        scraper_critical_priority_keywords (List[str]): Keywords indicating top-priority pages if found as standalone path segments.
+        scraper_high_priority_keywords (List[str]): Keywords indicating high-priority pages if found as standalone path segments.
+        scraper_max_keyword_path_segments (int): Max path segments for a priority keyword to retain its highest score tier.
+        scraper_exclude_link_path_patterns (List[str]): URL path patterns to hard-exclude from scraping.
+        scraper_max_pages_per_domain (int): Max pages to scrape per domain (0 for no limit).
+        scraper_min_score_to_queue (int): Minimum score a link needs to be added to the scrape queue.
+        scraper_score_threshold_for_limit_bypass (int): Score threshold for a page to bypass the max_pages_per_domain limit.
+        
         max_depth_internal_links (int): Maximum depth to follow internal links.
         scraper_networkidle_timeout_ms (int): Timeout in ms for Playwright's networkidle wait. 0 to disable.
         snippet_window_chars (int): Number of characters before/after a regex match for snippet extraction.
-        # snippet_window_lines (int): Number of lines before/after a regex match for snippet extraction. (DEPRECATED)
+        
         output_base_dir (str): Base directory for output files.
         scraped_content_subdir (str): Subdirectory name for storing scraped content.
         llm_context_subdir (str): Subdirectory name for storing LLM context/raw responses.
         filename_company_name_max_len (int): Maximum length for the sanitized company name part of output filenames.
+        
         respect_robots_txt (bool): Whether the scraper should respect robots.txt.
         robots_txt_user_agent (str): User-agent string for checking robots.txt.
+        
         gemini_api_key (Optional[str]): API key for Google Gemini.
         llm_model_name (str): Specific Google Gemini model to use.
         llm_temperature (float): Temperature for LLM response generation.
         llm_max_tokens (int): Maximum tokens for LLM response.
         llm_prompt_template_path (str): Path to the LLM prompt template file.
+        
         target_country_codes (List[str]): Target country codes for phone number parsing.
         default_region_code (Optional[str]): Default region code for phone number parsing.
+        
         input_excel_file_path (str): Path to the input data file.
         output_excel_file_name_template (str): Template for the output Excel file name.
         skip_rows_config (Optional[int]): Number of rows to skip from the start of the input file (0-indexed).
         nrows_config (Optional[int]): Number of rows to read after skipping. None means read to end.
+        
         log_level (str): Logging level for the file log (e.g., INFO, DEBUG).
         console_log_level (str): Logging level for console output (e.g., WARNING, INFO).
 
@@ -89,12 +103,28 @@ class AppConfig:
         self.scrape_max_retries: int = int(os.getenv('SCRAPER_MAX_RETRIES', '2'))
         self.scrape_retry_delay_seconds: int = int(os.getenv('SCRAPER_RETRY_DELAY_SECONDS', '5'))
         
-        target_link_keywords_str: str = os.getenv('TARGET_LINK_KEYWORDS', 'contact,about,support,impressum,kontakt,legal,privacy,terms')
-        self.target_link_keywords: List[str] = [keyword.strip().lower() for keyword in target_link_keywords_str.split(',')]
+        # Link Prioritization and Control Settings
+        target_link_keywords_str: str = os.getenv('TARGET_LINK_KEYWORDS', 'contact,about,support,impressum,kontakt,legal,privacy,terms,hilfe,datenschutz,ueber-uns')
+        self.target_link_keywords: List[str] = [kw.strip().lower() for kw in target_link_keywords_str.split(',') if kw.strip()]
         
+        critical_priority_keywords_str: str = os.getenv('SCRAPER_CRITICAL_PRIORITY_KEYWORDS', 'impressum,kontakt,contact,imprint')
+        self.scraper_critical_priority_keywords: List[str] = [kw.strip().lower() for kw in critical_priority_keywords_str.split(',') if kw.strip()]
+        
+        high_priority_keywords_str: str = os.getenv('SCRAPER_HIGH_PRIORITY_KEYWORDS', 'legal,privacy,terms,datenschutz,ueber-uns,about,about-us')
+        self.scraper_high_priority_keywords: List[str] = [kw.strip().lower() for kw in high_priority_keywords_str.split(',') if kw.strip()]
+        
+        self.scraper_max_keyword_path_segments: int = int(os.getenv('SCRAPER_MAX_KEYWORD_PATH_SEGMENTS', '3'))
+        
+        exclude_link_patterns_str: str = os.getenv('SCRAPER_EXCLUDE_LINK_PATH_PATTERNS', '/media/,/blog/,/wp-content/,/video/,/hilfe-video/')
+        self.scraper_exclude_link_path_patterns: List[str] = [p.strip().lower() for p in exclude_link_patterns_str.split(',') if p.strip()]
+        
+        self.scraper_max_pages_per_domain: int = int(os.getenv('SCRAPER_MAX_PAGES_PER_DOMAIN', '20')) # Default 20, 0 for no limit
+        self.scraper_min_score_to_queue: int = int(os.getenv('SCRAPER_MIN_SCORE_TO_QUEUE', '40'))
+        self.scraper_score_threshold_for_limit_bypass: int = int(os.getenv('SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS', '80'))
+
+        # Existing Scraper Settings
         self.max_depth_internal_links: int = int(os.getenv('MAX_DEPTH_INTERNAL_LINKS', '1'))
         self.scraper_networkidle_timeout_ms: int = int(os.getenv('SCRAPER_NETWORKIDLE_TIMEOUT_MS', '3000')) # Default 3s, 0 to disable
-        # self.snippet_window_lines: int = int(os.getenv('SNIPPET_WINDOW_LINES', '3')) # DEPRECATED
         self.snippet_window_chars: int = int(os.getenv('SNIPPET_WINDOW_CHARS', '300')) # Character window for snippets, default 300 chars
 
         # --- Output Configuration ---
@@ -118,7 +148,7 @@ class AppConfig:
 
         # --- Phone Number Normalization Configuration ---
         target_country_codes_str: str = os.getenv('TARGET_COUNTRY_CODES', 'DE,CH,AT') # Germany, Switzerland, Austria
-        self.target_country_codes: List[str] = [code.strip().upper() for code in target_country_codes_str.split(',')]
+        self.target_country_codes: List[str] = [code.strip().upper() for code in target_country_codes_str.split(',') if code.strip()]
         self.default_region_code: Optional[str] = os.getenv('DEFAULT_REGION_CODE', 'DE') # Default region for parsing if others fail
 
         # --- Data Handling ---
@@ -185,17 +215,16 @@ class AppConfig:
 #     print(f"Loaded .env: {loaded_env}")
 #     print(f"USER_AGENT: {config.user_agent}")
 #     print(f"DEFAULT_PAGE_TIMEOUT: {config.default_page_timeout}")
+#     print(f"TARGET_LINK_KEYWORDS: {config.target_link_keywords}")
+#     print(f"SCRAPER_CRITICAL_PRIORITY_KEYWORDS: {config.scraper_critical_priority_keywords}")
+#     print(f"SCRAPER_HIGH_PRIORITY_KEYWORDS: {config.scraper_high_priority_keywords}")
+#     print(f"SCRAPER_MAX_KEYWORD_PATH_SEGMENTS: {config.scraper_max_keyword_path_segments}")
+#     print(f"SCRAPER_EXCLUDE_LINK_PATH_PATTERNS: {config.scraper_exclude_link_path_patterns}")
+#     print(f"SCRAPER_MAX_PAGES_PER_DOMAIN: {config.scraper_max_pages_per_domain}")
+#     print(f"SCRAPER_MIN_SCORE_TO_QUEUE: {config.scraper_min_score_to_queue}")
+#     print(f"SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS: {config.scraper_score_threshold_for_limit_bypass}")
 #     print(f"GEMINI_API_KEY (exists): {'Yes' if config.gemini_api_key else 'No'}")
-#     print(f"LLM_MODEL_NAME: {config.llm_model_name}")
-#     print(f"LLM_TEMPERATURE: {config.llm_temperature}")
-#     print(f"LLM_MAX_TOKENS: {config.llm_max_tokens}")
-#     print(f"LLM_PROMPT_TEMPLATE_PATH: {config.llm_prompt_template_path}")
-#     print(f"TARGET_COUNTRY_CODES: {config.target_country_codes}")
-#     print(f"DEFAULT_REGION_CODE: {config.default_region_code}")
-#     print(f"OUTPUT_BASE_DIR: {config.output_base_dir}")
-#     print(f"LLM_CONTEXT_SUBDIR: {config.llm_context_subdir}")
-#     print(f"INPUT_EXCEL_FILE_PATH: {config.input_excel_file_path}")
-#     print(f"OUTPUT_EXCEL_FILE_NAME_TEMPLATE: {config.output_excel_file_name_template}")
+#     # ... print other relevant new and existing configs ...
 
 #     # Test resolving paths relative to project root (phone_validation_pipeline)
 #     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # up two levels from core

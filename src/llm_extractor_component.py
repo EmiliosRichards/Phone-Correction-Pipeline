@@ -1,6 +1,7 @@
 import logging
 import json
 import re
+import os
 from typing import Dict, Any, List, Tuple, Optional
 
 from google.generativeai.client import configure
@@ -163,7 +164,9 @@ class GeminiLLMExtractor:
     def extract_phone_numbers(
         self,
         candidate_items: List[Dict[str, str]], # Changed input
-        prompt_template_path: str
+        prompt_template_path: str,
+        llm_context_dir: str,  # New parameter
+        file_identifier_prefix: str  # New parameter
     ) -> Tuple[List[PhoneNumberLLMOutput], Optional[str]]:
         """
         Classifies candidate phone numbers based on their snippets and source URLs using the Gemini API.
@@ -179,6 +182,8 @@ class GeminiLLMExtractor:
                                                    "snippet", and "source_url".
             prompt_template_path (str): The file path to the prompt template. The template
                                         should expect a JSON list of these candidate items.
+            llm_context_dir (str): The directory path to save LLM context files.
+            file_identifier_prefix (str): A prefix for naming LLM context files (e.g., "CANONICAL_domain_com").
 
         Returns:
             Tuple[List[PhoneNumberLLMOutput], Optional[str]]:
@@ -206,6 +211,19 @@ class GeminiLLMExtractor:
                 "[Insert JSON list of (candidate_number, source_url, snippet) objects here]",
                 candidate_items_json_str
             )
+
+            # Save the full prompt
+            # Define filename and path before the try block to ensure filepath is bound for error logging
+            full_prompt_filename = f"{file_identifier_prefix}_llm_full_prompt.txt"
+            full_prompt_filepath = os.path.join(llm_context_dir, full_prompt_filename)
+            try:
+                with open(full_prompt_filepath, 'w', encoding='utf-8') as f_prompt:
+                    f_prompt.write(formatted_prompt)
+                logger.info(f"Saved full LLM prompt to {full_prompt_filepath}")
+            except IOError as e_io:
+                logger.error(f"IOError saving full LLM prompt to {full_prompt_filepath}: {e_io}")
+            # Continue even if saving prompt fails, as main functionality is LLM call
+
         except Exception as e:
             logger.error(f"Failed to load or format prompt: {e}")
             return [], f"Error loading prompt: {str(e)}"
