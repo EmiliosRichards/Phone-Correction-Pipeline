@@ -74,7 +74,8 @@ class AppConfig:
         default_region_code (Optional[str]): Default region code for phone number parsing.
         
         input_excel_file_path (str): Path to the input data file.
-        output_excel_file_name_template (str): Template for the output Excel file name.
+        output_excel_file_name_template (str): Template for the output Excel file name (summary report).
+        tertiary_report_file_name_template (str): Template for the new tertiary report Excel file name.
         skip_rows_config (Optional[int]): Number of rows to skip from the start of the input file (0-indexed).
         nrows_config (Optional[int]): Number of rows to read after skipping. None means read to end.
         
@@ -153,7 +154,8 @@ class AppConfig:
 
         # --- Data Handling ---
         self.input_excel_file_path: str = os.getenv('INPUT_EXCEL_FILE_PATH', 'data_to_be_inputed.xlsx') # Relative to phone_validation_pipeline
-        self.output_excel_file_name_template: str = os.getenv('OUTPUT_EXCEL_FILE_NAME_TEMPLATE', 'phone_validation_output_{run_id}.xlsx')
+        self.output_excel_file_name_template: str = os.getenv('OUTPUT_EXCEL_FILE_NAME_TEMPLATE', 'Pipeline_Summary_Report_{run_id}.xlsx')
+        self.tertiary_report_file_name_template: str = os.getenv('TERTIARY_REPORT_FILE_NAME_TEMPLATE', 'Top_Contacts_Report_{run_id}.xlsx')
 
         # --- Row Processing Range Configuration ---
         self.skip_rows_config: Optional[int] = None

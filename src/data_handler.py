@@ -2,11 +2,18 @@ import pandas as pd
 import phonenumbers
 import logging
 import uuid # For RunID
-from typing import Optional
+from typing import Optional, List, Dict, Any # Added List, Dict, Any
+from urllib.parse import urlparse, urlunparse # Added for URL parsing
 
 # Import AppConfig directly. Its __init__ handles .env loading.
 # If this import fails, it's a critical setup error for the application.
 from .core.config import AppConfig
+from .core.schemas import ( # Added imports for new schemas
+    PhoneNumberLLMOutput,
+    ConsolidatedPhoneNumberSource,
+    ConsolidatedPhoneNumber,
+    CompanyContactDetails
+)
 
 # Configure logging
 # setup_logging() might rely on environment variables loaded by AppConfig's instantiation.
@@ -20,6 +27,51 @@ except ImportError:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
     logger.info("Basic logging configured due to missing core.logging_config or its dependencies.")
+
+
+def get_canonical_base_url(url_string: str) -> str | None:
+    """
+    Extracts the canonical base URL (scheme + netloc, with 'www.' removed from netloc)
+    from a URL string.
+    e.g., "http://www.example.com/path?query" -> "http://example.com"
+    e.g., "example.com/path" -> "http://example.com"
+    """
+    if not url_string or not isinstance(url_string, str):
+        logger.warning("get_canonical_base_url received empty or non-string input.")
+        return None
+    try:
+        # Ensure a scheme is present for urlparse to work correctly
+        # and handle cases where URL might be missing it (e.g. "www.example.com")
+        temp_url = url_string
+        if not temp_url.startswith(('http://', 'https://')):
+            # Check if it looks like a domain that might have had a scheme stripped
+            # or if it's just a path fragment. A simple check for a dot.
+            if '.' not in temp_url.split('/')[0]: # if no dot in first part before a slash, it's likely not a domain
+                 logger.warning(f"URL '{url_string}' does not appear to be a valid absolute URL or domain for base URL extraction.")
+                 return None # Or consider returning the original string if it's a relative path and that's desired
+            temp_url = 'http://' + temp_url # Default to http if no scheme
+
+        parsed = urlparse(temp_url)
+
+        if not parsed.netloc:
+            logger.warning(f"Could not determine network location (netloc) for URL: {url_string} (parsed from {temp_url})")
+            return None
+
+        netloc = parsed.netloc
+        # Normalize by removing 'www.' prefix if it exists
+        if netloc.startswith('www.'):
+            netloc = netloc[4:]
+
+        # Use original scheme if present from parsing temp_url (which had a scheme added if missing)
+        # or default to 'http' if somehow scheme is still empty (should not happen with current logic)
+        scheme = parsed.scheme if parsed.scheme else 'http'
+
+        # Reconstruct the base URL using urlunparse for proper formatting
+        base_url = urlunparse((scheme, netloc, '', '', '', ''))
+        return base_url
+    except Exception as e:
+        logger.error(f"Error parsing URL '{url_string}' to get base URL: {e}", exc_info=True)
+        return None
 
 
 def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppConfig] = None) -> pd.DataFrame | None:
@@ -268,6 +320,124 @@ def apply_phone_normalization(df: pd.DataFrame, phone_column: str = "GivenPhoneN
     logger.info(f"Applied phone normalization to '{phone_column}', results in '{normalized_column}'.")
     return df
 
+
+def get_classification_priority(classification: str) -> int:
+    """Assigns a numerical priority to classifications for sorting/selection."""
+    priority_map = {
+        "Primary": 1,
+        "Secondary": 2,
+        "Support": 3,
+        "Low Relevance": 4,
+        "Non-Business": 5,
+        "Unknown": 6 # Should ideally not be a final classification from LLM based on prompt
+    }
+    return priority_map.get(classification, 99) # Default to low priority if unknown
+
+def process_and_consolidate_contact_data(
+    llm_results: List[PhoneNumberLLMOutput],
+    company_name_from_input: Optional[str],
+    initial_given_url: str
+) -> CompanyContactDetails | None:
+    """
+    Processes a list of LLM-extracted phone numbers for a single company,
+    consolidates them by unique number, aggregates their sources (types and paths),
+    and groups them under a canonical base URL.
+
+    Args:
+        llm_results: A list of PhoneNumberLLMOutput objects, typically all numbers
+                     found from scraping pages related to one initial company URL.
+        company_name_from_input: The original company name from the input data.
+        initial_given_url: The primary URL provided for this company in the input.
+
+    Returns:
+        A CompanyContactDetails object if successful, containing the canonical
+        base URL, company name, and a list of consolidated phone numbers.
+        Returns None if the initial_given_url cannot be processed into a base URL
+        or if there are no LLM results to process.
+    """
+    if not llm_results:
+        logger.info(f"No LLM results provided for {company_name_from_input or initial_given_url}, skipping consolidation.")
+        # Still return a structure indicating no contacts found for this base URL
+        base_url_for_empty = get_canonical_base_url(initial_given_url)
+        if not base_url_for_empty:
+            logger.warning(f"Could not determine canonical base URL for {initial_given_url} even for empty results.")
+            return None
+        return CompanyContactDetails(
+            company_name=company_name_from_input,
+            canonical_base_url=base_url_for_empty,
+            consolidated_numbers=[],
+            original_input_urls=[initial_given_url] if initial_given_url else []
+        )
+
+    canonical_base = get_canonical_base_url(initial_given_url)
+    if not canonical_base:
+        logger.error(f"Could not determine canonical base URL for '{initial_given_url}'. Cannot consolidate contacts.")
+        return None
+
+    consolidated_numbers_map: Dict[str, ConsolidatedPhoneNumber] = {}
+    all_original_source_urls_for_this_company: set[str] = set()
+    if initial_given_url: # Add the initial URL itself
+        all_original_source_urls_for_this_company.add(initial_given_url)
+
+
+    for llm_item in llm_results:
+        if not llm_item.number or not llm_item.source_url: # Basic check
+            logger.warning(f"Skipping LLM item due to missing number or source_url: {llm_item}")
+            continue
+        
+        all_original_source_urls_for_this_company.add(llm_item.source_url)
+
+        # Extract path from the specific source_url of the LLM item
+        parsed_source_item_url = urlparse(llm_item.source_url)
+        source_path = parsed_source_item_url.path
+        if parsed_source_item_url.query:
+            source_path += "?" + parsed_source_item_url.query
+        if not source_path: # If path is empty (e.g. just domain), use '/'
+            source_path = "/"
+
+        current_number_info = ConsolidatedPhoneNumberSource(
+            type=llm_item.type,
+            source_path=source_path,
+            original_full_url=llm_item.source_url
+        )
+
+        if llm_item.number not in consolidated_numbers_map:
+            consolidated_numbers_map[llm_item.number] = ConsolidatedPhoneNumber(
+                number=llm_item.number,
+                classification=llm_item.classification, # Initial classification
+                sources=[current_number_info]
+            )
+        else:
+            # Number already seen, add this new source and update classification if higher priority
+            existing_consolidated_number = consolidated_numbers_map[llm_item.number]
+            # Avoid adding duplicate source entries if the exact same path/type combo is somehow processed twice for the same number
+            # This check might be overly cautious if llm_results are inherently unique per source_url for a number
+            is_duplicate_source = False
+            for existing_source in existing_consolidated_number.sources:
+                if existing_source.original_full_url == current_number_info.original_full_url and \
+                   existing_source.type == current_number_info.type:
+                    is_duplicate_source = True
+                    break
+            if not is_duplicate_source:
+                existing_consolidated_number.sources.append(current_number_info)
+            
+            # Update classification if the new one is "better" (lower number is better)
+            current_priority = get_classification_priority(llm_item.classification)
+            existing_priority = get_classification_priority(existing_consolidated_number.classification)
+            if current_priority < existing_priority:
+                existing_consolidated_number.classification = llm_item.classification
+    
+    final_consolidated_list = sorted(
+        list(consolidated_numbers_map.values()),
+        key=lambda x: get_classification_priority(x.classification)
+    )
+
+    return CompanyContactDetails(
+        company_name=company_name_from_input,
+        canonical_base_url=canonical_base,
+        consolidated_numbers=final_consolidated_list,
+        original_input_urls=sorted(list(all_original_source_urls_for_this_company)) # Store all unique URLs processed
+    )
 
 # TODO: [FutureEnhancement] The __main__ block below was for direct script execution, testing, and demonstration.
 # It includes logic to create dummy configurations and data if real test files are not found.

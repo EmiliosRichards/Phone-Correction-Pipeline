@@ -1,10 +1,10 @@
 import pandas as pd
 from typing import List, Dict, Set, Optional, Any, Callable, Union, Tuple
-from src.data_handler import load_and_preprocess_data
+from src.data_handler import load_and_preprocess_data, process_and_consolidate_contact_data, get_canonical_base_url # Added process_and_consolidate_contact_data
 from src.scraper import scrape_website
 from src.regex_extractor_component import extract_numbers_with_snippets_from_text
 from src.llm_extractor_component import GeminiLLMExtractor
-from src.core.schemas import PhoneNumberLLMOutput # LLMExtractionResult not directly used for typing here
+from src.core.schemas import PhoneNumberLLMOutput, CompanyContactDetails, ConsolidatedPhoneNumber # Added ConsolidatedPhoneNumber
 from src.scraper.scraper_logic import normalize_url
 from src.core.logging_config import setup_logging
 from src.core.config import AppConfig
@@ -129,23 +129,50 @@ def main() -> None:
     required_cols: Dict[str, Any] = {
         'ScrapingStatus': '',
         'RegexCandidateSnippets': lambda: [[] for _ in range(len(df))],
-        'TargetCountryCodes': lambda: [[] for _ in range(len(df))],
-        'VerificationStatus': '',
-        'BestMatchedPhoneNumbers': lambda: [[] for _ in range(len(df))],
-        'OtherRelevantNumbers': lambda: [[] for _ in range(len(df))],
-        'ConfidenceScore': None,
-        'LLMExtractedNumbers': lambda: [[] for _ in range(len(df))],
+        # TargetCountryCodes is added by load_and_preprocess_data
+        # 'VerificationStatus': '', # This will be Overall_VerificationStatus
+        'BestMatchedPhoneNumbers': lambda: [[] for _ in range(len(df))], # Potentially for future use or other reports
+        'OtherRelevantNumbers': lambda: [[] for _ in range(len(df))], # Potentially for future use
+        'ConfidenceScore': None, # Potentially for future use
+        'LLMExtractedNumbers': lambda: [[] for _ in range(len(df))], # Stores raw list from LLM for a canonical URL - USAGE MAY CHANGE
+        'AllCompanyContacts': lambda: [None for _ in range(len(df))], # New column to store CompanyContactDetails object per input row
         'LLMContextPath': '',
-        'Notes': ''
+        'Notes': '',
+        # New columns for the revised summary report
+        'Top_Number_1': None,
+        'Top_Type_1': None,
+        'Top_SourceURL_1': None,
+        'Top_Number_2': None,
+        'Top_Type_2': None,
+        'Top_SourceURL_2': None,
+        'Top_Number_3': None,
+        'Top_Type_3': None,
+        'Top_SourceURL_3': None,
+        # CanonicalEntryURL, Original_Number_Status, Overall_VerificationStatus are handled in main loop
+        # GivenPhoneNumber and Description should come from load_and_preprocess_data
     }
     for col, default_val in required_cols.items():
         if col not in df.columns:
-            df[col] = default_val() if callable(default_val) else default_val
+            # Ensure 'TargetCountryCodes' is initialized if somehow missed by load_and_preprocess_data, though unlikely
+            if col == 'TargetCountryCodes' and col not in df.columns:
+                 df[col] = pd.Series([[] for _ in range(len(df))], dtype=object)
+            else:
+                df[col] = default_val() if callable(default_val) else default_val
+    
+    # Ensure essential columns from load_and_preprocess_data are present for summary report
+    # These are expected to be populated by load_and_preprocess_data
+    if 'GivenPhoneNumber' not in df.columns:
+        df['GivenPhoneNumber'] = None
+    if 'Description' not in df.columns:
+        df['Description'] = None
+
 
     globally_processed_urls: Set[str] = set() # Initialize the global set
     all_flattened_rows: List[Dict[str, Any]] = [] # For the detailed flattened report
-    canonical_site_llm_results: Dict[str, List[PhoneNumberLLMOutput]] = {}
-    canonical_site_scraper_status: Dict[str, str] = {}
+    all_tertiary_rows: List[Dict[str, Any]] = [] # For the new tertiary report
+    # This will now store the CompanyContactDetails object, not just raw LLM outputs
+    canonical_site_consolidated_data: Dict[str, Optional[CompanyContactDetails]] = {}
+    canonical_site_scraper_status: Dict[str, str] = {} # Keep this to track scraper status for canonical URLs
     input_to_canonical_map: Dict[str, Optional[str]] = {}
 
     for i, (index, row_series) in enumerate(df.iterrows()):
@@ -258,8 +285,8 @@ def main() -> None:
             logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status: {current_row_scraper_status}, Canonical URL: {final_canonical_entry_url}")
 
             if current_row_scraper_status == "Success" and final_canonical_entry_url:
-                if final_canonical_entry_url not in canonical_site_llm_results: # Process this canonical site for the first time
-                    logger.info(f"Processing new canonical URL for LLM: {final_canonical_entry_url} (from input {given_url_original})")
+                if final_canonical_entry_url not in canonical_site_consolidated_data: # Process this canonical site for the first time
+                    logger.info(f"Processing new canonical URL for consolidation: {final_canonical_entry_url} (from input {given_url_original})")
                     all_candidate_items_for_llm: List[Dict[str, str]] = []
                     if scraped_pages_details:
                         target_codes_raw: Any = row.get('TargetCountryCodes', [])
@@ -311,7 +338,13 @@ def main() -> None:
 
                             if not os.path.exists(prompt_template_abs_path):
                                 logger.error(f"LLM prompt template file not found at {prompt_template_abs_path}. Cannot process canonical URL {final_canonical_entry_url}.")
-                                canonical_site_llm_results[final_canonical_entry_url] = []
+                                # Store empty consolidated data
+                                consolidated_data_for_site = process_and_consolidate_contact_data(
+                                    llm_results=[], # No LLM results due to prompt error
+                                    company_name_from_input=company_name, # company_name of the first row that triggered this canonical
+                                    initial_given_url=final_canonical_entry_url # Use canonical as the "initial" for this context
+                                )
+                                canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_for_site
                                 canonical_site_scraper_status[final_canonical_entry_url] = "Error_LLM_PromptMissing"
                             else:
                                 # Save LLM input candidates file, perhaps named with canonical URL context
@@ -329,7 +362,13 @@ def main() -> None:
                                     llm_context_dir=llm_context_dir,
                                     file_identifier_prefix=f"CANONICAL_{safe_canonical_name_for_file}"
                                 )
-                                canonical_site_llm_results[final_canonical_entry_url] = llm_classified_outputs
+                                # Now, process and consolidate these LLM outputs
+                                consolidated_data_for_site = process_and_consolidate_contact_data(
+                                    llm_results=llm_classified_outputs,
+                                    company_name_from_input=company_name, # company_name of the first row that triggered this canonical
+                                    initial_given_url=final_canonical_entry_url # Use canonical as the "initial" for this context
+                                )
+                                canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_for_site
                                 canonical_site_scraper_status[final_canonical_entry_url] = current_row_scraper_status # Should be "Success"
                                 
                                 llm_raw_output_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_raw_output.json"
@@ -341,14 +380,20 @@ def main() -> None:
                                 except IOError as e: logger.error(f"IOError saving raw LLM output for {final_canonical_entry_url} to {llm_raw_output_filepath}: {e}")
                         except Exception as llm_exc:
                             logger.error(f"Error during LLM processing for canonical {final_canonical_entry_url}: {llm_exc}", exc_info=True)
-                            canonical_site_llm_results[final_canonical_entry_url] = []
+                            consolidated_data_on_error = process_and_consolidate_contact_data(
+                                llm_results=[], company_name_from_input=company_name, initial_given_url=final_canonical_entry_url
+                            )
+                            canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_on_error
                             canonical_site_scraper_status[final_canonical_entry_url] = "Error_LLM_Processing"
                     else: # No candidate items from regex for this new canonical site
-                        logger.info(f"No candidate snippets for LLM from canonical {final_canonical_entry_url}. Caching empty LLM result.")
-                        canonical_site_llm_results[final_canonical_entry_url] = []
+                        logger.info(f"No candidate snippets for LLM from canonical {final_canonical_entry_url}. Processing with empty LLM result.")
+                        consolidated_data_no_snippets = process_and_consolidate_contact_data(
+                            llm_results=[], company_name_from_input=company_name, initial_given_url=final_canonical_entry_url
+                        )
+                        canonical_site_consolidated_data[final_canonical_entry_url] = consolidated_data_no_snippets
                         canonical_site_scraper_status[final_canonical_entry_url] = current_row_scraper_status # "Success"
-                else: # This canonical URL's LLM data is already cached or scrape failed for pages
-                    logger.info(f"LLM data for canonical URL {final_canonical_entry_url} already cached or no pages scraped. Input row {given_url_original} maps to it.")
+                else: # This canonical URL's consolidated data is already cached.
+                    logger.info(f"Consolidated data for canonical URL {final_canonical_entry_url} already cached. Input row {given_url_original} maps to it.")
             
             elif current_row_scraper_status != "Success": # Scraping failed for this input_row
                 logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status '{current_row_scraper_status}'. No LLM processing for this input.")
@@ -384,28 +429,59 @@ def main() -> None:
                 df.at[index, 'Original_Number_Status'] = 'Error_Pass1_RowProcessing'
 
     # --- After the main loop (End of Pass 1) ---
-    logger.info(f"Pass 1 (Scraping and LLM Caching) complete. Processed {len(df)} input rows.")
-    logger.info(f"Unique canonical sites for which LLM processing was attempted/cached: {len(canonical_site_llm_results)}")
-    logger.debug(f"Canonical site LLM results cache keys: {list(canonical_site_llm_results.keys())}")
+    logger.info(f"Pass 1 (Scraping and Data Consolidation) complete. Processed {len(df)} input rows.")
+    logger.info(f"Unique canonical sites for which data consolidation was attempted/cached: {len(canonical_site_consolidated_data)}")
+    logger.debug(f"Canonical site consolidated data cache keys: {list(canonical_site_consolidated_data.keys())}")
     logger.debug(f"Canonical site scraper status cache: {list(canonical_site_scraper_status.keys())}") # Log keys for brevity
     logger.debug(f"Input to Canonical URL map entries: {len(input_to_canonical_map)}")
 
 # Define column order for Excel exports (moved here for clarity before Pass 2)
     detailed_columns_order = [
-        'CompanyName', 'GivenURL', 'CanonicalEntryURL', 'ScrapingStatus_Canonical',
-        'LLM_Processing_Status_Canonical', 'Original_Number_Status',
-        'extracted_number', 'country_code', 'is_mobile', 'is_fixed_line',
-        'possible_countries', 'classification', 'reasoning', 'source_url',
-        'RunID', 'TargetCountryCodes'
+        'CompanyName',
+        'Number',
+        'LLM_Type',
+        'LLM_Classification',
+        'LLM_Source_URL',
+        'ScrapingStatus',
+        'TargetCountryCodes',
+        'RunID'
     ]
 
     summary_columns_order = [
-        'CompanyName', 'GivenURL', 'CanonicalEntryURL', 'ScrapingStatus_Canonical',
-        'LLM_Processing_Status_Canonical', 'Overall_VerificationStatus', 'Original_Number_Status',
-        'Primary_Number_1', 'Primary_Number_1_Country', 'Primary_Number_1_IsMobile',
-        'Secondary_Number_1', 'Secondary_Number_1_Country', 'Secondary_Number_1_IsMobile',
-        'Secondary_Number_2', 'Secondary_Number_2_Country', 'Secondary_Number_2_IsMobile',
-        'RunID', 'TargetCountryCodes'
+        'CompanyName',
+        'GivenURL',
+        'GivenPhoneNumber',
+        'Original_Number_Status',
+        'Top_Number_1',
+        'Top_Type_1',
+        'Description',
+        'ScrapingStatus_Canonical', # This will be the 'ScrapingStatus' column requested by user
+        'CanonicalEntryURL',
+        'Top_Number_1', # Repeated as per user request
+        'Top_Type_1',   # Repeated as per user request
+        'Top_Number_2',
+        'Top_Type_2',
+        'Top_Number_3',
+        'Top_Type_3',
+        'Top_SourceURL_1',
+        'Top_SourceURL_2',
+        'Top_SourceURL_3',
+        'TargetCountryCodes',
+        'RunID'
+    ]
+
+    tertiary_report_columns_order = [
+        'CompanyName',
+        'GivenURL',
+        'CanonicalEntryURL',
+        'Description',
+        'ScrapingStatus', # This will map to ScrapingStatus_Canonical
+        'PhoneNumber_1',
+        'PhoneNumber_2',
+        'PhoneNumber_3',
+        'SourceURL_1',
+        'SourceURL_2',
+        'SourceURL_3'
     ]
 
     # --- Pass 2: Building Reports ---
@@ -423,37 +499,91 @@ def main() -> None:
         canonical_url_pass2 = original_row_data.get('CanonicalEntryURL')
         scraper_status_pass2 = original_row_data.get('ScrapingStatus')
 
-        if scraper_status_pass2 == "Success" and canonical_url_pass2 and canonical_url_pass2 in canonical_site_llm_results:
-            llm_outputs_for_canonical = canonical_site_llm_results[canonical_url_pass2]
-            
-            best_llm_outputs_for_this_site: Dict[str, PhoneNumberLLMOutput] = {}
-            if llm_outputs_for_canonical:
-                for llm_item_iter in llm_outputs_for_canonical:
-                    current_number_iter = llm_item_iter.number
-                    if current_number_iter:
-                        current_classification_score_iter = classification_precedence.get(llm_item_iter.classification, 99)
-                        existing_item_iter = best_llm_outputs_for_this_site.get(current_number_iter)
-                        if not existing_item_iter or current_classification_score_iter < classification_precedence.get(existing_item_iter.classification, 99):
-                            best_llm_outputs_for_this_site[current_number_iter] = llm_item_iter
-            
-            if best_llm_outputs_for_this_site:
-                for llm_item_final in best_llm_outputs_for_this_site.values():
-                    new_flattened_row: Dict[str, Any] = {
-                        'RunID': original_row_data.get('RunID'),
-                        'TargetCountryCodes': original_row_data.get('TargetCountryCodes'),
-                        'CompanyName': company_name_pass2,
-                        'GivenURL': given_url_pass2, # Original input URL for traceability
-                        'Canonical_URL': canonical_url_pass2, # The URL data was actually scraped from
-                        # 'Description': original_row_data.get('Description'), # Removed
-                        'ScrapingStatus': canonical_site_scraper_status.get(canonical_url_pass2, scraper_status_pass2), # Status of canonical scrape
-                        'LLM_Source_URL': llm_item_final.source_url,
-                        'LLM_Number': llm_item_final.number,
-                        'LLM_Type': llm_item_final.type,
-                        'LLM_Classification': llm_item_final.classification
-                    }
-                    all_flattened_rows.append(new_flattened_row)
+        # Access consolidated data
+        company_contact_details_pass2: Optional[CompanyContactDetails] = None
+        if canonical_url_pass2 and canonical_url_pass2 in canonical_site_consolidated_data:
+            company_contact_details_pass2 = canonical_site_consolidated_data[canonical_url_pass2]
+
+        if scraper_status_pass2 == "Success" and company_contact_details_pass2 and company_contact_details_pass2.consolidated_numbers:
+            # Iterate through sorted consolidated numbers
+            for consolidated_number_item in company_contact_details_pass2.consolidated_numbers:
+                # For the detailed report, we want to show each unique number and its aggregated sources.
+                # The classification is already the "best" one for that number.
+                
+                # Aggregate types and source URLs for this number
+                aggregated_types = []
+                aggregated_source_urls = []
+                seen_types_for_number = set() # To avoid "Sales, Sales" if type is same from different paths
+                
+                for source_detail in consolidated_number_item.sources:
+                    type_with_path = f"{source_detail.type} (from {source_detail.source_path})"
+                    if source_detail.type not in seen_types_for_number: # Add distinct types
+                        aggregated_types.append(source_detail.type)
+                        seen_types_for_number.add(source_detail.type)
+                    if source_detail.original_full_url not in aggregated_source_urls: # Add distinct full URLs
+                         aggregated_source_urls.append(source_detail.original_full_url)
+
+                llm_type_str = ", ".join(aggregated_types) if aggregated_types else consolidated_number_item.sources[0].type if consolidated_number_item.sources else "Unknown"
+                llm_source_url_str = ", ".join(aggregated_source_urls) if aggregated_source_urls else consolidated_number_item.sources[0].original_full_url if consolidated_number_item.sources else "N/A"
+
+                new_flattened_row: Dict[str, Any] = {
+                    'CompanyName': company_name_pass2,
+                    'Number': consolidated_number_item.number,
+                    'LLM_Type': llm_type_str, # Aggregated types
+                    'LLM_Classification': consolidated_number_item.classification, # Best classification for this number
+                    'LLM_Source_URL': llm_source_url_str, # Aggregated source URLs
+                    'ScrapingStatus': canonical_site_scraper_status.get(str(canonical_url_pass2), scraper_status_pass2) if canonical_url_pass2 else scraper_status_pass2,
+                    'TargetCountryCodes': original_row_data.get('TargetCountryCodes'),
+                    'RunID': run_id # Uses the date/time-based run_id
+                }
+                all_flattened_rows.append(new_flattened_row)
             # else: No unique relevant numbers from LLM for this successfully scraped canonical site - no row in detailed.
-        # else: Scraping failed or no canonical URL or no LLM results for this canonical - no row in detailed.
+        # else: Scraping failed or no canonical URL or no consolidated data for this canonical - no row in detailed.
+        
+        # C. Tertiary Report - Populate all_tertiary_rows
+        # This report is per input row, showing top 3 numbers from its canonical URL
+        
+        # Reuse unique_sorted_llm_numbers from summary report logic if already computed for this canonical_url_pass2
+        # For tertiary report, we need to re-fetch/re-calculate unique_sorted_llm_numbers based on original_row_data's canonical URL
+        
+        # company_contact_details_pass2 is already fetched above
+        
+        # The consolidated_numbers list is already sorted by classification priority
+        sorted_consolidated_numbers_for_tertiary: List[ConsolidatedPhoneNumber] = []
+        if company_contact_details_pass2:
+            sorted_consolidated_numbers_for_tertiary = company_contact_details_pass2.consolidated_numbers
+            
+        new_tertiary_row: Dict[str, Any] = {
+            'CompanyName': company_name_pass2,
+            'GivenURL': given_url_pass2,
+            'CanonicalEntryURL': canonical_url_pass2,
+            'Description': original_row_data.get('Description'),
+            'ScrapingStatus': canonical_site_scraper_status.get(str(canonical_url_pass2), scraper_status_pass2) if canonical_url_pass2 else scraper_status_pass2,
+            'PhoneNumber_1': None, 'PhoneNumber_2': None, 'PhoneNumber_3': None,
+            'SourceURL_1': None, 'SourceURL_2': None, 'SourceURL_3': None
+        }
+
+        if sorted_consolidated_numbers_for_tertiary:
+            num_item = sorted_consolidated_numbers_for_tertiary[0]
+            types_ter_1 = ", ".join(list(set(s.type for s in num_item.sources))) # Unique types
+            sources_ter_1 = ", ".join(list(set(s.original_full_url for s in num_item.sources))) # Unique URLs
+            new_tertiary_row['PhoneNumber_1'] = f"{num_item.number} ({types_ter_1})" if types_ter_1 else num_item.number
+            new_tertiary_row['SourceURL_1'] = sources_ter_1
+        if len(sorted_consolidated_numbers_for_tertiary) > 1:
+            num_item = sorted_consolidated_numbers_for_tertiary[1]
+            types_ter_2 = ", ".join(list(set(s.type for s in num_item.sources)))
+            sources_ter_2 = ", ".join(list(set(s.original_full_url for s in num_item.sources)))
+            new_tertiary_row['PhoneNumber_2'] = f"{num_item.number} ({types_ter_2})" if types_ter_2 else num_item.number
+            new_tertiary_row['SourceURL_2'] = sources_ter_2
+        if len(sorted_consolidated_numbers_for_tertiary) > 2:
+            num_item = sorted_consolidated_numbers_for_tertiary[2]
+            types_ter_3 = ", ".join(list(set(s.type for s in num_item.sources)))
+            sources_ter_3 = ", ".join(list(set(s.original_full_url for s in num_item.sources)))
+            new_tertiary_row['PhoneNumber_3'] = f"{num_item.number} ({types_ter_3})" if types_ter_3 else num_item.number
+            new_tertiary_row['SourceURL_3'] = sources_ter_3
+        
+        all_tertiary_rows.append(new_tertiary_row)
+
 
     # B. Summary Report - Populate specific columns in main 'df'
     for index, row_summary in df.iterrows():
@@ -461,77 +591,77 @@ def main() -> None:
         canonical_url_summary = row_summary.get('CanonicalEntryURL')
         scraper_status_summary = row_summary.get('ScrapingStatus')
 
-        llm_outputs_for_summary: List[PhoneNumberLLMOutput] = []
-        if canonical_url_summary and canonical_url_summary in canonical_site_llm_results:
-            llm_outputs_for_summary = canonical_site_llm_results[canonical_url_summary]
+        # Get the consolidated data for this canonical URL
+        company_contact_details_summary: Optional[CompanyContactDetails] = None
+        if canonical_url_summary and canonical_url_summary in canonical_site_consolidated_data:
+            company_contact_details_summary = canonical_site_consolidated_data[canonical_url_summary]
 
-        primary_numbers_summary: List[PhoneNumberLLMOutput] = []
-        secondary_numbers_summary: List[PhoneNumberLLMOutput] = []
-        support_numbers_summary: List[PhoneNumberLLMOutput] = [] # For Overall_VerificationStatus
-        low_relevance_summary: List[PhoneNumberLLMOutput] = [] # For Overall_VerificationStatus
+        # The consolidated_numbers list is already de-duplicated and sorted by classification
+        unique_sorted_consolidated_numbers: List[ConsolidatedPhoneNumber] = []
+        if company_contact_details_summary:
+            unique_sorted_consolidated_numbers = company_contact_details_summary.consolidated_numbers
 
-        if llm_outputs_for_summary:
-            for item_summary in llm_outputs_for_summary:
-                if item_summary.classification == 'Primary': primary_numbers_summary.append(item_summary)
-                elif item_summary.classification == 'Secondary': secondary_numbers_summary.append(item_summary)
-                elif item_summary.classification == 'Support': support_numbers_summary.append(item_summary)
-                elif item_summary.classification == 'Low Relevance': low_relevance_summary.append(item_summary)
-        
-        # Populate Primary/Secondary numbers for summary
-        if primary_numbers_summary:
-            df.at[index, 'Primary_Number_1'] = primary_numbers_summary[0].number
-            df.at[index, 'Primary_Type_1'] = primary_numbers_summary[0].type
-            df.at[index, 'Primary_SourceURL_1'] = primary_numbers_summary[0].source_url
-        if secondary_numbers_summary:
-            df.at[index, 'Secondary_Number_1'] = secondary_numbers_summary[0].number
-            df.at[index, 'Secondary_Type_1'] = secondary_numbers_summary[0].type
-            df.at[index, 'Secondary_SourceURL_1'] = secondary_numbers_summary[0].source_url
-            if len(secondary_numbers_summary) > 1:
-                df.at[index, 'Secondary_Number_2'] = secondary_numbers_summary[1].number
-                df.at[index, 'Secondary_Type_2'] = secondary_numbers_summary[1].type
-                df.at[index, 'Secondary_SourceURL_2'] = secondary_numbers_summary[1].source_url
+        # Populate Top_Number_1, Top_Type_1, Top_SourceURL_1
+        if len(unique_sorted_consolidated_numbers) > 0:
+            top_item_1 = unique_sorted_consolidated_numbers[0]
+            df.at[index, 'Top_Number_1'] = top_item_1.number
+            df.at[index, 'Top_Type_1'] = ", ".join(list(set(s.type for s in top_item_1.sources))) # Concatenate unique types
+            df.at[index, 'Top_SourceURL_1'] = ", ".join(list(set(s.original_full_url for s in top_item_1.sources))) # Concatenate unique source URLs
+        # Populate Top_Number_2, Top_Type_2, Top_SourceURL_2
+        if len(unique_sorted_consolidated_numbers) > 1:
+            top_item_2 = unique_sorted_consolidated_numbers[1]
+            df.at[index, 'Top_Number_2'] = top_item_2.number
+            df.at[index, 'Top_Type_2'] = ", ".join(list(set(s.type for s in top_item_2.sources)))
+            df.at[index, 'Top_SourceURL_2'] = ", ".join(list(set(s.original_full_url for s in top_item_2.sources)))
+        # Populate Top_Number_3, Top_Type_3, Top_SourceURL_3
+        if len(unique_sorted_consolidated_numbers) > 2:
+            top_item_3 = unique_sorted_consolidated_numbers[2]
+            df.at[index, 'Top_Number_3'] = top_item_3.number
+            df.at[index, 'Top_Type_3'] = ", ".join(list(set(s.type for s in top_item_3.sources)))
+            df.at[index, 'Top_SourceURL_3'] = ", ".join(list(set(s.original_full_url for s in top_item_3.sources)))
 
         # Determine Original_Number_Status
         original_norm_phone_summary = row_summary.get('NormalizedGivenPhoneNumber')
+        found_original_in_top_llm = False
         if original_norm_phone_summary and original_norm_phone_summary != "InvalidFormat":
-            if any(p.number == original_norm_phone_summary for p in primary_numbers_summary) or \
-               any(s.number == original_norm_phone_summary for s in secondary_numbers_summary):
+            for top_num_item in unique_sorted_consolidated_numbers[:3]: # Check against top 3 populated numbers
+                if top_num_item.number == original_norm_phone_summary:
+                    found_original_in_top_llm = True
+                    break
+        
+        if original_norm_phone_summary and original_norm_phone_summary != "InvalidFormat":
+            if found_original_in_top_llm:
                 df.at[index, 'Original_Number_Status'] = 'Verified'
-            elif primary_numbers_summary or secondary_numbers_summary:
+            elif unique_sorted_consolidated_numbers: # Consolidated data has numbers, but original wasn't among them
                 df.at[index, 'Original_Number_Status'] = 'Corrected'
-            elif llm_outputs_for_summary: # LLM ran but found no primary/secondary, and original didn't match
-                 df.at[index, 'Original_Number_Status'] = 'No Match Found by LLM'
-            else: # LLM did not run or had no output for this canonical URL
-                 df.at[index, 'Original_Number_Status'] = 'LLM_NoOutput_For_Canonical'
-
+            # If consolidated data exists for canonical but has no numbers
+            elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers:
+                 df.at[index, 'Original_Number_Status'] = 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' # Simplified
+            elif company_contact_details_summary: # Consolidated data exists, had numbers, but after filtering unique_sorted_consolidated_numbers is empty (should not happen if logic is correct)
+                 df.at[index, 'Original_Number_Status'] = 'No Relevant Match Found by LLM' # Should be covered by above
+            else: # LLM did not run or had no output for this canonical URL (e.g. scrape fail)
+                 df.at[index, 'Original_Number_Status'] = 'LLM_Not_Run_Or_NoOutput_For_Canonical'
         elif original_norm_phone_summary == "InvalidFormat":
             df.at[index, 'Original_Number_Status'] = 'Original_InvalidFormat'
-        else:
+        else: # No original phone number provided
             df.at[index, 'Original_Number_Status'] = 'Original_Not_Provided'
-        
-        # Determine Overall_VerificationStatus
+
+        # Determine Overall_VerificationStatus (This is a general status for the row, can be simplified or enhanced based on new top numbers)
+        # For now, let's base it on whether any top LLM number was found.
         overall_status = "Unverified" # Default
         if scraper_status_summary != "Success":
             overall_status = f"Unverified_Scrape_{scraper_status_summary}"
-        elif primary_numbers_summary:
-            overall_status = "Verified_Primary_Found"
-        elif secondary_numbers_summary:
-            overall_status = "Verified_Secondary_Found"
-        elif support_numbers_summary: # Only if no primary/secondary
-            overall_status = "Verified_Support_Found"
-        elif low_relevance_summary: # Only if no primary/secondary/support
-            overall_status = "Verified_LowRelevance_Found"
-        elif llm_outputs_for_summary: # LLM ran, found items, but none matched above categories
-            overall_status = "Unverified_LLM_NoHighValueMatch"
-        elif canonical_url_summary and canonical_url_summary in canonical_site_llm_results and not llm_outputs_for_summary:
-            # LLM ran for this canonical URL but returned absolutely nothing
-            overall_status = "Unverified_LLM_OutputEmpty"
+        elif unique_sorted_consolidated_numbers: # If any top number was found
+            overall_status = "Verified_LLM_Match_Found"
+        # If consolidated data exists for this canonical URL but has no numbers
+        elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers:
+            overall_status = "Unverified_LLM_NoRelevantNumbers" # Simplified
         elif canonical_url_summary and canonical_site_scraper_status.get(canonical_url_summary) == "Error_LLM_Processing":
             overall_status = "Error_LLM_Processing_For_Canonical"
         elif canonical_url_summary and canonical_site_scraper_status.get(canonical_url_summary) == "Error_LLM_PromptMissing":
             overall_status = "Error_LLM_PromptMissing_For_Canonical"
-        # else: stays "Unverified" if scrape was success but no LLM results for canonical (e.g. no regex snippets)
-
+        # else: stays "Unverified" if scrape was success but no LLM results for canonical (e.g. no regex snippets, or LLM not triggered)
+        
         # Prepend redirect info if applicable
         original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
         if canonical_url_summary and input_to_canonical_map.get(original_input_url_for_map) != original_input_url_for_map : # Check if it was actually different from input
@@ -542,7 +672,7 @@ def main() -> None:
         
         df.at[index, 'Overall_VerificationStatus'] = overall_status
         df.at[index, 'ScrapingStatus_Canonical'] = canonical_site_scraper_status.get(str(canonical_url_summary), scraper_status_summary) if canonical_url_summary is not None else scraper_status_summary
-        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if canonical_url_summary and canonical_url_summary in canonical_site_llm_results else (canonical_site_scraper_status.get(str(canonical_url_summary), "Not_Processed_Or_Scrape_Failed") if canonical_url_summary is not None else "Not_Processed_Or_Scrape_Failed")
+        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None else (canonical_site_scraper_status.get(str(canonical_url_summary), "Not_Processed_Or_Scrape_Failed") if canonical_url_summary is not None else "Not_Processed_Or_Scrape_Failed")
 
 
     # Create and save Detailed Flattened Report
@@ -557,7 +687,7 @@ def main() -> None:
             ordered=True
         )
         df_detailed_flattened = df_detailed_flattened.sort_values(
-            by=['CompanyName', 'Canonical_URL', 'LLM_Classification_Sort', 'LLM_Number'],
+            by=['CompanyName', 'LLM_Classification_Sort', 'Number'],
             na_position='last' # Ensure NaNs in sort key are handled if any
         ).drop(columns=['LLM_Classification_Sort'])
         
@@ -568,17 +698,25 @@ def main() -> None:
         
         df_detailed_export = df_detailed_flattened[detailed_columns_order].copy()
 
-        detailed_output_filename = f"phone_validation_detailed_output_{run_id}.xlsx"
+        detailed_output_filename = f"All_LLM_Extractions_Report_{run_id}.xlsx" # Updated filename
         detailed_output_excel_path = os.path.join(run_output_dir, detailed_output_filename)
         try:
             logger.info(f"Attempting to save detailed report to: {detailed_output_excel_path}")
             with pd.ExcelWriter(detailed_output_excel_path, engine='openpyxl') as writer:
                 df_detailed_export.to_excel(writer, index=False, sheet_name='Detailed_Phone_Data')
                 # Auto-adjust column widths for detailed report
-                for column in df_detailed_export:
-                    column_length = max(df_detailed_export[column].astype(str).map(len).max(), len(str(column)))
-                    col_letter = get_column_letter(list(df_detailed_export.columns).index(str(column)) + 1)
-                    writer.sheets['Detailed_Phone_Data'].column_dimensions[col_letter].width = column_length + 2
+                worksheet_detailed = writer.sheets['Detailed_Phone_Data']
+                for col_idx, col_name in enumerate(df_detailed_export.columns):
+                    series_data = df_detailed_export.iloc[:, col_idx]
+                    if series_data.empty:
+                        max_val_len = 0
+                    else:
+                        lengths = series_data.astype(str).map(len)
+                        max_val_len = lengths.max() if not lengths.empty else 0
+                    
+                    column_header_len = len(str(col_name))
+                    adjusted_width = max(max_val_len, column_header_len) + 2
+                    worksheet_detailed.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
             logger.info(f"Detailed report saved successfully to {detailed_output_excel_path}")
         except Exception as e_detailed:
             logger.error(f"Error saving detailed report to {detailed_output_excel_path}: {e_detailed}", exc_info=True)
@@ -586,26 +724,35 @@ def main() -> None:
         logger.info("No data for detailed flattened report. Skipping file creation.")
 
     # Prepare and save Summary Report (from the modified main df)
-    # Ensure all expected columns exist in df before selecting/reordering
-    for col in summary_columns_order:
-        if col not in df.columns:
-            # Initialize missing columns that should have been created by data_handler or this script
-            if col in ['CanonicalEntryURL', 'ScrapingStatus_Canonical', 'LLM_Processing_Status_Canonical', 'Overall_VerificationStatus', 'Original_Number_Status',
-                       'Primary_Number_1', 'Primary_Type_1', 'Primary_SourceURL_1', 
-                       'Secondary_Number_1', 'Secondary_Type_1', 'Secondary_SourceURL_1',
-                       'Secondary_Number_2', 'Secondary_Type_2', 'Secondary_SourceURL_2']:
-                df[col] = None # Or appropriate default like ''
-            elif col == 'RunID':
-                df[col] = run_id
-            # 'TargetCountryCodes' should come from input or be added by data_handler
-            # 'CompanyName', 'GivenURL' are expected from input.
-            # If other critical columns are missing, it indicates an earlier problem.
-            # For now, just ensure they exist to prevent KeyError on selection.
-            elif col not in df.columns: # Catch-all for any other defined in summary_columns_order
-                 df[col] = None
+    # Ensure all columns for the summary report exist in df, initializing if necessary.
+    # The summary_columns_order list defines what we want. We iterate through its unique names.
+    unique_summary_cols_needed = list(dict.fromkeys(summary_columns_order)) # Get unique column names while preserving order for first occurrences
+
+    for col_name in unique_summary_cols_needed:
+        if col_name not in df.columns:
+            # Initialize columns that are expected to be derived or set during the pipeline
+            if col_name in ['Original_Number_Status', 'Overall_VerificationStatus',
+                            'CanonicalEntryURL', 'ScrapingStatus_Canonical', 'LLM_Processing_Status_Canonical',
+                            'Top_Number_1', 'Top_Type_1', 'Top_SourceURL_1',
+                            'Top_Number_2', 'Top_Type_2', 'Top_SourceURL_2',
+                            'Top_Number_3', 'Top_Type_3', 'Top_SourceURL_3']:
+                df[col_name] = None # Default to None if not populated
+                logger.warning(f"Summary report column '{col_name}' was not found in DataFrame and was initialized to None. Check population logic.")
+            elif col_name == 'RunID':
+                df[col_name] = run_id # Should always be available
+            # Columns like CompanyName, GivenURL, GivenPhoneNumber, Description, TargetCountryCodes
+            # are expected from load_and_preprocess_data. If missing here, it's a more fundamental issue.
+            # However, the required_cols initialization at the top should have handled these.
+            # This loop is an additional safeguard.
+            elif col_name not in ['CompanyName', 'GivenURL', 'GivenPhoneNumber', 'Description', 'TargetCountryCodes']:
+                 logger.error(f"Unexpected summary column '{col_name}' missing and not covered by specific initialization. Defaulting to None.")
+                 df[col_name] = None
 
 
-    df_summary_export = df[[col for col in summary_columns_order if col in df.columns]].copy()
+    # Select columns for export based on summary_columns_order.
+    # All unique names in summary_columns_order should now exist in df due to the loop above.
+    # If a column name is repeated in summary_columns_order, it will be included multiple times.
+    df_summary_export = df[summary_columns_order].copy()
     
     summary_output_filename = app_config.output_excel_file_name_template.format(run_id=run_id)
     summary_output_excel_path = os.path.join(run_output_dir, summary_output_filename)
@@ -614,13 +761,57 @@ def main() -> None:
         with pd.ExcelWriter(summary_output_excel_path, engine='openpyxl') as writer:
             df_summary_export.to_excel(writer, index=False, sheet_name='Phone_Validation_Summary')
             # Auto-adjust column widths for summary report
-            for column in df_summary_export:
-                column_length = max(df_summary_export[column].astype(str).map(len).max(), len(str(column)))
-                col_letter = get_column_letter(list(df_summary_export.columns).index(str(column)) + 1)
-                writer.sheets['Phone_Validation_Summary'].column_dimensions[col_letter].width = column_length + 2
+            worksheet_summary = writer.sheets['Phone_Validation_Summary']
+            for col_idx, col_name in enumerate(df_summary_export.columns):
+                series_data = df_summary_export.iloc[:, col_idx]
+                if series_data.empty:
+                    max_val_len = 0
+                else:
+                    lengths = series_data.astype(str).map(len)
+                    max_val_len = lengths.max() if not lengths.empty else 0
+                
+                column_header_len = len(str(col_name))
+                adjusted_width = max(max_val_len, column_header_len) + 2
+                worksheet_summary.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
         logger.info(f"Summary report saved successfully to {summary_output_excel_path}")
     except Exception as e_summary:
         logger.error(f"Error saving summary report to {summary_output_excel_path}: {e_summary}", exc_info=True)
+
+    # Create and save new Tertiary Report
+    if all_tertiary_rows:
+        df_tertiary_report = pd.DataFrame(all_tertiary_rows)
+        
+        # Ensure all columns are present as per tertiary_report_columns_order
+        for col_t in tertiary_report_columns_order:
+            if col_t not in df_tertiary_report.columns:
+                df_tertiary_report[col_t] = None # Initialize if missing
+        
+        df_tertiary_export = df_tertiary_report[tertiary_report_columns_order].copy()
+
+        tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id)
+        tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
+        try:
+            logger.info(f"Attempting to save tertiary report to: {tertiary_output_excel_path}")
+            with pd.ExcelWriter(tertiary_output_excel_path, engine='openpyxl') as writer_t:
+                df_tertiary_export.to_excel(writer_t, index=False, sheet_name='Contact_Focused_Report')
+                # Auto-adjust column widths
+                worksheet_tertiary = writer_t.sheets['Contact_Focused_Report']
+                for col_idx, col_name in enumerate(df_tertiary_export.columns):
+                    series_data = df_tertiary_export.iloc[:, col_idx]
+                    if series_data.empty:
+                        max_val_len = 0
+                    else:
+                        lengths = series_data.astype(str).map(len)
+                        max_val_len = lengths.max() if not lengths.empty else 0
+                    
+                    column_header_len = len(str(col_name))
+                    adjusted_width = max(max_val_len, column_header_len) + 2
+                    worksheet_tertiary.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+            logger.info(f"Tertiary report saved successfully to {tertiary_output_excel_path}")
+        except Exception as e_tertiary:
+            logger.error(f"Error saving tertiary report to {tertiary_output_excel_path}: {e_tertiary}", exc_info=True)
+    else:
+        logger.info("No data for tertiary report. Skipping file creation.")
 
     logger.info(f"Pipeline run {run_id} finished.")
     total_duration = time.time() - datetime.strptime(run_id, "%Y%m%d_%H%M%S").timestamp()
