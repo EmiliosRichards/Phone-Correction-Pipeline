@@ -1,6 +1,7 @@
 import logging
 import sys
-from typing import Optional # Added Optional
+from typing import Optional
+from logging.handlers import RotatingFileHandler
 
 def setup_logging(
     file_log_level=logging.INFO,
@@ -40,7 +41,16 @@ def setup_logging(
     # File Handler (if path is provided)
     if log_file_path:
         try:
-            file_handler = logging.FileHandler(log_file_path, mode='a') # Append mode
+            # Use RotatingFileHandler instead of FileHandler
+            max_bytes = 10 * 1024 * 1024  # 10 MB per log file
+            backup_count = 5  # Keep 5 backup log files (e.g., log.1, log.2, ..., log.5)
+            file_handler = RotatingFileHandler(
+                log_file_path,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                mode='a',
+                encoding='utf-8' # Explicitly set encoding
+            )
             file_handler.setLevel(file_log_level)
             file_handler.setFormatter(formatter)
             root_logger.addHandler(file_handler)

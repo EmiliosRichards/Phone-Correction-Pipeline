@@ -9,6 +9,7 @@ requests
 google-generativeai
 pydantic
 openpyxl
+tenacity
 
 # Notes:
 # 1. After installing these requirements, you must also run `playwright install`

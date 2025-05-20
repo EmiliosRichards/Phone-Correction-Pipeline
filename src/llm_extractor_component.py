@@ -8,6 +8,7 @@ from google.generativeai.client import configure
 from google.generativeai.generative_models import GenerativeModel
 from google.generativeai.types import GenerationConfig
 from google.api_core import exceptions as google_exceptions
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import ValidationError as PydanticValidationError
 
 import phonenumbers
@@ -18,6 +19,15 @@ from .core.schemas import PhoneNumberLLMOutput, LLMExtractionResult
 from .core.config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+RETRYABLE_GEMINI_EXCEPTIONS = (
+    google_exceptions.DeadlineExceeded,
+    google_exceptions.ServiceUnavailable,
+    google_exceptions.ResourceExhausted,  # For rate limits
+    google_exceptions.InternalServerError, # 500 errors
+    google_exceptions.Aborted
+    # google_exceptions.Unavailable # Removed as it's not a known attribute, ServiceUnavailable covers the intent
+)
 
 class GeminiLLMExtractor:
     """
@@ -161,6 +171,31 @@ class GeminiLLMExtractor:
         logger.debug(f"No clear JSON block found in LLM text output: {text_output[:200]}...")
         return None
 
+    @retry(
+        stop=stop_after_attempt(3),  # Try 3 times in total (1 initial + 2 retries)
+        wait=wait_exponential(multiplier=1, min=2, max=10),  # Wait 2s, then 4s (max 10s)
+        retry=retry_if_exception_type(RETRYABLE_GEMINI_EXCEPTIONS),
+        reraise=True  # Reraise the exception if all retries fail
+    )
+    def _generate_content_with_retry(self, formatted_prompt: str, generation_config: GenerationConfig):
+        """
+        Internal method to call Gemini API with retry logic.
+        """
+        logger.info("Attempting to generate content with Gemini API...")
+        response = self.model.generate_content(
+            formatted_prompt,
+            generation_config=generation_config
+        )
+        # Basic check for safety, though specific non-retriable content blocks
+        # would ideally be handled by the caller if they are not exceptions.
+        if response and response.prompt_feedback and response.prompt_feedback.block_reason:
+            logger.warning(f"Gemini content generation blocked. Reason: {response.prompt_feedback.block_reason.name}. This might not be retriable by network retries.")
+            # Depending on the block_reason, one might choose to raise a specific non-retryable error here.
+            # For now, we let it proceed and the caller handles the content.
+
+        logger.info("Successfully generated content from Gemini API attempt.")
+        return response
+
     def extract_phone_numbers(
         self,
         candidate_items: List[Dict[str, str]], # Changed input
@@ -236,7 +271,7 @@ class GeminiLLMExtractor:
 
         try:
             logger.debug(f"Sending request to Gemini. Prompt starts with: {formatted_prompt[:200]}...")
-            response = self.model.generate_content(
+            response = self._generate_content_with_retry(
                 formatted_prompt,
                 generation_config=generation_config
             )
