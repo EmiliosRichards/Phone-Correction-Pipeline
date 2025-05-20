@@ -51,6 +51,7 @@ class AppConfig:
         scraper_max_pages_per_domain (int): Max pages to scrape per domain (0 for no limit).
         scraper_min_score_to_queue (int): Minimum score a link needs to be added to the scrape queue.
         scraper_score_threshold_for_limit_bypass (int): Score threshold for a page to bypass the max_pages_per_domain limit.
+        scraper_max_high_priority_pages_after_limit (int): Max number of high-priority pages to scrape after SCRAPER_MAX_PAGES_PER_DOMAIN is hit.
         
         max_depth_internal_links (int): Maximum depth to follow internal links.
         scraper_networkidle_timeout_ms (int): Timeout in ms for Playwright's networkidle wait. 0 to disable.
@@ -122,6 +123,7 @@ class AppConfig:
         self.scraper_max_pages_per_domain: int = int(os.getenv('SCRAPER_MAX_PAGES_PER_DOMAIN', '20')) # Default 20, 0 for no limit
         self.scraper_min_score_to_queue: int = int(os.getenv('SCRAPER_MIN_SCORE_TO_QUEUE', '40'))
         self.scraper_score_threshold_for_limit_bypass: int = int(os.getenv('SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS', '80'))
+        self.scraper_max_high_priority_pages_after_limit: int = int(os.getenv('SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT', '5')) # Default to 5
 
         # Existing Scraper Settings
         self.max_depth_internal_links: int = int(os.getenv('MAX_DEPTH_INTERNAL_LINKS', '1'))

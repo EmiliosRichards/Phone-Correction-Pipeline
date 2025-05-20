@@ -267,8 +267,11 @@ These settings fine-tune how the scraper discovers and prioritizes links:
     *   Description: Minimum score a link needs from `find_internal_links` to be added to the scrape queue.
     *   Default: `40`
 *   **`SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS`**:
-    *   Description: When `SCRAPER_MAX_PAGES_PER_DOMAIN` is hit, only links scoring at/above this threshold will be processed.
+    *   Description: When `SCRAPER_MAX_PAGES_PER_DOMAIN` is hit, only links scoring at/above this threshold will be processed, up to `SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT`.
     *   Default: `80`
+*   **`SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT`**:
+    *   Description: After `SCRAPER_MAX_PAGES_PER_DOMAIN` is met, this is the maximum number of *additional* pages that can be scraped if they meet/exceed `SCRAPER_SCORE_THRESHOLD_FOR_LIMIT_BYPASS`. Helps to get a few very high-priority pages without scraping too many if a site is large.
+    *   Default: `5`
 
 #### LLM (Gemini) Settings
 *   **`GEMINI_API_KEY`** (Required): Your Google Gemini API key.

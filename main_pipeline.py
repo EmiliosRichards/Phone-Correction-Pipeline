@@ -21,6 +21,9 @@ from phonenumbers import NumberParseException
 from openpyxl.utils import get_column_letter
 
 TARGET_COUNTRY_CODES_INT: Set[int] = {49, 41, 43} # Germany, Switzerland, Austria
+EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT: Set[str] = {
+    'Unknown', 'Fax', 'Mobile', 'Date', 'ID' # 'Non-Priority-Country Contact' removed as per user request
+}
 logger = logging.getLogger(__name__) # Will be configured by setup_logging in main()
 app_config: AppConfig = AppConfig()
 
@@ -692,9 +695,25 @@ def main() -> None:
         }
 
         if company_contact_details_for_report and company_contact_details_for_report.consolidated_numbers:
+            # Filter numbers based on EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT
+            eligible_numbers_for_report: List[ConsolidatedPhoneNumber] = []
+            for cn_item in company_contact_details_for_report.consolidated_numbers:
+                source_types = {s.type for s in cn_item.sources if s.type}
+                if cn_item.classification != 'Non-Business' and \
+                   not EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT.intersection(source_types):
+                    eligible_numbers_for_report.append(cn_item)
+                else:
+                    excluded_reasons = []
+                    if cn_item.classification == 'Non-Business':
+                        excluded_reasons.append("classification is Non-Business")
+                    intersecting_types = EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT.intersection(source_types)
+                    if intersecting_types:
+                        excluded_reasons.append(f"excluded types: {intersecting_types}")
+                    logger.debug(f"Excluding number {cn_item.number} from Top_Contacts_Report for company '{aggregated_entry['report_company_name']}' due to: {'; '.join(excluded_reasons)}")
+
             # all_input_companies_str = ", ".join(aggregated_entry["all_input_companies_for_canonical"]) # Keep this for the main CompanyName column if needed, but for individual numbers, derive from sources.
 
-            for i, consolidated_number_item in enumerate(company_contact_details_for_report.consolidated_numbers[:3]):
+            for i, consolidated_number_item in enumerate(eligible_numbers_for_report[:3]): # Use filtered list
                 phone_num_key = f'PhoneNumber_{i+1}'
                 source_url_key = f'SourceURL_{i+1}'
                 
@@ -712,7 +731,14 @@ def main() -> None:
                 new_tertiary_row[phone_num_key] = f"{number_str} ({types_str}) [{companies_for_this_number_str}]"
                 new_tertiary_row[source_url_key] = ", ".join(sorted(list(set(s.original_full_url for s in consolidated_number_item.sources))))
         
-        all_tertiary_rows.append(new_tertiary_row)
+        # Only add the row to the report if it actually has at least one phone number populated after filtering
+        # The check for new_tertiary_row['PhoneNumber_1'] etc. effectively determines if eligible_numbers_for_report was non-empty
+        if new_tertiary_row['PhoneNumber_1'] or new_tertiary_row['PhoneNumber_2'] or new_tertiary_row['PhoneNumber_3']:
+            all_tertiary_rows.append(new_tertiary_row)
+        else:
+            # This log message will trigger if no numbers remained after filtering OR if there were no numbers to begin with.
+            logger.info(f"Skipping row for canonical URL '{aggregated_entry['canonical_entry_url']}' (Company: '{aggregated_entry['report_company_name']}') in Top_Contacts_Report as it has no eligible phone numbers after filtering.")
+            
     logger.info(f"Finished building Top_Contacts_Report. {len(all_tertiary_rows)} rows created.")
 
 
@@ -726,7 +752,7 @@ def main() -> None:
 
         # Get the globally consolidated data for this true_base_domain (canonical_url_summary)
         company_contact_details_summary: Optional[CompanyContactDetails] = None
-        if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base:
+        if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base: # Ensure this was already correct
             company_contact_details_summary = final_consolidated_data_by_true_base[canonical_url_summary]
 
         # The consolidated_numbers list is already de-duplicated and sorted by classification

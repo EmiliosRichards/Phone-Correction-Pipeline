@@ -249,6 +249,7 @@ async def scrape_website(
     start_time = time.time()
     final_canonical_entry_url: Optional[str] = None
     pages_scraped_for_this_domain_count = 0
+    high_priority_pages_scraped_after_limit = 0 # New counter
     logger.info(f"Starting scrape for URL: {given_url} (Company: {company_name_or_id})")
 
     normalized_given_url = normalize_url(given_url)
@@ -305,19 +306,32 @@ async def scrape_website(
 
                 if config_instance.scraper_max_pages_per_domain > 0 and \
                    pages_scraped_for_this_domain_count >= config_instance.scraper_max_pages_per_domain:
+                    # Max pages per domain limit is hit. Now check score threshold and high-priority limit.
                     if current_score < config_instance.scraper_score_threshold_for_limit_bypass:
                         logger.info(f"Domain page limit ({config_instance.scraper_max_pages_per_domain}) reached. "
                                     f"Skipping '{current_url_from_queue}' (score {current_score} < "
                                     f"bypass threshold {config_instance.scraper_score_threshold_for_limit_bypass}).")
                         continue
-                    else:
-                        logger.info(f"Domain page limit reached, but '{current_url_from_queue}' (score {current_score}) "
-                                    f"meets/exceeds bypass threshold {config_instance.scraper_score_threshold_for_limit_bypass}.")
-
+                    else: # Score is high enough to bypass general limit
+                        if high_priority_pages_scraped_after_limit >= config_instance.scraper_max_high_priority_pages_after_limit:
+                            logger.info(f"Domain page limit ({config_instance.scraper_max_pages_per_domain}) reached AND "
+                                        f"max high-priority pages after limit ({config_instance.scraper_max_high_priority_pages_after_limit}) reached. "
+                                        f"Skipping '{current_url_from_queue}' (score {current_score}).")
+                            continue
+                        else:
+                            logger.info(f"Domain page limit reached, but '{current_url_from_queue}' (score {current_score}) "
+                                        f"meets bypass threshold AND is within high-priority page limit "
+                                        f"({high_priority_pages_scraped_after_limit + 1}/{config_instance.scraper_max_high_priority_pages_after_limit}).")
+                            # This page will be processed, counter will be incremented if successful scrape
+                
                 html_content, status_code = await fetch_page_content(page, current_url_from_queue)
 
                 if html_content:
                     pages_scraped_for_this_domain_count += 1
+                    # If general limit was hit and this high-priority page is scraped, increment its specific counter
+                    if pages_scraped_for_this_domain_count > config_instance.scraper_max_pages_per_domain and \
+                       current_score >= config_instance.scraper_score_threshold_for_limit_bypass:
+                        high_priority_pages_scraped_after_limit += 1
                     
                     final_landed_url_raw = page.url
                     final_landed_url_normalized = normalize_url(final_landed_url_raw)
