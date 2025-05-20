@@ -447,8 +447,12 @@ async def scrape_website(
     cleaned_pages_storage_dir = os.path.join(base_scraped_content_dir, "cleaned_pages_text") # New directory for cleaned text
     os.makedirs(cleaned_pages_storage_dir, exist_ok=True)
     
-    company_safe_name = get_safe_filename(company_name_or_id, for_url=False, max_len=50) # Max 50 for company part
-
+    company_safe_name = get_safe_filename(
+        company_name_or_id,
+        for_url=False,
+        max_len=config_instance.filename_company_name_max_len # Use the new config value
+    )
+ 
     scraped_page_details: List[Tuple[str, str]] = [] # To store (file_path, source_url)
     # processed_urls = set() # Removed: Will use globally_processed_urls
     urls_to_scrape = [(normalized_given_url, 0)] # Start with the normalized URL

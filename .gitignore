@@ -161,4 +161,6 @@ phone_validation_pipeline/output_data/
 ms-playwright/
 
 # Excel input file
-phone_validation_pipeline/data_to_be_inputed.xlsx
+data_to_be_inputed.xlsx
+
+old_output_data/

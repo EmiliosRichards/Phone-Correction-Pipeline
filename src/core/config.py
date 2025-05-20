@@ -50,6 +50,7 @@ class AppConfig:
         output_base_dir (str): Base directory for output files.
         scraped_content_subdir (str): Subdirectory name for storing scraped content.
         llm_context_subdir (str): Subdirectory name for storing LLM context/raw responses.
+        filename_company_name_max_len (int): Maximum length for the sanitized company name part of output filenames.
         respect_robots_txt (bool): Whether the scraper should respect robots.txt.
         robots_txt_user_agent (str): User-agent string for checking robots.txt.
         gemini_api_key (Optional[str]): API key for Google Gemini.
@@ -100,6 +101,7 @@ class AppConfig:
         self.output_base_dir: str = os.getenv('OUTPUT_BASE_DIR', 'output_data') # Relative to phone_validation_pipeline
         self.scraped_content_subdir: str = 'scraped_content'
         self.llm_context_subdir: str = 'llm_context' # New subdir for LLM raw responses
+        self.filename_company_name_max_len: int = int(os.getenv('FILENAME_COMPANY_NAME_MAX_LEN', '25')) # Default to 25
 
         # --- Robots.txt Handling ---
         self.respect_robots_txt: bool = os.getenv('RESPECT_ROBOTS_TXT', 'True').lower() == 'true'
