@@ -1,0 +1,48 @@
+{
+  "phone_patterns": {
+    "german": {
+      "pattern": "(?:(?:\\+49|0049|49)|(?:\\(0\\)))\\s*(?:\\d[\\s-]?){8,12}\\d",
+      "description": "German format with country code or area code in parentheses"
+    },
+    "international": {
+      "pattern": "(?:\\+|00)\\d{1,3}[\\s.-]?(?:\\(0\\))?\\s*(?:\\d[\\s-]?){6,12}\\d",
+      "description": "International format with country code"
+    },
+    "local": {
+      "pattern": "\\(?0\\d{1,4}\\)?[\\s.-]?(?:\\d[\\s-]?){5,10}\\d",
+      "description": "Local format with area code"
+    }
+  },
+  "validation": {
+    "min_digits": 8,
+    "max_digits": 15,
+    "invalid_patterns": [
+      {
+        "pattern": "(\\d)\\1{4,}",
+        "description": "5 or more repeated digits"
+      },
+      {
+        "pattern": "(19|20)\\d{2}",
+        "description": "Looks like a year"
+      },
+      {
+        "pattern": "^0{3,}",
+        "description": "Starts with too many zeros"
+      }
+    ]
+  },
+  "formatting": {
+    "german": {
+      "pattern": "+49 {area_code} {number}",
+      "description": "German format with +49 country code"
+    },
+    "international": {
+      "pattern": "{country_code} {area_code} {exchange} {number}",
+      "description": "International format with spaces between groups"
+    },
+    "local": {
+      "pattern": "({area_code}) {exchange}-{number}",
+      "description": "Local format with parentheses around area code"
+    }
+  }
+}

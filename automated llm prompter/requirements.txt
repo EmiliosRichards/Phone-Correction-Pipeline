@@ -1,0 +1,14 @@
+google-generativeai
+google-api-core
+requests
+paramiko
+python-dotenv
+jsonschema
+python-dateutil
+urllib3
+certifi
+typing-extensions
+pytz
+structlog
+python-json-logger
+nltk

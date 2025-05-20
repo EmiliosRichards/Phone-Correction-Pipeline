@@ -1,0 +1,50 @@
+TASK: Extract phone numbers from the following text.
+OUTPUT FORMAT: You MUST provide your output as a JSON array. Each element in the array is a JSON object representing a single phone number. If no phone numbers are found, output an empty array: [].
+
+Each JSON object MUST contain these exact fields, in this order:
+1.  `original_number_text` (string): The phone number exactly as it appears in the text.
+2.  `normalized_number` (string): The phone number in E.164 format (e.g., "+18005551234"). If country code is unknown, make a reasonable guess (e.g., assume US if format is typical for US numbers) and note this in `extra_details`. If E.164 is impossible, provide the most standard form.
+3.  `category` (string): The category field MUST be one of the following exact string values:
+    *   "Sales": Numbers explicitly mentioned for sales inquiries, product purchases, or business development.
+    *   "Support": Numbers explicitly designated for customer service, helpdesk, or technical support.
+    *   "Recruiting": Numbers related to recruitment or job applications.
+    *   "General": General contact numbers or if the specific business purpose is unclear.
+    *   "LowValue": Numbers that are likely of low importance or not primary contact numbers (e.g., fax, pager, some automated lines if not fitting other categories).
+4.  `confidence` (float): A score from 0.0 to 1.0 indicating your confidence in the extraction.
+5.  `context_snippet` (string): A short text snippet (approx. 20-30 words or a sentence) around the number.
+6.  `company_name` (string or null): The name of the company associated with the number. Use `null` if not applicable or not found.
+7.  `extra_details` (string or null): Any other relevant notes. Use `null` or an empty string if none.
+
+EXAMPLE JSON OUTPUT (should be an array of objects like this):
+```json
+[
+  {
+    "original_number_text": "Contact us: (800) CALL-NOW",
+    "normalized_number": "+18002255669",
+    "category": "Sales",
+    "confidence": 0.9,
+    "context_snippet": "For immediate assistance, Contact us: (800) CALL-NOW. Our representatives are standing by.",
+    "company_name": "Best Deals Inc.",
+    "extra_details": "CALL-NOW mapped to 225-5669. Assumed US country code."
+  },
+  {
+    "original_number_text": "Tech support line is 555.123.4567",
+    "normalized_number": "+15551234567",
+    "category": "Support",
+    "confidence": 0.95,
+    "context_snippet": "If you experience issues, our Tech support line is 555.123.4567 available weekdays.",
+    "company_name": "Tech Solutions Ltd.",
+    "extra_details": "Assumed US country code."
+  }
+]
+```
+
+If no numbers are found, the output MUST be:
+```json
+[]
+```
+
+Do not add any explanations or text before or after the JSON array.
+
+Input Text:
+{input_text}
