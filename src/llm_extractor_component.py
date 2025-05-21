@@ -202,7 +202,7 @@ class GeminiLLMExtractor:
         prompt_template_path: str,
         llm_context_dir: str,  # New parameter
         file_identifier_prefix: str  # New parameter
-    ) -> Tuple[List[PhoneNumberLLMOutput], Optional[str]]:
+    ) -> Tuple[List[PhoneNumberLLMOutput], Optional[str], Optional[Dict[str, int]]]:
         """
         Classifies candidate phone numbers based on their snippets and source URLs using the Gemini API.
 
@@ -236,6 +236,40 @@ class GeminiLLMExtractor:
         """
         raw_llm_response_str: Optional[str] = None
         extracted_numbers: List[PhoneNumberLLMOutput] = []
+        token_usage_stats: Optional[Dict[str, int]] = None
+
+        # --- BEGIN NEW LOGIC FOR SAVING TEMPLATE ONCE ---
+        try:
+            run_output_dir = os.path.dirname(llm_context_dir)
+            if not run_output_dir: # e.g. if llm_context_dir was just "llm_context"
+                logger.warning(f"Could not determine run_output_dir from llm_context_dir: '{llm_context_dir}'. Cannot save prompt template.")
+            else:
+                # Ensure the parent directory for llm_prompt_template.txt exists
+                os.makedirs(run_output_dir, exist_ok=True)
+
+                template_output_filename = "llm_prompt_template.txt"
+                template_output_filepath = os.path.join(run_output_dir, template_output_filename)
+
+                if not os.path.exists(template_output_filepath):
+                    logger.info(f"Attempting to save base LLM prompt template to {template_output_filepath}")
+                    try:
+                        # Load the original base prompt template content
+                        base_prompt_content = self._load_prompt_template(prompt_template_path)
+                        with open(template_output_filepath, 'w', encoding='utf-8') as f_template:
+                            f_template.write(base_prompt_content)
+                        logger.info(f"Successfully saved base LLM prompt template to {template_output_filepath}")
+                    except FileNotFoundError:
+                        # _load_prompt_template logs this. This log is for context of this specific save operation.
+                        logger.error(f"Base prompt template file '{prompt_template_path}' not found. Cannot save a copy to '{template_output_filepath}'.")
+                    except IOError as e_io:
+                        logger.error(f"IOError saving base LLM prompt template to '{template_output_filepath}': {e_io}")
+                    except Exception as e_template_save: # Catch any other error during template loading/saving
+                        logger.error(f"Unexpected error during saving of base LLM prompt template to '{template_output_filepath}': {e_template_save}")
+                else:
+                    logger.debug(f"Base LLM prompt template '{template_output_filepath}' already exists. Skipping save.")
+        except Exception as e_path_setup: # Catch errors from os.path.dirname or os.makedirs
+            logger.error(f"Error in pre-processing for saving prompt template (e.g., path manipulation for '{llm_context_dir}'): {e_path_setup}")
+        # --- END NEW LOGIC FOR SAVING TEMPLATE ONCE ---
 
         try:
             prompt_template = self._load_prompt_template(prompt_template_path)
@@ -247,22 +281,10 @@ class GeminiLLMExtractor:
                 candidate_items_json_str
             )
 
-            # Save the full prompt
-            # Define filename and path before the try block to ensure filepath is bound for error logging
-            full_prompt_filename = f"{file_identifier_prefix}_llm_full_prompt.txt"
-            full_prompt_filepath = os.path.join(llm_context_dir, full_prompt_filename)
-            logger.info(f"Attempting to save LLM full prompt. Path: '{full_prompt_filepath}', Length: {len(full_prompt_filepath)}") # DEBUG PATH LENGTH
-            try:
-                with open(full_prompt_filepath, 'w', encoding='utf-8') as f_prompt:
-                    f_prompt.write(formatted_prompt)
-                logger.info(f"Saved full LLM prompt to {full_prompt_filepath}")
-            except IOError as e_io:
-                logger.error(f"IOError saving full LLM prompt to {full_prompt_filepath}: {e_io}")
-            # Continue even if saving prompt fails, as main functionality is LLM call
 
         except Exception as e:
             logger.error(f"Failed to load or format prompt: {e}")
-            return [], f"Error loading prompt: {str(e)}"
+            return [], f"Error loading prompt: {str(e)}", token_usage_stats
 
         generation_config = GenerationConfig(
             candidate_count=1,
@@ -276,6 +298,21 @@ class GeminiLLMExtractor:
                 formatted_prompt,
                 generation_config=generation_config
             )
+
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                logger.info(
+                    f"Gemini API usage metadata: "
+                    f"Prompt Tokens: {response.usage_metadata.prompt_token_count}, "
+                    f"Candidates Tokens: {response.usage_metadata.candidates_token_count}, "
+                    f"Total Tokens: {response.usage_metadata.total_token_count}"
+                )
+                token_usage_stats = {
+                    "prompt_tokens": response.usage_metadata.prompt_token_count,
+                    "completion_tokens": response.usage_metadata.candidates_token_count,
+                    "total_tokens": response.usage_metadata.total_token_count
+                }
+            else:
+                logger.warning("Gemini API usage metadata not found in response object or response.usage_metadata is None/empty.")
             
             # Gemini SDK should parse into List[PhoneNumberLLMOutput] if response_schema is List[PydanticModel]
             # and response_mime_type is "application/json".
@@ -285,7 +322,7 @@ class GeminiLLMExtractor:
             
             if not response.candidates:
                 logger.error("No candidates found in Gemini response.")
-                return [], json.dumps({"error": "No candidates in response", "raw_response_text": raw_llm_response_str})
+                return [], json.dumps({"error": "No candidates in response", "raw_response_text": raw_llm_response_str}), token_usage_stats
 
             # Accessing parsed Pydantic objects:
             # If response_schema=List[PhoneNumberLLMOutput] was successful,
@@ -358,7 +395,7 @@ class GeminiLLMExtractor:
                             "extracted_candidate": json_candidate_str,
                             "raw_response_text": raw_llm_response_str,
                             "details": str(e)
-                        })
+                        }), token_usage_stats
                     except PydanticValidationError as ve:
                         logger.error(f"Pydantic validation failed for parsed JSON: {ve}. Parsed JSON: '{json_candidate_str}'. Raw LLM: '{raw_llm_response_str[:500]}...'")
                         return [], json.dumps({
@@ -366,13 +403,13 @@ class GeminiLLMExtractor:
                             "parsed_json": json_candidate_str,
                             "raw_response_text": raw_llm_response_str,
                             "details": ve.errors()
-                        })
+                        }), token_usage_stats
                 else: # if not json_candidate_str
                     logger.warning(f"Could not extract a JSON block from LLM response. Raw response: {raw_llm_response_str[:500]}...")
                     return [], json.dumps({
                         "error": "Could not extract JSON block from LLM response",
                         "raw_response_text": raw_llm_response_str
-                    })
+                    }), token_usage_stats
             else: # if not raw_llm_response_str (empty response from LLM)
                 logger.warning("Gemini response text is empty.")
                 finish_reason = "Unknown"
@@ -383,11 +420,11 @@ class GeminiLLMExtractor:
                     return [], json.dumps({
                         "error": f"Gemini generation stopped due to: {finish_reason}",
                         "raw_response_text": raw_llm_response_str
-                    })
+                    }), token_usage_stats
                 return [], json.dumps({
                     "error": "Empty text from LLM response",
                     "raw_response_text": raw_llm_response_str
-                })
+                }), token_usage_stats
 
 
         except google_exceptions.GoogleAPIError as e:
@@ -395,14 +432,16 @@ class GeminiLLMExtractor:
             # Consider specific error types for retry if LLMBaseClient's logic isn't used.
             # For now, just return the error.
             raw_llm_response_str = json.dumps({"error": f"Gemini API error: {str(e)}", "type": type(e).__name__})
-            return [], raw_llm_response_str
+            # token_usage_stats would be None here as the API call itself failed or didn't complete to the point of having usage_metadata
+            return [], raw_llm_response_str, token_usage_stats
         except Exception as e:
             logger.error(f"Unexpected error during LLM extraction: {e}", exc_info=True)
             raw_llm_response_str = json.dumps({"error": f"Unexpected error: {str(e)}", "type": type(e).__name__})
-            return [], raw_llm_response_str
+            # token_usage_stats might be None or populated if error occurred after API call
+            return [], raw_llm_response_str, token_usage_stats
         
         # Ensure raw_llm_response_str is a string for the second part of the tuple
         if raw_llm_response_str is None:
             raw_llm_response_str = json.dumps({"error": "LLM response was not captured."})
             
-        return extracted_numbers, raw_llm_response_str
+        return extracted_numbers, raw_llm_response_str, token_usage_stats
