@@ -1,11 +1,11 @@
 import pandas as pd
 from typing import List, Dict, Set, Optional, Any, Callable, Union, Tuple
 import csv # Added for failure log
-from src.data_handler import load_and_preprocess_data, process_and_consolidate_contact_data, get_canonical_base_url # Added process_and_consolidate_contact_data
+from src.data_handler import load_and_preprocess_data, process_and_consolidate_contact_data, get_canonical_base_url, generate_processed_contacts_report # Kept main's import
 from src.scraper import scrape_website
 from src.regex_extractor_component import extract_numbers_with_snippets_from_text
 from src.llm_extractor_component import GeminiLLMExtractor
-from src.core.schemas import PhoneNumberLLMOutput, CompanyContactDetails, ConsolidatedPhoneNumber # Added ConsolidatedPhoneNumber
+from src.core.schemas import PhoneNumberLLMOutput, CompanyContactDetails, ConsolidatedPhoneNumber 
 from src.scraper.scraper_logic import normalize_url
 from src.core.logging_config import setup_logging
 from src.core.config import AppConfig
@@ -21,18 +21,17 @@ import phonenumbers
 from phonenumbers import NumberParseException
 from openpyxl.utils import get_column_letter
 
-TARGET_COUNTRY_CODES_INT: Set[int] = {49, 41, 43} # Germany, Switzerland, Austria
+TARGET_COUNTRY_CODES_INT: Set[int] = {49, 41, 43} 
 EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT: Set[str] = {
-    'Unknown', 'Fax', 'Mobile', 'Date', 'ID' # 'Non-Priority-Country Contact' removed as per user request
+    'Unknown', 'Fax', 'Mobile', 'Date', 'ID' 
 }
-logger = logging.getLogger(__name__) # Will be configured by setup_logging in main()
+logger = logging.getLogger(__name__) 
 app_config: AppConfig = AppConfig()
 
 INPUT_FILE_PATH: str = app_config.input_excel_file_path
 if not os.path.isabs(INPUT_FILE_PATH):
     project_root_dir = os.path.dirname(os.path.abspath(__file__))
     INPUT_FILE_PATH = os.path.join(project_root_dir, INPUT_FILE_PATH)
-    # Initial log before full setup might go to default console
     print(f"INFO: Resolved relative INPUT_FILE_PATH to absolute: {INPUT_FILE_PATH}")
 
 
@@ -49,22 +48,20 @@ def is_target_country_number_reliable(phone_number_str: str) -> bool:
 def generate_run_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def log_row_failure(failure_log_writer: Optional[Any], input_row_identifier: Any, stage_of_failure: str, error_reason: str) -> None: # Changed csv.writer to Any
+def log_row_failure(failure_log_writer: Optional[Any], input_row_identifier: Any, stage_of_failure: str, error_reason: str) -> None: 
     """Helper function to write a row-specific failure to the CSV log."""
     if failure_log_writer:
         try:
-            # Sanitize error_reason to remove newlines/carriage returns for CSV compatibility
             sanitized_reason = str(error_reason).replace('\n', ' ').replace('\r', '')
             failure_log_writer.writerow([input_row_identifier, stage_of_failure, sanitized_reason])
         except Exception as e:
-            # Log to the main logger if writing to failure log fails, to avoid crashing the pipeline
             logger.error(f"CRITICAL: Failed to write to failure_log_csv: {e}. Row ID: {input_row_identifier}, Stage: {stage_of_failure}", exc_info=True)
     else:
         logger.warning(f"Attempted to log row failure but failure_log_writer is None. Row ID: {input_row_identifier}, Stage: {stage_of_failure}")
 
 
 def main() -> None:
-    pipeline_start_time = time.time() # For overall duration
+    pipeline_start_time = time.time() 
     run_metrics: Dict[str, Any] = {
         "run_id": None,
         "total_duration_seconds": None,
@@ -925,6 +922,9 @@ def main() -> None:
         run_metrics["errors_encountered"].append(f"Error saving summary report: {str(e_summary)}")
     run_metrics["report_generation_stats"]["summary_report_rows"] = len(df_summary_export) if 'df_summary_export' in locals() else 0
  
+    tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id) 
+    tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
+
     if all_tertiary_rows:
         df_tertiary_report = pd.DataFrame(all_tertiary_rows)
         
@@ -934,10 +934,8 @@ def main() -> None:
         
         df_tertiary_export = df_tertiary_report[tertiary_report_columns_order].copy()
 
-        tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id)
-        tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
         try:
-            logger.info(f"Attempting to save tertiary report to: {tertiary_output_excel_path}")
+            logger.info(f"Attempting to save tertiary report ('Final Contacts.xlsx') to: {tertiary_output_excel_path}")
             with pd.ExcelWriter(tertiary_output_excel_path, engine='openpyxl') as writer_t:
                 df_tertiary_export.to_excel(writer_t, index=False, sheet_name='Contact_Focused_Report')
                 worksheet_tertiary = writer_t.sheets['Contact_Focused_Report']
@@ -962,6 +960,19 @@ def main() -> None:
     run_metrics["tasks"]["pass2_report_generation_duration_seconds"] = time.time() - pass2_reports_start_time
  
     write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time)
+
+    logger.info("Attempting to generate 'Final Processed Contacts' report...")
+    if os.path.exists(tertiary_output_excel_path):
+        try:
+            generate_processed_contacts_report(
+                final_contacts_file_path=tertiary_output_excel_path, 
+                config=app_config,
+                run_id=run_id
+            )
+        except Exception as e_processed_report:
+            logger.error(f"Error generating 'Final Processed Contacts' report: {e_processed_report}", exc_info=True)
+    else:
+        logger.warning(f"'Final Contacts.xlsx' not found at {tertiary_output_excel_path}. Skipping 'Final Processed Contacts' report generation.")
 
     logger.info(f"Pipeline run {run_id} finished.")
     logger.info(f"Total pipeline duration: {run_metrics['total_duration_seconds']:.2f} seconds.")
