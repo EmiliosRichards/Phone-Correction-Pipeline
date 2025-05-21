@@ -4,6 +4,9 @@ import logging
 import uuid # For RunID
 from typing import Optional, List, Dict, Any, Union # Added List, Dict, Any, Union
 from urllib.parse import urlparse, urlunparse # Added for URL parsing
+import os # Added for os.path.exists and os.makedirs
+import re # For new helper functions
+from openpyxl.utils import get_column_letter # For auto-sizing columns
 
 # Import AppConfig directly. Its __init__ handles .env loading.
 # If this import fails, it's a critical setup error for the application.
@@ -501,6 +504,227 @@ def process_and_consolidate_contact_data(
         consolidated_numbers=final_consolidated_list,
         original_input_urls=sorted(list(all_original_source_urls_for_this_company)) # Store all unique URLs processed
     )
+
+# Helper functions adapted from scripts/process_contacts.py
+def _extract_base_domain_for_processed_report(company_name_field: Optional[str]) -> Optional[str]:
+    """
+    Extracts the base domain from a company name field that might contain a URL.
+    Example: "https://wolterskluwer.com - AnNoText" -> "wolterskluwer"
+    """
+    if pd.isna(company_name_field) or not company_name_field:
+        return None
+    # Find the first part that looks like a URL
+    url_match = re.search(r'https?://[^\s]+', str(company_name_field))
+    if url_match:
+        url_str = url_match.group(0)
+        try:
+            parsed_url = urlparse(url_str)
+            domain = parsed_url.netloc
+            # Remove www. if present
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            domain_parts = domain.split('.')
+            if len(domain_parts) > 1:
+                # Handles 'example.com' -> 'example', 'example.co.uk' -> 'example'
+                if domain_parts[-1] in ['com', 'de', 'org', 'net', 'uk', 'io', 'co', 'eu', 'info', 'biz', 'at', 'ch']: # Expanded TLD list
+                    if len(domain_parts) > 2 and domain_parts[-2] in ['co']: # for .co.uk etc.
+                         return domain_parts[-3] if len(domain_parts) > 2 else domain_parts[0]
+                    return domain_parts[-2] if len(domain_parts) > 1 else domain_parts[0]
+                return domain_parts[0] # Fallback if TLD not in simple list
+            return domain # If only one part (e.g. localhost)
+        except Exception as e:
+            logger.warning(f"Error parsing URL '{url_str}' in _extract_base_domain_for_processed_report: {e}")
+            return None
+    # If no URL found, but the field might be a domain itself (e.g. "example.com")
+    # This part is an addition to the original script's logic to handle cases where
+    # the company_name_field is just "example.com" without "http://"
+    try:
+        # Attempt to parse as if it's a netloc
+        # Add a scheme to help urlparse identify it as a domain
+        temp_url_for_parse = company_name_field
+        if not temp_url_for_parse.startswith(('http://', 'https://')):
+            # Check if it contains a common TLD, indicating it might be a domain
+            if not any(tld in temp_url_for_parse for tld in ['.com', '.de', '.org', '.net', '.io', '.co', '.eu', '.info', '.biz', '.at', '.ch']):
+                 # If no common TLD, and no scheme, it's unlikely a domain we can process here.
+                 # Return the original field or part of it if it's very long.
+                 # For this report, if it's not a clear domain, maybe return None or the original.
+                 # The script's original behavior was to return None if no http(s) found.
+                 return None # Sticking closer to original script's behavior if no http(s)
+
+            temp_url_for_parse = 'http://' + temp_url_for_parse
+
+        parsed_direct = urlparse(temp_url_for_parse)
+        if parsed_direct.netloc:
+            domain = parsed_direct.netloc
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            domain_parts = domain.split('.')
+            if len(domain_parts) > 1:
+                if domain_parts[-1] in ['com', 'de', 'org', 'net', 'uk', 'io', 'co', 'eu', 'info', 'biz', 'at', 'ch']:
+                    if len(domain_parts) > 2 and domain_parts[-2] in ['co']:
+                         return domain_parts[-3] if len(domain_parts) > 2 else domain_parts[0]
+                    return domain_parts[-2] if len(domain_parts) > 1 else domain_parts[0]
+                return domain_parts[0]
+            return domain
+    except Exception: # Catch any error from this alternative parsing
+        pass # Fall through to return None
+    return None
+
+
+def _extract_phone_number_for_processed_report(phone_field: Optional[str]) -> Optional[str]:
+    """
+    Extracts the numerical phone number from a string.
+    Example: "+4922332055000 (Main Line) [AnNoText]" -> "+4922332055000"
+    Also handles: "0123456789 (Type) [Company]" -> "0123456789"
+    """
+    if pd.isna(phone_field) or not phone_field:
+        return None
+    # Regex to capture the part that is likely the number, before any parenthesis.
+    # It allows digits, +, spaces, hyphens, and parentheses initially.
+    match = re.search(r'([+\d\s()-]+)', str(phone_field))
+    if match:
+        # Take the matched group, then split by '(', take the first part, strip whitespace.
+        # Then remove all non-digit and non-+ characters.
+        potential_number_part = match.group(1).split('(')[0].strip()
+        phone_num = re.sub(r'[^\d+]', '', potential_number_part)
+        return phone_num if phone_num else None
+    return None
+
+def _extract_number_type_for_processed_report(phone_field: Optional[str]) -> Optional[str]:
+    """
+    Extracts the number type from parentheses in a phone string.
+    Example: "+4922332055000 (Main Line) [AnNoText]" -> "Main Line"
+    """
+    if pd.isna(phone_field) or not phone_field:
+        return None
+    match = re.search(r'\((.*?)\)', str(phone_field)) # Finds content within the first pair of parentheses
+    if match:
+        return match.group(1).strip()
+    return "Unknown" # Default if no type found in parentheses, as per user feedback implicit in script
+
+def generate_processed_contacts_report(
+    final_contacts_file_path: str, # Changed from all_company_details
+    config: AppConfig,
+    run_id: str
+) -> None:
+    """
+    Generates the 'Final Processed Contacts' Excel report based on 'Final Contacts.xlsx'.
+
+    This report contains columns: "Company Name", "URL", "Number", "Number Type",
+    and "Number Found At". The data is derived by processing the content of
+    the 'Final Contacts.xlsx' file (tertiary report).
+
+    Args:
+        final_contacts_file_path (str): Path to the 'Final Contacts.xlsx' file.
+        config (AppConfig): The application configuration instance.
+        run_id (str): The current run ID for constructing the output path.
+    """
+    logger.info(f"Starting generation of 'Final Processed Contacts' report from: {final_contacts_file_path}")
+
+    try:
+        df_source = pd.read_excel(final_contacts_file_path)
+        logger.info(f"Successfully read '{final_contacts_file_path}'. Shape: {df_source.shape}")
+    except FileNotFoundError:
+        logger.error(f"Error: Source file '{final_contacts_file_path}' not found for 'Final Processed Contacts' report.")
+        return
+    except Exception as e:
+        logger.error(f"Error reading source file '{final_contacts_file_path}': {e}", exc_info=True)
+        return
+
+    report_data = []
+    for index, row in df_source.iterrows():
+        # 'CompanyName' in Final Contacts is like "http://domain.com - Actual Name"
+        # The _extract_base_domain_for_processed_report expects this format.
+        company_name_input = row.get('CompanyName')
+        processed_company_name = _extract_base_domain_for_processed_report(company_name_input)
+
+        # 'CanonicalEntryURL' is the base URL.
+        url = row.get('CanonicalEntryURL')
+
+        # 'PhoneNumber_1' in Final Contacts is like "NUMBER (TYPE) [SOURCE_COMPANIES]"
+        phone_number_field_1 = row.get('PhoneNumber_1')
+        number = _extract_phone_number_for_processed_report(phone_number_field_1)
+        number_type = _extract_number_type_for_processed_report(phone_number_field_1)
+
+        # 'SourceURL_1' contains the source URLs for the first number.
+        number_found_at = row.get('SourceURL_1')
+
+        # Only add row if a number was successfully extracted, to match script's behavior
+        # where rows without numbers (or where extraction fails) might be implicitly skipped.
+        # The script `process_contacts.py` appends regardless, but values might be None.
+        # For consistency with user expectation of "identical row counts", we should append.
+        # If number is None, it will be written as blank in Excel.
+        report_data.append({
+            "Company Name": processed_company_name,
+            "URL": url,
+            "Number": number,
+            "Number Type": number_type,
+            "Number Found At": number_found_at
+        })
+
+    if not report_data:
+        logger.info("No data processed to write for the 'Final Processed Contacts' report (source df might be empty or all rows resulted in no data).")
+        return
+
+    report_df = pd.DataFrame(report_data)
+    
+    columns_order = ["Company Name", "URL", "Number", "Number Type", "Number Found At"]
+    # Ensure all columns exist, add if not, then reorder
+    for col in columns_order:
+        if col not in report_df.columns:
+            report_df[col] = None # Add missing columns with None
+    report_df = report_df[columns_order]
+
+    full_path: str = "" # Initialize full_path to ensure it's always bound
+    try:
+        # Construct the correct output path within the run_id specific directory
+        # config.output_base_dir is expected to be an absolute path from AppConfig
+        run_specific_output_dir = os.path.join(config.output_base_dir, run_id)
+        if not os.path.exists(run_specific_output_dir):
+            # This directory should ideally be created by the main pipeline
+            logger.warning(f"Run-specific output directory '{run_specific_output_dir}' did not exist. Creating it.")
+            os.makedirs(run_specific_output_dir, exist_ok=True)
+
+        # Filename template does not include {run_id} by default
+        file_name = config.processed_contacts_report_file_name_template
+        # if "{run_id}" in file_name: # This check is good practice but not needed for default template
+        #     file_name = file_name.format(run_id=run_id)
+        
+        full_path = os.path.join(run_specific_output_dir, file_name)
+        
+        with pd.ExcelWriter(full_path, engine='openpyxl') as writer:
+            report_df.to_excel(writer, index=False, sheet_name='Processed_Contacts')
+            worksheet = writer.sheets['Processed_Contacts']
+            for col_idx, column_name_header in enumerate(report_df.columns):
+                series = report_df[column_name_header]
+                max_len = 0
+                if not series.empty:
+                    # Calculate max length of data in the column
+                    # Ensure series is treated as string for len calculation
+                    # And handle potential NaN values by converting to empty string or specific string
+                    # Using .astype(str).map(len) is robust.
+                    # For NaNs, astype(str) converts them to 'nan'.
+                    # We can replace 'nan' with empty string for length calculation if desired,
+                    # or just let it be. The script's example output implies blanks for missing data.
+                    
+                    # Calculate max length of data values
+                    # Convert to string, then get length. Max of these lengths.
+                    # Handle if all values are NaN or None after conversion (max of empty sequence error)
+                    str_series_lengths = series.astype(str).map(len)
+                    if not str_series_lengths.empty:
+                         max_len_data = str_series_lengths.max()
+                         if pd.notna(max_len_data): # Check if max_len_data itself is not NaN
+                            max_len = int(max_len_data)
+
+
+                # Consider header length
+                header_length = len(str(column_name_header))
+                adjusted_width = max(max_len, header_length) + 2 # Add padding
+                worksheet.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+        
+        logger.info(f"'Final Processed Contacts' report generated successfully: {full_path}")
+    except Exception as e:
+        logger.error(f"Failed to write 'Final Processed Contacts' report to {full_path}: {e}", exc_info=True)
 
 # TODO: [FutureEnhancement] The __main__ block below was for direct script execution, testing, and demonstration.
 # It includes logic to create dummy configurations and data if real test files are not found.
