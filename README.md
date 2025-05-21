@@ -6,7 +6,7 @@ The Phone Validation Pipeline is a Python-based application designed to automate
 
 The pipeline reads company data from a spreadsheet, performs web scraping with advanced link prioritization, extracts potential phone numbers using regular expressions and a Large Language Model (LLM), and generates comprehensive reports.
 
-For a detailed summary of recent enhancements and a deeper dive into specific features, please see the [Pipeline Enhancements Summary](./docs/pipeline_enhancements_summary_20250520_165353.md) document.
+For a detailed summary of recent enhancements and a deeper dive into specific features, please see the [Pipeline Enhancements Summary](./docs/pipeline_enhancements_summary_20250520_165353.md) document and the [Report Enhancements: Final Processed Contacts](./docs/report_enhancements_final_processed_contacts.md) document.
 
 ## High-Level Workflow
 
@@ -17,8 +17,9 @@ The pipeline follows these main stages:
 3.  **Regex Extraction**: Applies regular expressions to the scraped text to identify potential phone number patterns and their surrounding context.
 4.  **LLM Extraction**: Utilizes a Large Language Model (Google Gemini) to analyze the scraped text and contextual snippets to extract, confirm, and classify phone numbers.
 5.  **Data Consolidation & Verification**: Consolidates all extracted data globally by *true base domain* (e.g., `http://example.com`). This handles variations in input URLs and ensures each unique website is processed efficiently. Phone numbers are de-duplicated per true base domain, and their original sources (including input company names and specific page URLs) and types are aggregated.
-6.  **Reporting**: Generates three primary Excel reports for each run:
-    *   **Top Contacts Report** (`Top_Contacts_Report_{RunID}.xlsx`): One consolidated entry per unique true base domain. Features aggregated company names, a filtered and prioritized list of up to 3 phone numbers (with their types and original sourcing company names), and source URLs. This is the primary report for outreach.
+6.  **Reporting**: Generates four primary Excel reports for each run:
+    *   **Final Contacts Report** (`Final Contacts.xlsx`): One consolidated entry per unique true base domain. Features aggregated company names, a filtered and prioritized list of up to 3 phone numbers (with their types and original sourcing company names), and source URLs. This is the primary report for outreach. (Formerly "Top Contacts Report")
+    *   **Final Processed Contacts Report** (`Final_Processed_Contacts.xlsx`): A cleaner, more concise version of the "Final Contacts Report", with specific columns: Company Name, URL, Number, Number Type, Number Found At. It uses the "Final Contacts.xlsx" as its direct data source.
     *   **Summary Report** (`phone_validation_output_{RunID}.xlsx`): One row per original input entry, showing top numbers found for its corresponding true base domain and verification statuses.
     *   **Detailed LLM Extractions Report** (`All_LLM_Extractions_Report_{RunID}.xlsx`): Lists all unique phone numbers found by the LLM for each true base domain, with aggregated types and source URLs.
     Additionally, detailed (and now rotating) logs and intermediate data dumps are created for traceability.
@@ -30,8 +31,9 @@ The pipeline follows these main stages:
 *   **Multi-Modal Extraction**: Combines regex and LLM techniques for robust extraction.
 *   **Flexible LLM Output Handling**: LLM returns text-based JSON, parsed and validated by the application.
 *   **True Base Domain Consolidation**: All data is globally consolidated by the true base domain (e.g., `http://example.com`), ensuring efficient processing and unified reporting for each unique website, regardless of input URL variations.
-*   **Refined Triple Excel Reporting**:
-    *   `Top_Contacts_Report`: Optimized for outreach, one row per true base domain, with filtered, prioritized contacts and aggregated company/source details.
+*   **Refined Quadruple Excel Reporting**:
+    *   `Final Contacts Report`: Optimized for outreach, one row per true base domain, with filtered, prioritized contacts and aggregated company/source details.
+    *   `Final Processed Contacts Report`: A lean, clean version of the `Final Contacts Report` for quick review.
     *   `Summary Report`: Per-input-row overview.
     *   `Detailed_LLM_Extractions_Report`: Comprehensive log of all numbers found by LLM per true base domain.
 *   **Robust LLM Interaction**: Includes retry mechanisms for API calls to Google Gemini.
@@ -64,6 +66,7 @@ phone_validation_pipeline/
 │   └── data_to_be_inputed.csv # Example input
 ├── docs/                  # Project documentation
 │   ├── pipeline_enhancements_summary_20250520_165353.md # Detailed summary of recent features
+│   ├── report_enhancements_final_processed_contacts.md # Documentation for the "Final Processed Contacts" report
 │   └── archive/                 # Older planning and summary documents
 │       └── ...
 ├── prompts/               # Directory for LLM prompt templates
@@ -91,7 +94,8 @@ phone_validation_pipeline/
         │   └── ..._llm_raw_output.json  # Raw LLM response
         ├── phone_validation_output_{RunID}.xlsx       # Summary report (per input row)
         ├── All_LLM_Extractions_Report_{RunID}.xlsx    # Detailed flattened report (was phone_validation_detailed_output)
-        └── Top_Contacts_Report_{RunID}.xlsx           # Consolidated top contacts report (per true base domain)
+        ├── Final Contacts.xlsx                        # Consolidated top contacts report (per true base domain)
+        └── Final_Processed_Contacts.xlsx              # Leaner, processed version of Final Contacts
 ```
 
 ## Setup Instructions
@@ -141,9 +145,10 @@ This script will:
 *   Read data from the `INPUT_EXCEL_FILE_PATH` specified in your `.env` file.
 *   Perform scraping, extraction, and validation according to the configured settings.
 *   Save output files to a run-specific subdirectory within `output_data/` (e.g., `output_data/YYYYMMDD_HHMMSS/`). This includes:
+    *   The Final Contacts Report (`Final Contacts.xlsx`).
+    *   The Final Processed Contacts Report (`Final_Processed_Contacts.xlsx`).
     *   The Summary Report (`phone_validation_output_{RunID}.xlsx`).
-    *   The Detailed Flattened Report (`All_LLM_Extractions_Report_{RunID}.xlsx`).
-    *   The Top Contacts Report (`Top_Contacts_Report_{RunID}.xlsx`).
+    *   The Detailed LLM Extractions Report (`All_LLM_Extractions_Report_{RunID}.xlsx`).
     *   A comprehensive run log (`pipeline_run_{RunID}.log`).
     *   Subdirectories for scraped content, intermediate data (regex snippets), and LLM context (prompts, raw responses).
 
@@ -156,4 +161,4 @@ For more detailed information on:
 *   Advanced configuration options and best practices.
 *   Troubleshooting common issues.
 
-Please refer to the [**USAGE.md**](./USAGE.md) file and the [**Pipeline Enhancements Summary**](./docs/pipeline_enhancements_summary_20250520_165353.md) document.
+Please refer to the [**USAGE.md**](./USAGE.md) file, the [**Pipeline Enhancements Summary**](./docs/pipeline_enhancements_summary_20250520_165353.md) document, and the [**Report Enhancements: Final Processed Contacts**](./docs/report_enhancements_final_processed_contacts.md) document.

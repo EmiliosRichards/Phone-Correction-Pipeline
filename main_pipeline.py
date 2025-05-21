@@ -1,6 +1,6 @@
 import pandas as pd
 from typing import List, Dict, Set, Optional, Any, Callable, Union, Tuple
-from src.data_handler import load_and_preprocess_data, process_and_consolidate_contact_data, get_canonical_base_url # Added process_and_consolidate_contact_data
+from src.data_handler import load_and_preprocess_data, process_and_consolidate_contact_data, get_canonical_base_url, generate_processed_contacts_report # Added generate_processed_contacts_report
 from src.scraper import scrape_website
 from src.regex_extractor_component import extract_numbers_with_snippets_from_text
 from src.llm_extractor_component import GeminiLLMExtractor
@@ -950,7 +950,12 @@ def main() -> None:
     except Exception as e_summary:
         logger.error(f"Error saving summary report to {summary_output_excel_path}: {e_summary}", exc_info=True)
 
-    # Create and save new Tertiary Report
+    # Define tertiary_output_excel_path before the conditional block
+    # to ensure it's always bound for the "Final Processed Contacts" report generation.
+    tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id) # Ensure run_id is used if template expects it
+    tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
+
+    # Create and save new Tertiary Report ("Final Contacts.xlsx")
     if all_tertiary_rows:
         df_tertiary_report = pd.DataFrame(all_tertiary_rows)
         
@@ -961,10 +966,9 @@ def main() -> None:
         
         df_tertiary_export = df_tertiary_report[tertiary_report_columns_order].copy()
 
-        tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id)
-        tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
+        # tertiary_output_excel_path is already defined above
         try:
-            logger.info(f"Attempting to save tertiary report to: {tertiary_output_excel_path}")
+            logger.info(f"Attempting to save tertiary report ('Final Contacts.xlsx') to: {tertiary_output_excel_path}")
             with pd.ExcelWriter(tertiary_output_excel_path, engine='openpyxl') as writer_t:
                 df_tertiary_export.to_excel(writer_t, index=False, sheet_name='Contact_Focused_Report')
                 # Auto-adjust column widths
@@ -985,6 +989,22 @@ def main() -> None:
             logger.error(f"Error saving tertiary report to {tertiary_output_excel_path}: {e_tertiary}", exc_info=True)
     else:
         logger.info("No data for tertiary report. Skipping file creation.")
+
+    # Generate the new "Final Processed Contacts" report
+    logger.info("Attempting to generate 'Final Processed Contacts' report...")
+    # The 'Final Contacts.xlsx' (tertiary report) should have been saved by now.
+    # Its path is tertiary_output_excel_path
+    if os.path.exists(tertiary_output_excel_path):
+        try:
+            generate_processed_contacts_report(
+                final_contacts_file_path=tertiary_output_excel_path, # Pass the path to "Final Contacts.xlsx"
+                config=app_config,
+                run_id=run_id
+            )
+        except Exception as e_processed_report:
+            logger.error(f"Error generating 'Final Processed Contacts' report: {e_processed_report}", exc_info=True)
+    else:
+        logger.warning(f"'Final Contacts.xlsx' not found at {tertiary_output_excel_path}. Skipping 'Final Processed Contacts' report generation.")
 
     logger.info(f"Pipeline run {run_id} finished.")
     total_duration = time.time() - datetime.strptime(run_id, "%Y%m%d_%H%M%S").timestamp()
