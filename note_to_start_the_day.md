@@ -1,3 +1,5 @@
+PHASE 1 --------------
+
 Enable header selection and working with the range config. // 
 
 Test 2.5 Flash - 1.5 Flash - // 1.5 flash almost identical. //
@@ -12,11 +14,17 @@ Add a logging to see which urls failed, perhaps so we can rerun them
 
 Can we get a token count. 
 
+Can we benchmark accuracy and compare
+
 Setup system on contabo, check usage and see how much it costs. 
 
 Add the upgrade? Big Enancement chat.  
 
+PHASE 2 ----------------------
+
 Set up the next project. 
+
+HANDLED BY FUTURE ENHANCEMENT ----------------
 
 Think about how we will eventually house and store all our data - companies and other. 
 
@@ -33,6 +41,7 @@ Adding pipeline usage monitoring and management.
 Check the workers/monitoring software from v1. CPU, Memory, and Disk assessmennt. 
 
 
-
 Async:
 Scraping Calls: asyncio.run() is called inside the loop. This starts and stops an asyncio event loop for each URL. For many URLs, this is inefficient. A single event loop managing concurrent scraping tasks for multiple URLs would be better.
+
+---> CHECK docs\pipeline_scalability_enhancement_plan_20250521_105900.md
