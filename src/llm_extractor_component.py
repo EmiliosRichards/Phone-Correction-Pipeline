@@ -251,6 +251,7 @@ class GeminiLLMExtractor:
             # Define filename and path before the try block to ensure filepath is bound for error logging
             full_prompt_filename = f"{file_identifier_prefix}_llm_full_prompt.txt"
             full_prompt_filepath = os.path.join(llm_context_dir, full_prompt_filename)
+            logger.info(f"Attempting to save LLM full prompt. Path: '{full_prompt_filepath}', Length: {len(full_prompt_filepath)}") # DEBUG PATH LENGTH
             try:
                 with open(full_prompt_filepath, 'w', encoding='utf-8') as f_prompt:
                     f_prompt.write(formatted_prompt)

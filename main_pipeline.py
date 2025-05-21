@@ -354,6 +354,12 @@ def main() -> None:
                             else:
                                 # Save LLM input candidates file, perhaps named with canonical URL context
                                 safe_canonical_name_for_file = "".join(c if c.isalnum() else "_" for c in final_canonical_entry_url.replace("http://","").replace("https://",""))
+                                # Truncate safe_canonical_name_for_file to prevent excessively long filenames
+                                max_len_url_part = 100 # Define a max length for the URL-derived part
+                                if len(safe_canonical_name_for_file) > max_len_url_part:
+                                    safe_canonical_name_for_file = safe_canonical_name_for_file[:max_len_url_part]
+                                    logger.info(f"Truncated safe_canonical_name_for_file for {final_canonical_entry_url} to: {safe_canonical_name_for_file}")
+
                                 llm_input_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_input_data.json"
                                 llm_input_filepath = os.path.join(llm_context_dir, llm_input_filename)
                                 try:
@@ -372,6 +378,7 @@ def main() -> None:
                                 
                                 llm_raw_output_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_raw_output.json"
                                 llm_raw_output_filepath = os.path.join(llm_context_dir, llm_raw_output_filename)
+                                logger.info(f"Attempting to save LLM raw output. Path: '{llm_raw_output_filepath}', Length: {len(llm_raw_output_filepath)}") # DEBUG PATH LENGTH
                                 try:
                                     with open(llm_raw_output_filepath, 'w', encoding='utf-8') as f_llm_out:
                                         f_llm_out.write(llm_raw_response if isinstance(llm_raw_response, str) else json.dumps(llm_raw_response or {}, indent=2))

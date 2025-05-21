@@ -67,12 +67,14 @@ def get_safe_filename(name_or_url: str, for_url: bool = False, max_len: int = 10
         domain_part = re.sub(r'[^\w-]', '', domain_part)[:15] # Ensure domain_prefix is defined before use
         url_hash = hashlib.sha256(original_input.encode('utf-8')).hexdigest()[:16]
         safe_name = f"{domain_part}_{url_hash}" # Use the sanitized domain_part
-        logger.debug(f"Generated safe filename for URL '{original_input}': {safe_name}")
+        logger.info(f"DEBUG PATH: get_safe_filename (for_url=True) output: '{safe_name}' from input '{original_input}'") # DEBUG PATH LENGTH
         return safe_name
     else:
         name_or_url = re.sub(r'^https?://', '', name_or_url)
         safe_name = re.sub(r'[^\w.-]', '_', name_or_url)
-        return safe_name[:max_len]
+        safe_name_truncated = safe_name[:max_len]
+        logger.info(f"DEBUG PATH: get_safe_filename (for_url=False) output: '{safe_name_truncated}' (original sanitized: '{safe_name}', max_len: {max_len}) from input '{original_input}'") # DEBUG PATH LENGTH
+        return safe_name_truncated
 
 async def fetch_page_content(page, url: str) -> Tuple[Optional[str], Optional[int]]:
     logger.debug(f"Attempting to navigate to: {url}")
@@ -353,7 +355,7 @@ async def scrape_website(
                     landed_url_safe_name = get_safe_filename(final_landed_url_normalized, for_url=True)
                     cleaned_page_filename = f"{company_safe_name}__{landed_url_safe_name}_cleaned.txt"
                     cleaned_page_filepath = os.path.join(cleaned_pages_storage_dir, cleaned_page_filename)
-                    
+                    logger.info(f"DEBUG PATH: Attempting to save cleaned page. Path: '{cleaned_page_filepath}', Length: {len(cleaned_page_filepath)}") # DEBUG PATH LENGTH
                     try:
                         with open(cleaned_page_filepath, 'w', encoding='utf-8') as f_cleaned_page:
                             f_cleaned_page.write(cleaned_text)
