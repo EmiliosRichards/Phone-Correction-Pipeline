@@ -2,7 +2,7 @@ import pandas as pd
 import phonenumbers
 import logging
 import uuid # For RunID
-from typing import Optional, List, Dict, Any # Added List, Dict, Any
+from typing import Optional, List, Dict, Any, Union # Added List, Dict, Any, Union
 from urllib.parse import urlparse, urlunparse # Added for URL parsing
 
 # Import AppConfig directly. Its __init__ handles .env loading.
@@ -126,6 +126,24 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
     else:
         logger.info("No specific row range configured; loading all rows.")
 
+    # Determine the correct skiprows argument for pandas
+    # skip_rows_val is the number of 0-indexed *data* rows to skip after the header.
+    # If skip_rows_val is k > 0, we need to skip file lines 1 through k (0-indexed).
+    # If skip_rows_val is 0, pandas skiprows=0 (with header=0) works.
+    # If skip_rows_val is None, pandas skiprows=None (with header=0) works.
+    pandas_skiprows_arg: Union[int, List[int]] # Type hint updated
+    if skip_rows_val is not None and skip_rows_val > 0:
+        # Create a list of 0-indexed file line numbers to skip.
+        # These are the data rows immediately following the header (file line 0).
+        # e.g., if skip_rows_val is 4 (skip 4 data rows), we skip file lines 1, 2, 3, 4.
+        pandas_skiprows_arg = list(range(1, skip_rows_val + 1))
+    else:
+        # If skip_rows_val is None (process all rows) or 0 (skip no data rows),
+        # pandas_skiprows_arg should be 0.
+        pandas_skiprows_arg = 0
+
+    logger.info(f"Pandas skiprows argument will be: {pandas_skiprows_arg}, nrows: {nrows_val}")
+
     try:
         logger.info(f"Attempting to load data from: {file_path}")
 
@@ -151,10 +169,10 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
         # This is the correct logic.
 
         if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path, header=0, skiprows=skip_rows_val if skip_rows_val is not None else 0, nrows=nrows_val)
+            df = pd.read_csv(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
             logger.info(f"CSV columns loaded: {df.columns.tolist()}")
         elif file_path.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(file_path, header=0, skiprows=skip_rows_val if skip_rows_val is not None else 0, nrows=nrows_val)
+            df = pd.read_excel(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
             logger.info(f"Excel columns loaded: {df.columns.tolist()}")
         else:
             logger.error(f"Unsupported file type: {file_path}. Please use CSV or Excel.")
