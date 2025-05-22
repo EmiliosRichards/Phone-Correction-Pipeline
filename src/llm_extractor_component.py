@@ -15,7 +15,7 @@ import phonenumbers
 from phonenumbers import PhoneNumberFormat
 
 # Assuming schemas are in core.schemas and config in core.config
-from .core.schemas import PhoneNumberLLMOutput, LLMExtractionResult
+from .core.schemas import PhoneNumberLLMOutput, MinimalExtractionOutput
 from .core.config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -314,7 +314,7 @@ class GeminiLLMExtractor:
                     try:
                         parsed_json_object = json.loads(json_candidate_str)
                         # Validate the entire object against LLMExtractionResult
-                        llm_result = LLMExtractionResult(**parsed_json_object) # Pydantic validation here
+                        llm_result = MinimalExtractionOutput(**parsed_json_object) # Pydantic validation here
                         
                         validated_numbers = llm_result.extracted_numbers
 
@@ -339,6 +339,7 @@ class GeminiLLMExtractor:
                                 llm_output.original_input_company_name = candidate_details.get('original_input_company_name')
                             else:
                                 logger.warning(f"Could not find details (source_url, original_input_company_name) for LLM output number: {original_candidate_number}. Map keys: {list(candidate_details_map.keys())[:5]}")
+
                             
                             # Re-normalize phone numbers (existing logic)
                             if llm_output.number: # Number might be None if LLM fails for an entry
