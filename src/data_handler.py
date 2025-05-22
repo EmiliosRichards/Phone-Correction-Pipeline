@@ -50,14 +50,14 @@ def get_canonical_base_url(url_string: str) -> str | None:
             # Check if it looks like a domain that might have had a scheme stripped
             # or if it's just a path fragment. A simple check for a dot.
             if '.' not in temp_url.split('/')[0]: # if no dot in first part before a slash, it's likely not a domain
-                 logger.warning(f"URL '{url_string}' does not appear to be a valid absolute URL or domain for base URL extraction.")
+                 logger.warning(f"Input string '{url_string}' (when attempting to derive a base URL) does not appear to be a valid absolute URL or domain. This may be an original input value.")
                  return None # Or consider returning the original string if it's a relative path and that's desired
             temp_url = 'http://' + temp_url # Default to http if no scheme
 
         parsed = urlparse(temp_url)
 
         if not parsed.netloc:
-            logger.warning(f"Could not determine network location (netloc) for URL: {url_string} (parsed from {temp_url})")
+            logger.warning(f"Could not determine network location (netloc) for input string '{url_string}' (parsed as '{temp_url}' when attempting to derive a base URL).")
             return None
 
         netloc = parsed.netloc

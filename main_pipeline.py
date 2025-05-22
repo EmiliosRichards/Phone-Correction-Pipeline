@@ -17,6 +17,7 @@ import time
 import json
 import re
 from urllib.parse import urlparse, quote
+import socket # Added for TLD probing
 import phonenumbers
 from phonenumbers import NumberParseException
 from openpyxl.utils import get_column_letter
@@ -285,21 +286,51 @@ def main() -> None:
                     current_path = quote(current_path, safe='/%')
                     current_query = quote(current_query, safe='=&/?+%')
                     current_fragment = quote(current_fragment, safe='/?#%')
+
+                    # TLD Probing Logic
                     if current_netloc and not re.search(r'\.[a-zA-Z]{2,}$', current_netloc) and not current_netloc.endswith('.'):
                         is_ip_address = re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", current_netloc)
                         if current_netloc.lower() != 'localhost' and not is_ip_address:
-                            logger.info(f"Appending .de to netloc '{current_netloc}' for {company_name}")
-                            current_netloc += ".de"
+                            logger.info(f"Input domain '{current_netloc}' for '{company_name}' appears to lack a TLD. Attempting TLD probing...")
+                            successfully_probed_tld = False
+                            probed_netloc_base = current_netloc # Keep original for logging if all probes fail
+                            
+                            for tld_to_try in app_config.url_probing_tlds:
+                                candidate_domain_to_probe = f"{probed_netloc_base}.{tld_to_try}"
+                                logger.debug(f"Probing TLD: Trying '{candidate_domain_to_probe}' for '{company_name}'")
+                                try:
+                                    socket.gethostbyname(candidate_domain_to_probe)
+                                    current_netloc = candidate_domain_to_probe # Update current_netloc
+                                    logger.info(f"TLD probe successful for '{company_name}'. Using '{current_netloc}' after trying '.{tld_to_try}'.")
+                                    successfully_probed_tld = True
+                                    break # Stop on first successful probe
+                                except socket.gaierror:
+                                    logger.debug(f"TLD probe DNS lookup failed for '{candidate_domain_to_probe}' for '{company_name}'.")
+                                except Exception as sock_e: # Catch other potential socket errors
+                                    logger.debug(f"TLD probe for '{candidate_domain_to_probe}' failed with unexpected socket error: {sock_e}")
+                            
+                            if not successfully_probed_tld:
+                                logger.warning(f"TLD probing failed for base domain '{probed_netloc_base}' for '{company_name}'. Proceeding with '{current_netloc}' (which might be the un-suffixed original or last attempted).")
+                                # current_netloc remains as it was before the loop if no probe succeeded (i.e. probed_netloc_base)
+                                # Or, if a default append is desired here (e.g. .de as a last resort), it could be added.
+                                # For now, we proceed with the netloc as is, and scraper will handle DNS failure.
+                        
                     effective_path = current_path if current_path else ('/' if current_netloc else '')
+                    
+                    # Reconstruct the URL with potentially modified netloc
                     processed_url = urlparse('')._replace(
                         scheme=current_scheme, netloc=current_netloc, path=effective_path,
                         params=current_params, query=current_query, fragment=current_fragment
                     ).geturl()
-                    if processed_url != given_url_original: 
-                        logger.info(f"URL pre-processed: Original='{given_url_original}', Processed='{processed_url}'")
-                
+                    
+                    # Log the final decision for the URL to be scraped
+                    if processed_url != given_url_original:
+                        logger.info(f"URL for '{company_name}': Original='{given_url_original}', Processed for Scraper='{processed_url}'")
+                    else:
+                        logger.info(f"URL for '{company_name}': Using original='{given_url_original}' (no changes after preprocessing).")
+
                 if not processed_url or not isinstance(processed_url, str) or not processed_url.startswith(('http://', 'https://')):
-                    logger.warning(f"Skipping row {current_row_number_for_log} due to invalid or missing URL after processing: {processed_url} (Original was: '{given_url_original}')")
+                    logger.warning(f"Skipping row {current_row_number_for_log} ('{company_name}') due to invalid or missing URL after all processing: '{processed_url}' (Original input was: '{given_url_original}')")
                     df.at[index, 'ScrapingStatus'] = 'InvalidURL'
                     current_row_scraper_status = 'InvalidURL'
                     df.at[index, 'VerificationStatus'] = 'Skipped_InvalidURL'
@@ -999,6 +1030,52 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
             else:
                 f.write("- No task durations recorded.\n")
             f.write("\n")
+
+            f.write("### Average Task Durations (per relevant item):\n")
+
+            tasks_data = metrics.get("tasks", {})
+            scraping_stats_data = metrics.get("scraping_stats", {})
+            regex_stats_data = metrics.get("regex_extraction_stats", {})
+            llm_stats_data = metrics.get("llm_processing_stats", {})
+            data_proc_stats_data = metrics.get("data_processing_stats", {})
+
+            # Average Scrape Duration
+            total_scrape_duration = tasks_data.get("scrape_website_total_duration_seconds", 0)
+            new_canonical_sites_scraped = scraping_stats_data.get("new_canonical_sites_scraped", 0)
+            if new_canonical_sites_scraped > 0:
+                avg_scrape_duration = total_scrape_duration / new_canonical_sites_scraped
+                f.write(f"- **Average Scrape Website Duration (per New Canonical Site Scraped):** {avg_scrape_duration:.2f} seconds\n")
+            else:
+                f.write("- Average Scrape Website Duration (per New Canonical Site Scraped): N/A (No new canonical sites scraped)\n")
+
+            # Average Regex Extraction Duration
+            total_regex_duration = tasks_data.get("regex_extraction_total_duration_seconds", 0)
+            sites_processed_for_regex = regex_stats_data.get("sites_processed_for_regex", 0)
+            if sites_processed_for_regex > 0:
+                avg_regex_duration = total_regex_duration / sites_processed_for_regex
+                f.write(f"- **Average Regex Extraction Duration (per Site Processed for Regex):** {avg_regex_duration:.2f} seconds\n")
+            else:
+                f.write("- Average Regex Extraction Duration (per Site Processed for Regex): N/A (No sites processed for regex)\n")
+
+            # Average LLM Extraction Duration
+            total_llm_duration = tasks_data.get("llm_extraction_total_duration_seconds", 0)
+            sites_processed_for_llm = llm_stats_data.get("sites_processed_for_llm", 0)
+            if sites_processed_for_llm > 0:
+                avg_llm_duration = total_llm_duration / sites_processed_for_llm
+                f.write(f"- **Average LLM Extraction Duration (per Site Processed for LLM):** {avg_llm_duration:.2f} seconds\n")
+            else:
+                f.write("- Average LLM Extraction Duration (per Site Processed for LLM): N/A (No sites processed for LLM)\n")
+
+            # Average Pass 1 Main Loop Duration
+            total_pass1_duration = tasks_data.get("pass1_main_loop_duration_seconds", 0)
+            input_rows_count = data_proc_stats_data.get("input_rows_count", 0)
+            if input_rows_count > 0:
+                avg_pass1_duration = total_pass1_duration / input_rows_count
+                f.write(f"- **Average Pass 1 Main Loop Duration (per Input Row):** {avg_pass1_duration:.2f} seconds\n")
+            else:
+                f.write("- Average Pass 1 Main Loop Duration (per Input Row): N/A (No input rows)\n")
+            
+            f.write("\n") # Add a newline before the next section
 
             f.write("## Data Processing Statistics:\n")
             stats = metrics.get("data_processing_stats", {})

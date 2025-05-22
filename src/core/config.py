@@ -70,12 +70,15 @@ class AppConfig:
         llm_temperature (float): Temperature for LLM response generation.
         llm_max_tokens (int): Maximum tokens for LLM response.
         llm_prompt_template_path (str): Path to the LLM prompt template file.
+        llm_max_retries_on_number_mismatch (int): Max retries if LLM output number mismatches input.
         
         target_country_codes (List[str]): Target country codes for phone number parsing.
         default_region_code (Optional[str]): Default region code for phone number parsing.
         
+        default_region_code (Optional[str]): Default region code for phone number parsing.
+        url_probing_tlds (List[str]): Comma-separated list of TLDs to try appending to domain-like inputs that lack a TLD (e.g., "de,com,at,ch").
+        
         input_excel_file_path (str): Path to the input data file.
-        output_excel_file_name_template (str): Template for the output Excel file name (summary report).
         tertiary_report_file_name_template (str): Template for the new tertiary report Excel file name.
         processed_contacts_report_file_name_template (str): Template for the 'Final Processed Contacts' report Excel file name.
         skip_rows_config (Optional[int]): Number of rows to skip from the start of the input file (0-indexed).
@@ -153,11 +156,16 @@ class AppConfig:
         
         # Path to the prompt template, relative to the phone_validation_pipeline directory
         self.llm_prompt_template_path: str = os.getenv('LLM_PROMPT_TEMPLATE_PATH', 'prompts/gemini_phone_validation_v1.txt')
+        self.llm_max_retries_on_number_mismatch: int = int(os.getenv('LLM_MAX_RETRIES_ON_NUMBER_MISMATCH', '1'))
 
         # --- Phone Number Normalization Configuration ---
         target_country_codes_str: str = os.getenv('TARGET_COUNTRY_CODES', 'DE,CH,AT') # Germany, Switzerland, Austria
         self.target_country_codes: List[str] = [code.strip().upper() for code in target_country_codes_str.split(',') if code.strip()]
         self.default_region_code: Optional[str] = os.getenv('DEFAULT_REGION_CODE', 'DE') # Default region for parsing if others fail
+
+        # --- URL Probing Configuration ---
+        url_probing_tlds_str: str = os.getenv('URL_PROBING_TLDS', 'de,com,at,ch')
+        self.url_probing_tlds: List[str] = [tld.strip().lower() for tld in url_probing_tlds_str.split(',') if tld.strip()]
 
         # --- Data Handling ---
         self.input_excel_file_path: str = os.getenv('INPUT_EXCEL_FILE_PATH', 'data_to_be_inputed.xlsx') # Relative to phone_validation_pipeline

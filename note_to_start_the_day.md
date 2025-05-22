@@ -1,30 +1,64 @@
-Step one for tomorrow/today test issue 2 and merge, finish issue 3 and merge, modulize the project, continue with additional tasks. issue 4? then phase two? think about benchmarks
+Step one for tomorrow/today test issue 2 and merge, finish issue 3 and merge, modulize the project, continue with additional tasks. issue 4? then phase two? think about benchmarks //
 
-PHASE 1 --------------
+
+Also in the last run I noticed a Rows Failed During Processing (Pass 1): 1
+
+what does that mean? 
+
+also i saw Scraping Failures (Other Errors): 1
+
+
+
+and in Errors Encountered During Pipeline:
+No significant errors recorded.
+
+yet we did have errors
+
+what does LLM_Not_Run_Or_NoOutput_For_Canonical and LLM_OutputEmpty_Or_NoRelevant_For_Canonical mean 
+
+make a md file, have error metric, number of errors per type
+
+delete intermediate data folder 
+
+try .com when composing urls
+
+Did the original url amount to nothing, did the page fail, did the scraper or other part fail, what exactly happened so we can figure out if its fixable or out of our hands, We want to improve the system and know how its performing for clarity
+
+Modulize and create tests for all pieces of the project
+
+
+Make logs clearer? maybe include line or something for the errors so we can find and pinpoint them ? 
+
+ - __main__ - WARNING - Spaces found in domain part 'DATEV Anwalt' for DATEV Anwalt. Removing them. for instance doesnt need to be in the console but it could appear in the error list. 
+- main log should keep everything for debug and investigation. eroor list points us to main errors etc, console clean unless setting a log level
+
+Effort 2: Strategize Testing for LLM Retry Logic.
+
+PHASE 1 -------------- COMPLETED
 
 Enable header selection and working with the range config. // 
 
 Test 2.5 Flash - 1.5 Flash - // 1.5 flash almost identical. //
 
-Check the logs for failures and improve.
+Check the logs for failures and improve. <--------<
+
+Add a logging to see which urls failed, perhaps so we can rerun them <--------<
+
+Understand info/warning/ log levels
 
 Add a final deliverable report for kevin Company name, URL, Number, Number Type, Note/Additional-info, number-found-at, Description? //
 
-And metadata logging, Time spent, Accuracy etc - look at old system reports for ideas. 
+And metadata logging, Time spent, Accuracy etc - look at old system reports for ideas. //
 
-Add a logging to see which urls failed, perhaps so we can rerun them
+Can we get a token count. Yes //
 
-Can we get a token count. 
+check usage and see how much it costs. //
 
-Can we benchmark accuracy and compare
-
-Setup system on contabo, check usage and see how much it costs. 
-
-Add the upgrade? Big Enancement chat.  
-
-Should we increase the snippet char size? avaraging 3000 tokens per api call (costs approx. 0.0005 dollars) 10000 api calls = 5 usd
+Should we increase the snippet char size? avaraging 3000 tokens per api call (costs approx. 0.0005 dollars) 10000 api calls = 5 usd //
 
 PHASE 2 ----------------------
+
+Modulise Phone Project <---------<
 
 Set up the next project. 
 
@@ -49,3 +83,10 @@ Async:
 Scraping Calls: asyncio.run() is called inside the loop. This starts and stops an asyncio event loop for each URL. For many URLs, this is inefficient. A single event loop managing concurrent scraping tasks for multiple URLs would be better.
 
 ---> CHECK docs\pipeline_scalability_enhancement_plan_20250521_105900.md
+
+Can we benchmark accuracy and compare. Models/other <-----<
+
+Add the upgrade? Big Enancement chat. Issue 3 Profile with webpage summerisation <------<
+
+
+Setup system on contabo, <--------<

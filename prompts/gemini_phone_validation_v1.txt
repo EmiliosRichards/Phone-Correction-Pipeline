@@ -21,7 +21,7 @@ Input will be a list of items, each formatted as:
 
 Please provide your output as a single JSON object. This object MUST contain a key named "extracted_numbers", which is a list.
 EVERY item in the "extracted_numbers" list MUST be an object containing exactly three fields:
-1. "number": The original E.164 formatted candidate_number.
+1. "number": This MUST be the exact, unmodified 'number' string that was provided to you in the corresponding input candidate object. Do not alter it in any way.
 2. "type": Your determined type for the number (e.g., 'Main Line', 'Sales', 'Support', 'Fax', 'Mobile', 'Headquarters', 'Direct Dial', 'Customer Service', 'Non-Priority-Country Contact', 'Date', 'ID', 'Unknown').
 3. "classification": Your assigned classification ('Primary', 'Secondary', 'Support', 'Low Relevance', 'Non-Business'). If unsure, default to 'Non-Business' for classification but always include the field.
 
@@ -68,7 +68,7 @@ Example of the expected output format:
 }
 ```
 
-For EVERY candidate number provided in the input list, you MUST include a corresponding entry in the 'extracted_numbers' list. Assign a 'type' and 'classification' to each.
+For EVERY candidate number provided in the input list, you MUST include a corresponding entry in the 'extracted_numbers' list, **in the SAME order as the input**. The 'number' field in your output for each item MUST be identical to the 'number' field from the corresponding input candidate. Assign a 'type' and 'classification' to each.
 
 Candidate List:
 [Insert JSON list of (candidate_number, source_url, snippet) objects here]

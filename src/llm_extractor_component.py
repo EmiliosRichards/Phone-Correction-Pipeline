@@ -196,6 +196,41 @@ class GeminiLLMExtractor:
         logger.info("Successfully generated content from Gemini API attempt.")
         return response
 
+    def _process_successful_llm_item(
+        self,
+        llm_output: PhoneNumberLLMOutput,
+        input_item_details: Dict[str, Any]
+    ) -> PhoneNumberLLMOutput:
+        """Enriches and normalizes a successfully matched LLM output item."""
+        llm_output.source_url = input_item_details.get('source_url')
+        llm_output.original_input_company_name = input_item_details.get('original_input_company_name')
+
+        if llm_output.number:
+            normalized_num = self._normalize_phone_number(llm_output.number, self.config.target_country_codes)
+            if normalized_num:
+                llm_output.number = normalized_num
+            else:
+                logger.warning(f"LLM output number '{llm_output.number}' (from input '{input_item_details.get('number')}') could not be normalized. Keeping as is.")
+        return llm_output
+
+    def _create_error_llm_item(
+        self,
+        input_item_details: Dict[str, Any],
+        error_type_str: str = "Error_ProcessingFailed",
+        classification_str: str = "Non-Business"
+    ) -> PhoneNumberLLMOutput:
+        """Creates a PhoneNumberLLMOutput for an item that failed processing."""
+        logger.warning(f"Creating error item for input number '{input_item_details.get('number')}' due to: {error_type_str}")
+        return PhoneNumberLLMOutput(
+            number=str(input_item_details.get('number')), # Use the original input number
+            type=error_type_str,
+            classification=classification_str,
+            source_url=input_item_details.get('source_url'),
+            original_input_company_name=input_item_details.get('original_input_company_name')
+            # snippet is not part of PhoneNumberLLMOutput, it's input context
+            # confidence and other fields will use Pydantic defaults (e.g., None)
+        )
+
     def extract_phone_numbers(
         self,
         candidate_items: List[Dict[str, str]], # Changed input
@@ -235,8 +270,13 @@ class GeminiLLMExtractor:
             `json.JSONDecodeError`, and `PydanticValidationError`.
         """
         raw_llm_response_str: Optional[str] = None
-        extracted_numbers: List[PhoneNumberLLMOutput] = []
-        token_usage_stats: Optional[Dict[str, int]] = None
+        final_processed_outputs: List[Optional[PhoneNumberLLMOutput]] = [None] * len(candidate_items)
+        items_needing_retry: List[Tuple[int, Dict[str, Any]]] = [] # Stores (original_index, input_item_dict)
+        raw_llm_response_str_initial: Optional[str] = None
+        token_usage_stats_initial: Optional[Dict[str, int]] = None
+        # To accumulate token stats from multiple calls
+        accumulated_token_stats: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
 
         # --- BEGIN NEW LOGIC FOR SAVING TEMPLATE ONCE ---
         try:
@@ -271,178 +311,221 @@ class GeminiLLMExtractor:
             logger.error(f"Error in pre-processing for saving prompt template (e.g., path manipulation for '{llm_context_dir}'): {e_path_setup}")
         # --- END NEW LOGIC FOR SAVING TEMPLATE ONCE ---
 
+        # --- Initial LLM Call ---
+        current_items_for_llm_call = list(candidate_items) # Make a mutable copy
+        
         try:
-            prompt_template = self._load_prompt_template(prompt_template_path)
-            # Serialize candidate_items to a JSON string
-            candidate_items_json_str = json.dumps(candidate_items, indent=2)
-            # The new prompt template expects "[Insert JSON list of (candidate_number, source_url, snippet) objects here]"
-            formatted_prompt = prompt_template.replace(
+            prompt_template_pass1 = self._load_prompt_template(prompt_template_path)
+            candidate_items_json_str_pass1 = json.dumps(current_items_for_llm_call, indent=2)
+            formatted_prompt_pass1 = prompt_template_pass1.replace(
                 "[Insert JSON list of (candidate_number, source_url, snippet) objects here]",
-                candidate_items_json_str
+                candidate_items_json_str_pass1
             )
-
-
         except Exception as e:
-            logger.error(f"Failed to load or format prompt: {e}")
-            return [], f"Error loading prompt: {str(e)}", token_usage_stats
+            logger.error(f"Failed to load or format prompt for initial call: {e}")
+            # Populate all with error items
+            for i, item_detail in enumerate(candidate_items):
+                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_PromptLoading")
+            return [item for item in final_processed_outputs if item is not None], f"Error loading prompt: {str(e)}", accumulated_token_stats
 
-        generation_config = GenerationConfig(
+        generation_config_pass1 = GenerationConfig(
             candidate_count=1,
             max_output_tokens=self.config.llm_max_tokens,
             temperature=self.config.llm_temperature
         )
 
         try:
-            logger.debug(f"Sending request to Gemini. Prompt starts with: {formatted_prompt[:200]}...")
-            response = self._generate_content_with_retry(
-                formatted_prompt,
-                generation_config=generation_config
-            )
+            logger.debug(f"Sending initial request to Gemini for {len(current_items_for_llm_call)} items. Prompt starts with: {formatted_prompt_pass1[:200]}...")
+            response_pass1 = self._generate_content_with_retry(formatted_prompt_pass1, generation_config_pass1)
+            raw_llm_response_str_initial = response_pass1.text
 
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                logger.info(
-                    f"Gemini API usage metadata: "
-                    f"Prompt Tokens: {response.usage_metadata.prompt_token_count}, "
-                    f"Candidates Tokens: {response.usage_metadata.candidates_token_count}, "
-                    f"Total Tokens: {response.usage_metadata.total_token_count}"
-                )
-                token_usage_stats = {
-                    "prompt_tokens": response.usage_metadata.prompt_token_count,
-                    "completion_tokens": response.usage_metadata.candidates_token_count,
-                    "total_tokens": response.usage_metadata.total_token_count
+            if hasattr(response_pass1, 'usage_metadata') and response_pass1.usage_metadata:
+                token_usage_stats_initial = {
+                    "prompt_tokens": response_pass1.usage_metadata.prompt_token_count,
+                    "completion_tokens": response_pass1.usage_metadata.candidates_token_count,
+                    "total_tokens": response_pass1.usage_metadata.total_token_count
                 }
+                for key in accumulated_token_stats: accumulated_token_stats[key] += token_usage_stats_initial.get(key, 0)
+                logger.info(f"Initial LLM call usage: {token_usage_stats_initial}")
             else:
-                logger.warning("Gemini API usage metadata not found in response object or response.usage_metadata is None/empty.")
-            
-            # Gemini SDK should parse into List[PhoneNumberLLMOutput] if response_schema is List[PydanticModel]
-            # and response_mime_type is "application/json".
-            # The raw text is in response.text if needed for saving.
-            
-            raw_llm_response_str = response.text # Save the raw text response
-            
-            if not response.candidates:
-                logger.error("No candidates found in Gemini response.")
-                return [], json.dumps({"error": "No candidates in response", "raw_response_text": raw_llm_response_str}), token_usage_stats
+                logger.warning("Initial LLM call: Gemini API usage metadata not found.")
 
-            # Accessing parsed Pydantic objects:
-            # If response_schema=List[PhoneNumberLLMOutput] was successful,
-            # response.candidates[0].content.parts[0].function_call.args might contain the data
-            # or more directly, if the SDK handles it well, response.parsed might exist.
-            # Let's check response.text first for the raw string, then try to parse it if response.parsed isn't directly usable.
+            if not response_pass1.candidates:
+                logger.error("No candidates found in initial Gemini response.")
+                for i, item_detail in enumerate(candidate_items):
+                    final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_NoLLMCandidates")
+                return [item for item in final_processed_outputs if item is not None], json.dumps({"error": "No candidates in initial response", "raw_response_text": raw_llm_response_str_initial}), accumulated_token_stats
 
-            parsed_objects: Optional[List[PhoneNumberLLMOutput]] = None
-            
-            # The Gemini SDK documentation suggests that if `response_schema` is provided,
-            # the `response.text` will be the JSON string, and `response.candidates[0].content.parts[0]`
-            # might not be a function call but directly the structured content.
-            # The `response.parsed` attribute is the most direct way if the SDK version supports it well.
-
-            # For now, let's assume response.text contains the JSON list as per Gemini's capability
-            # and we parse it with Pydantic. If Gemini directly populates response.parsed with List[PhoneNumberLLMOutput],
-            # that would be even better.
-            # The `google-generativeai` library for Gemini, when `response_schema` is used,
-            # should ideally make the parsed objects available directly.
-            # If `response.text` is a JSON string representing a list of `PhoneNumberLLMOutput` objects:
-            
-            if raw_llm_response_str:
-                json_candidate_str = self._extract_json_from_text(raw_llm_response_str)
-                if json_candidate_str:
-                    logger.debug(f"Attempting to parse extracted JSON candidate: {json_candidate_str[:200]}...")
+            if raw_llm_response_str_initial:
+                json_candidate_str_pass1 = self._extract_json_from_text(raw_llm_response_str_initial)
+                if json_candidate_str_pass1:
                     try:
-                        parsed_json_object = json.loads(json_candidate_str)
-                        # Validate the entire object against LLMExtractionResult
-                        llm_result = MinimalExtractionOutput(**parsed_json_object) # Pydantic validation here
+                        parsed_json_object_pass1 = json.loads(json_candidate_str_pass1)
+                        llm_result_pass1 = MinimalExtractionOutput(**parsed_json_object_pass1)
+                        validated_numbers_pass1 = llm_result_pass1.extracted_numbers
+
+                        if len(validated_numbers_pass1) != len(current_items_for_llm_call):
+                            logger.error(f"Initial LLM call: Mismatch in item count. Input: {len(current_items_for_llm_call)}, Output: {len(validated_numbers_pass1)}. Cannot reliably map. Marking all as error.")
+                            for i, item_detail in enumerate(candidate_items):
+                                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_LLMItemCountMismatch")
+                            return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
                         
-                        validated_numbers = llm_result.extracted_numbers
-
-                        # Create a mapping from input candidate_number to its source_url
-                        # The candidate_items are available in the outer scope of this method.
-                        # Each dict in candidate_items now also has "original_input_company_name".
-                        candidate_details_map = {
-                            item['number']: {
-                                'source_url': item['source_url'],
-                                'original_input_company_name': item.get('original_input_company_name') # Use .get for safety
-                            }
-                            for item in candidate_items
-                        }
-
-                        # Populate source_url, original_input_company_name and re-normalize phone numbers
-                        for llm_output in validated_numbers:
-                            original_candidate_number = llm_output.number # This is the number LLM returned
-                            
-                            candidate_details = candidate_details_map.get(original_candidate_number)
-                            if candidate_details:
-                                llm_output.source_url = candidate_details.get('source_url')
-                                llm_output.original_input_company_name = candidate_details.get('original_input_company_name')
+                        for i, input_item_detail in enumerate(current_items_for_llm_call):
+                            llm_output_item = validated_numbers_pass1[i]
+                            if llm_output_item.number == input_item_detail['number']:
+                                final_processed_outputs[i] = self._process_successful_llm_item(llm_output_item, input_item_detail)
                             else:
-                                logger.warning(f"Could not find details (source_url, original_input_company_name) for LLM output number: {original_candidate_number}. Map keys: {list(candidate_details_map.keys())[:5]}")
-
-                            
-                            # Re-normalize phone numbers (existing logic)
-                            if llm_output.number: # Number might be None if LLM fails for an entry
-                                normalized_num = self._normalize_phone_number(llm_output.number, self.config.target_country_codes)
-                                if normalized_num:
-                                    llm_output.number = normalized_num
-                                else:
-                                    logger.warning(f"LLM extracted number '{llm_output.number}' could not be normalized to E.164. Keeping as is or consider filtering.")
-                                    # Decide if unnormalizable numbers should be kept or discarded. For now, keeping.
-                        extracted_numbers = validated_numbers
-                        logger.info(f"Successfully extracted and validated {len(extracted_numbers)} phone numbers from LLM.")
-
+                                logger.warning(f"Initial mismatch for input '{input_item_detail['number']}', LLM returned '{llm_output_item.number}'. Queueing for retry.")
+                                items_needing_retry.append((i, input_item_detail))
+                    
                     except json.JSONDecodeError as e:
-                        logger.error(f"Failed to parse JSON from extracted candidate: {e}. Candidate: '{json_candidate_str}'. Raw LLM: '{raw_llm_response_str[:500]}...'")
-                        return [], json.dumps({
-                            "error": "Failed to parse LLM JSON response from extracted candidate",
-                            "extracted_candidate": json_candidate_str,
-                            "raw_response_text": raw_llm_response_str,
-                            "details": str(e)
-                        }), token_usage_stats
+                        logger.error(f"Initial LLM call: Failed to parse JSON: {e}. Raw: '{raw_llm_response_str_initial[:500]}...'")
+                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialJsonParse")
+                        return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
                     except PydanticValidationError as ve:
-                        logger.error(f"Pydantic validation failed for parsed JSON: {ve}. Parsed JSON: '{json_candidate_str}'. Raw LLM: '{raw_llm_response_str[:500]}...'")
-                        return [], json.dumps({
-                            "error": "Pydantic validation failed for parsed LLM response",
-                            "parsed_json": json_candidate_str,
-                            "raw_response_text": raw_llm_response_str,
-                            "details": ve.errors()
-                        }), token_usage_stats
-                else: # if not json_candidate_str
-                    logger.warning(f"Could not extract a JSON block from LLM response. Raw response: {raw_llm_response_str[:500]}...")
-                    return [], json.dumps({
-                        "error": "Could not extract JSON block from LLM response",
-                        "raw_response_text": raw_llm_response_str
-                    }), token_usage_stats
-            else: # if not raw_llm_response_str (empty response from LLM)
-                logger.warning("Gemini response text is empty.")
-                finish_reason = "Unknown"
-                if response and response.candidates and response.candidates[0].finish_reason: # Check response obj
-                    finish_reason = response.candidates[0].finish_reason.name
-                logger.warning(f"Gemini finish reason: {finish_reason}")
-                if finish_reason != "STOP":
-                    return [], json.dumps({
-                        "error": f"Gemini generation stopped due to: {finish_reason}",
-                        "raw_response_text": raw_llm_response_str
-                    }), token_usage_stats
-                return [], json.dumps({
-                    "error": "Empty text from LLM response",
-                    "raw_response_text": raw_llm_response_str
-                }), token_usage_stats
-
+                        logger.error(f"Initial LLM call: Pydantic validation failed: {ve}. Raw: '{raw_llm_response_str_initial[:500]}...'")
+                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialPydanticValidation")
+                        return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
+                else: # No JSON block
+                    logger.warning(f"Initial LLM call: Could not extract JSON block. Raw: {raw_llm_response_str_initial[:500]}...")
+                    for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialNoJsonBlock")
+                    return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
+            else: # Empty response
+                logger.warning("Initial LLM call: Response text is empty.")
+                for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialEmptyResponse")
+                return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
 
         except google_exceptions.GoogleAPIError as e:
-            logger.error(f"Gemini API error: {e}")
-            # Consider specific error types for retry if LLMBaseClient's logic isn't used.
-            # For now, just return the error.
-            raw_llm_response_str = json.dumps({"error": f"Gemini API error: {str(e)}", "type": type(e).__name__})
-            # token_usage_stats would be None here as the API call itself failed or didn't complete to the point of having usage_metadata
-            return [], raw_llm_response_str, token_usage_stats
+            logger.error(f"Initial LLM call: Gemini API error: {e}")
+            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialApiError_{type(e).__name__}")
+            return [item for item in final_processed_outputs if item is not None], json.dumps({"error": f"Initial Gemini API error: {str(e)}", "type": type(e).__name__}), accumulated_token_stats
         except Exception as e:
-            logger.error(f"Unexpected error during LLM extraction: {e}", exc_info=True)
-            raw_llm_response_str = json.dumps({"error": f"Unexpected error: {str(e)}", "type": type(e).__name__})
-            # token_usage_stats might be None or populated if error occurred after API call
-            return [], raw_llm_response_str, token_usage_stats
-        
-        # Ensure raw_llm_response_str is a string for the second part of the tuple
-        if raw_llm_response_str is None:
-            raw_llm_response_str = json.dumps({"error": "LLM response was not captured."})
+            logger.error(f"Initial LLM call: Unexpected error: {e}", exc_info=True)
+            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialUnexpected_{type(e).__name__}")
+            return [item for item in final_processed_outputs if item is not None], json.dumps({"error": f"Initial unexpected error: {str(e)}", "type": type(e).__name__}), accumulated_token_stats
+
+        # --- Iterative Retry Loop for Mismatched Items ---
+        current_retry_attempt = 0
+        raw_llm_response_str_retry: Optional[str] = None # To store the last retry response
+
+        while items_needing_retry and current_retry_attempt < self.config.llm_max_retries_on_number_mismatch:
+            current_retry_attempt += 1
+            logger.info(f"Attempting LLM retry pass #{current_retry_attempt} for {len(items_needing_retry)} mismatched items.")
             
-        return extracted_numbers, raw_llm_response_str, token_usage_stats
+            inputs_for_this_retry_pass = [item_tuple[1] for item_tuple in items_needing_retry]
+            original_indices_for_this_pass = [item_tuple[0] for item_tuple in items_needing_retry]
+            
+            try:
+                prompt_template_retry = self._load_prompt_template(prompt_template_path) # Reload, though it's same
+                candidate_items_json_str_retry = json.dumps(inputs_for_this_retry_pass, indent=2)
+                formatted_prompt_retry = prompt_template_retry.replace(
+                    "[Insert JSON list of (candidate_number, source_url, snippet) objects here]",
+                    candidate_items_json_str_retry
+                )
+            except Exception as e:
+                logger.error(f"Failed to load or format prompt for retry pass #{current_retry_attempt}: {e}")
+                # Mark remaining items_needing_retry as error and break loop
+                for original_idx, item_detail_retry in items_needing_retry:
+                    if final_processed_outputs[original_idx] is None: # Only if not already processed
+                         final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_retry, f"Error_RetryPromptLoading_Pass{current_retry_attempt}")
+                items_needing_retry.clear() # Stop further retries
+                break
+
+            generation_config_retry = GenerationConfig( # Same config as initial
+                candidate_count=1, max_output_tokens=self.config.llm_max_tokens, temperature=self.config.llm_temperature
+            )
+
+            try:
+                logger.debug(f"Sending retry #{current_retry_attempt} request to Gemini for {len(inputs_for_this_retry_pass)} items.")
+                response_retry = self._generate_content_with_retry(formatted_prompt_retry, generation_config_retry)
+                raw_llm_response_str_retry = response_retry.text # Store this retry's raw response
+
+                if hasattr(response_retry, 'usage_metadata') and response_retry.usage_metadata:
+                    token_stats_retry = {
+                        "prompt_tokens": response_retry.usage_metadata.prompt_token_count,
+                        "completion_tokens": response_retry.usage_metadata.candidates_token_count,
+                        "total_tokens": response_retry.usage_metadata.total_token_count
+                    }
+                    for key in accumulated_token_stats: accumulated_token_stats[key] += token_stats_retry.get(key, 0)
+                    logger.info(f"LLM retry #{current_retry_attempt} usage: {token_stats_retry}")
+                else:
+                    logger.warning(f"LLM retry #{current_retry_attempt}: Gemini API usage metadata not found.")
+
+                still_mismatched_after_this_retry: List[Tuple[int, Dict[str, Any]]] = []
+                if not response_retry.candidates:
+                    logger.error(f"Retry #{current_retry_attempt}: No candidates in Gemini response. All items in this batch remain mismatched.")
+                    still_mismatched_after_this_retry.extend(items_needing_retry) # All failed this retry
+                elif raw_llm_response_str_retry:
+                    json_candidate_str_retry = self._extract_json_from_text(raw_llm_response_str_retry)
+                    if json_candidate_str_retry:
+                        try:
+                            parsed_json_object_retry = json.loads(json_candidate_str_retry)
+                            llm_result_retry = MinimalExtractionOutput(**parsed_json_object_retry)
+                            validated_numbers_retry = llm_result_retry.extracted_numbers
+
+                            if len(validated_numbers_retry) != len(inputs_for_this_retry_pass):
+                                logger.error(f"Retry #{current_retry_attempt}: Mismatch in item count. Input: {len(inputs_for_this_retry_pass)}, Output: {len(validated_numbers_retry)}. All items in this batch remain mismatched.")
+                                still_mismatched_after_this_retry.extend(items_needing_retry)
+                            else:
+                                for j, retried_input_item_detail in enumerate(inputs_for_this_retry_pass):
+                                    original_input_idx = original_indices_for_this_pass[j]
+                                    retried_llm_output_item = validated_numbers_retry[j]
+
+                                    if retried_llm_output_item.number == retried_input_item_detail['number']:
+                                        logger.info(f"Retry pass #{current_retry_attempt} successful for input '{retried_input_item_detail['number']}'.")
+                                        final_processed_outputs[original_input_idx] = self._process_successful_llm_item(retried_llm_output_item, retried_input_item_detail)
+                                    else:
+                                        logger.warning(f"Mismatch persists after retry pass #{current_retry_attempt} for input '{retried_input_item_detail['number']}', LLM returned '{retried_llm_output_item.number}'.")
+                                        still_mismatched_after_this_retry.append((original_input_idx, retried_input_item_detail))
+                        
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Retry #{current_retry_attempt}: Failed to parse JSON: {e}. All items in this batch remain mismatched.")
+                            still_mismatched_after_this_retry.extend(items_needing_retry)
+                        except PydanticValidationError as ve:
+                            logger.error(f"Retry #{current_retry_attempt}: Pydantic validation failed: {ve}. All items in this batch remain mismatched.")
+                            still_mismatched_after_this_retry.extend(items_needing_retry)
+                    else: # No JSON block in retry
+                        logger.warning(f"Retry #{current_retry_attempt}: Could not extract JSON block. All items in this batch remain mismatched.")
+                        still_mismatched_after_this_retry.extend(items_needing_retry)
+                else: # Empty response in retry
+                    logger.warning(f"Retry #{current_retry_attempt}: Response text is empty. All items in this batch remain mismatched.")
+                    still_mismatched_after_this_retry.extend(items_needing_retry)
+                
+                items_needing_retry = still_mismatched_after_this_retry
+
+            except google_exceptions.GoogleAPIError as e:
+                logger.error(f"Retry #{current_retry_attempt}: Gemini API error: {e}. All items in this batch remain mismatched for this attempt.")
+                # No change to items_needing_retry, they will be processed in next attempt or final error handling
+                # We don't clear items_needing_retry here, to allow further retries if configured.
+            except Exception as e:
+                logger.error(f"Retry #{current_retry_attempt}: Unexpected error: {e}", exc_info=True)
+                # As above, items remain for next attempt or final error handling.
+
+        # --- Handle Persistently Mismatched Items (after all retries) ---
+        if items_needing_retry:
+            logger.warning(f"{len(items_needing_retry)} items still mismatched after all {self.config.llm_max_retries_on_number_mismatch} retries.")
+            for original_idx, item_detail_persist_error in items_needing_retry:
+                if final_processed_outputs[original_idx] is None: # Only if not somehow processed
+                    final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_persist_error, "Error_PersistentMismatchAfterRetries")
+        
+        # --- Handle Initial Mismatches if Retries were Disabled (max_retries = 0) ---
+        # This case is covered if items_needing_retry was populated and loop didn't run.
+        # The previous block "Handle Persistently Mismatched Items" will catch them if max_retries was 0.
+
+        # --- Final check for any None slots (e.g. if an error occurred before first pass processing for an item) ---
+        for i, output_item in enumerate(final_processed_outputs):
+            if output_item is None:
+                logger.error(f"Item at original index {i} (input: {candidate_items[i].get('number')}) was not processed. Creating error item.")
+                final_processed_outputs[i] = self._create_error_llm_item(candidate_items[i], "Error_NotProcessed")
+        
+        # The primary raw response to return is from the initial call, or the last retry if that's more relevant.
+        # For simplicity, returning the initial raw response. If retries happened, their raw responses are logged.
+        final_raw_llm_response_str = raw_llm_response_str_initial if raw_llm_response_str_initial is not None else \
+                                   (raw_llm_response_str_retry if raw_llm_response_str_retry is not None else \
+                                    json.dumps({"error": "LLM response was not captured."}))
+
+        # Cast List[Optional[PhoneNumberLLMOutput]] to List[PhoneNumberLLMOutput]
+        # All None should have been filled by error items.
+        processed_results: List[PhoneNumberLLMOutput] = [item for item in final_processed_outputs if item is not None]
+
+        return processed_results, final_raw_llm_response_str, accumulated_token_stats
