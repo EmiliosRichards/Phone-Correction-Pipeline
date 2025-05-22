@@ -854,7 +854,7 @@ def main() -> None:
         original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
         true_base_domain_from_map = input_to_canonical_map.get(original_input_url_for_map) 
 
-        normalized_original_input_base = get_canonical_base_url(original_input_url_for_map) if original_input_url_for_map != "None_GivenURL_Input" else None
+        normalized_original_input_base = get_canonical_base_url(original_input_url_for_map, log_level_for_non_domain_input=logging.INFO) if original_input_url_for_map != "None_GivenURL_Input" else None
         
         if canonical_url_summary and normalized_original_input_base and normalized_original_input_base != canonical_url_summary:
             overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
