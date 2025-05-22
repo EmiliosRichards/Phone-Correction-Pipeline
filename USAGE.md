@@ -29,6 +29,7 @@ This document provides detailed instructions for setting up, configuring, and ru
       - [LLM (Gemini) Settings](#llm-gemini-settings)
       - [Phone Number Normalization](#phone-number-normalization)
       - [Logging Settings](#logging-settings)
+      - [Developer Logging Guidelines](#developer-logging-guidelines)
   - [6. Troubleshooting](#6-troubleshooting)
 
 ## 1. Prerequisites
@@ -159,9 +160,19 @@ The main pipeline generates several outputs, organized within a run-specific dir
 *   **Final Processed Contacts Report**: An Excel file (e.g., `output_data/[RunID]/Final_Processed_Contacts.xlsx`). Filename configured by `PROCESSED_CONTACTS_REPORT_FILE_NAME_TEMPLATE`.
 *   **Summary Report**: An Excel file (e.g., `output_data/[RunID]/Pipeline_Summary_Report_[RunID].xlsx`). Filename configured by `OUTPUT_EXCEL_FILE_NAME_TEMPLATE`.
 *   **Detailed LLM Extractions Report**: An Excel file (e.g., `output_data/[RunID]/All_LLM_Extractions_Report_[RunID].xlsx`).
-*   **Run Log File**: A comprehensive log of the pipeline's execution (e.g., `output_data/[RunID]/pipeline_run_[RunID].log`).
+*   **Run Metrics Report** (`run_metrics.md`): A Markdown file providing a summary of the pipeline run. It includes:
+    *   Overall processing statistics (e.g., total rows, rows processed, rows successfully completed).
+    *   A "Global Pipeline Errors" section detailing any errors that affected the entire pipeline's execution.
+    *   A "Summary of Row-Level Failures" section, hierarchically organized by `stage_of_failure`, showing counts of failures at each stage.
+    *   *Note:* This report might not be generated if the pipeline encounters a critical failure very early during its initialization phase. In such cases, the main `.log` file and console output are the primary sources for diagnosing these initial failures.
+*   **Failed Rows Report** (`failed_rows_{run_id}.csv`): A CSV file that lists each input row that failed during processing. Key columns include:
+    *   `CompanyName`: The name of the company.
+    *   `GivenURL`: The URL provided for the company.
+    *   `stage_of_failure`: The specific pipeline stage where the error occurred (e.g., "Scraping", "LLM Extraction", "Data Consolidation").
+    *   `error_details`: A JSON string containing detailed information about the error.
+    *   `log_timestamp`: The timestamp of when the error was logged.
+*   **Run Log File**: A comprehensive, rotating log of the pipeline's execution (e.g., `output_data/[RunID]/pipeline_run_[RunID].log`). This file contains detailed operational messages, warnings, and errors, including contextual identifiers like `InputRowID`, `CompanyName`, and `file_identifier_prefix` (e.g., `CANONICAL_...` for LLM logs) to aid in debugging and tracing data flow.
 *   **Scraped Content Files**: Cleaned text content from each successfully scraped webpage, stored in `output_data/[RunID]/scraped_content/cleaned_pages_text/`.
-*   **Regex Snippets File**: JSON file containing aggregated regex-extracted snippets for each company, in `output_data/[RunID]/intermediate_data/`.
 *   **LLM Prompt Input File**: The full prompt sent to the LLM for each company, in `output_data/[RunID]/llm_context/`.
 *   **LLM Raw Output File**: The raw response received from the LLM, in `output_data/[RunID]/llm_context/`.
 
@@ -170,14 +181,13 @@ The default output directory structure looks like this:
 ```
 output_data/
 └── [RunID]/  (e.g., 20240520_113000)
-    ├── pipeline_run_20240520_113000.log
+    ├── pipeline_run_20240520_113000.log                 # Main run log file (rotating)
+    ├── run_metrics.md                                   # Run metrics and failure summary
+    ├── failed_rows_20240520_113000.csv                  # Report of failed rows
     ├── scraped_content/
     │   └── cleaned_pages_text/
     │       └── CompanyName__domain_hash_cleaned.txt
     │       └── ... (other cleaned text files)
-    ├── intermediate_data/
-    │   └── CompanyName_RowX_regex_snippets.json
-    │   └── ...
     ├── llm_context/
     │   ├── CANONICAL_example_com_llm_full_prompt.txt
     │   ├── CANONICAL_example_com_llm_input_data.json
@@ -298,11 +308,31 @@ These settings fine-tune how the scraper discovers and prioritizes links:
     *   Default: `DE`
 
 #### Logging Settings
-*   **`LOG_LEVEL`**: Log level for the main run log file (DEBUG, INFO, WARNING, ERROR).
+*   **`LOG_LEVEL`**: Log level for the main run log file (e.g., `pipeline_run_{RunID}.log`). Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
     *   Default: `INFO`
-*   **`CONSOLE_LOG_LEVEL`**: Log level for console output.
-    *   Default: `WARNING` (to keep console less verbose)
-    *   Note: Log files now use rotation (10MB chunks, 5 backups) to manage size during long runs.
+    *   The main log file uses rotation (10MB chunks, 5 backups) to manage size.
+    *   Log messages in this file are enhanced with contextual identifiers:
+        *   `InputRowID`: The index of the input row being processed.
+        *   `CompanyName`: The name of the company associated with the log entry.
+        *   `file_identifier_prefix`: A prefix (e.g., `CANONICAL_`, `REGEX_`) used in LLM-related log messages to distinguish their origin or context.
+*   **`CONSOLE_LOG_LEVEL`**: Log level for console output. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
+    *   Default: `WARNING` (to keep console less verbose during normal operation).
+    *   This can be set via the `CONSOLE_LOG_LEVEL` environment variable in your `.env` file. For example, set to `DEBUG` for more detailed console output during development or troubleshooting.
+
+#### Developer Logging Guidelines
+When contributing to the pipeline, adhere to the following logging best practices:
+*   **Use Standard Logging Levels**:
+    *   `DEBUG`: Detailed information, typically of interest only when diagnosing problems.
+    *   `INFO`: Confirmation that things are working as expected.
+    *   `WARNING`: An indication that something unexpected happened, or indicative of some problem in the near future (e.g., ‘disk space low’). The software is still working as expected.
+    *   `ERROR`: Due to a more serious problem, the software has not been able to perform some function.
+    *   `CRITICAL`: A serious error, indicating that the program itself may be unable to continue running.
+*   **Include Contextual Identifiers**: When logging messages related to specific data processing, especially within loops or component-specific logic, include relevant identifiers:
+    *   For row-specific processing: `logger.info(f"Processing {company_name} (Row ID: {input_row_id}): Starting scrape.")`
+    *   For LLM-related activities: `logger.debug(f"{file_identifier_prefix}LLM prompt generated for {company_name}.")`
+    *   This helps in tracing the lifecycle of data through the pipeline and pinpointing issues related to specific inputs or components.
+*   **Be Clear and Concise**: Log messages should be understandable and provide enough information to diagnose issues without being excessively verbose at standard levels (INFO, WARNING).
+*   **Consult the Main Log**: The `pipeline_run_{RunID}.log` is the primary source for detailed debugging. The new contextual identifiers are crucial for filtering and understanding the flow of operations within this log.
 
 ## 6. Troubleshooting
 

@@ -280,10 +280,10 @@ def normalize_phone_number(phone_number_str: str, region: str | None = None) -> 
         if phonenumbers.is_valid_number(parsed_number):
             return phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.E164)
         else:
-            logger.warning(f"Phone number '{phone_number_str}' (region: {region}) is not valid.")
+            logger.info(f"Phone number '{phone_number_str}' (region: {region}) is not valid.")
             return "InvalidFormat"
     except phonenumbers.phonenumberutil.NumberParseException as e:
-        logger.warning(f"Could not parse phone number '{phone_number_str}' (region: {region}): {e}")
+        logger.info(f"Could not parse phone number '{phone_number_str}' (region: {region}): {e}")
         return "InvalidFormat"
     except Exception as e:
         logger.error(f"Unexpected error normalizing phone number '{phone_number_str}': {e}")
@@ -413,34 +413,32 @@ def process_and_consolidate_contact_data(
         Returns None if the initial_given_url cannot be processed into a base URL
         or if there are no LLM results to process.
     """
+    canonical_base = get_canonical_base_url(initial_given_url)
+    if not canonical_base: # This check is crucial. If no base_url, we can't proceed.
+        logger.error(f"Could not determine canonical base URL for '{initial_given_url}' (Company: {company_name_from_input}). Cannot consolidate contacts.")
+        return None
+
+    logger.info(f"Processing {len(llm_results)} LLM result items for {company_name_from_input or initial_given_url} (Canonical: {canonical_base})")
+
     if not llm_results:
-        logger.info(f"No LLM results provided for {company_name_from_input or initial_given_url}, skipping consolidation.")
-        # Still return a structure indicating no contacts found for this base URL
-        base_url_for_empty = get_canonical_base_url(initial_given_url)
-        if not base_url_for_empty:
-            logger.warning(f"Could not determine canonical base URL for {initial_given_url} even for empty results.")
-            return None
+        logger.info(f"No LLM results provided for {company_name_from_input or initial_given_url} (Canonical: {canonical_base}), returning empty contact details.")
         return CompanyContactDetails(
             company_name=company_name_from_input,
-            canonical_base_url=base_url_for_empty,
+            canonical_base_url=canonical_base, # Use the derived canonical_base
             consolidated_numbers=[],
             original_input_urls=[initial_given_url] if initial_given_url else []
         )
-
-    canonical_base = get_canonical_base_url(initial_given_url)
-    if not canonical_base:
-        logger.error(f"Could not determine canonical base URL for '{initial_given_url}'. Cannot consolidate contacts.")
-        return None
 
     consolidated_numbers_map: Dict[str, ConsolidatedPhoneNumber] = {}
     all_original_source_urls_for_this_company: set[str] = set()
     if initial_given_url: # Add the initial URL itself
         all_original_source_urls_for_this_company.add(initial_given_url)
 
-
+    skipped_malformed_count = 0
     for llm_item in llm_results:
         if not llm_item.number or not llm_item.source_url: # Basic check
-            logger.warning(f"Skipping LLM item due to missing number or source_url: {llm_item}")
+            logger.warning(f"Skipping LLM item for {company_name_from_input or initial_given_url} (Canonical: {canonical_base}) due to missing number or source_url: {llm_item}")
+            skipped_malformed_count += 1
             continue
         
         all_original_source_urls_for_this_company.add(llm_item.source_url)
@@ -497,6 +495,11 @@ def process_and_consolidate_contact_data(
         # The classification itself is already the "best" one found.
         key=lambda cons_phone: get_classification_priority(cons_phone.classification, cons_phone.sources[0].type if cons_phone.sources else "Unknown")
     )
+
+    if skipped_malformed_count > 0:
+        logger.warning(f"{skipped_malformed_count} LLM items were skipped due to being malformed for {company_name_from_input or initial_given_url} (Canonical: {canonical_base}).")
+
+    logger.info(f"Consolidated to {len(final_consolidated_list)} unique phone numbers for {company_name_from_input or initial_given_url} (Canonical: {canonical_base})")
 
     return CompanyContactDetails(
         company_name=company_name_from_input,

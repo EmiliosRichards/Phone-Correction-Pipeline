@@ -131,9 +131,9 @@ class GeminiLLMExtractor:
                     logger.debug(f"Normalized '{number_str}' to E.164 using default region '{self.config.default_region_code}'.")
                     return phonenumbers.format_number(parsed_num, PhoneNumberFormat.E164)
             except phonenumbers.NumberParseException:
-                logger.warning(f"Could not parse phone number '{number_str}' even with default region '{self.config.default_region_code}'.")
+                logger.info(f"Could not parse phone number '{number_str}' even with default region '{self.config.default_region_code}'.")
         
-        logger.warning(f"Could not normalize phone number '{number_str}' to E.164 with hints {country_codes} or default region.")
+        logger.info(f"Could not normalize phone number '{number_str}' to E.164 with hints {country_codes} or default region.")
         return None
     def _extract_json_from_text(self, text_output: Optional[str]) -> Optional[str]:
         """
@@ -177,11 +177,11 @@ class GeminiLLMExtractor:
         retry=retry_if_exception_type(RETRYABLE_GEMINI_EXCEPTIONS),
         reraise=True  # Reraise the exception if all retries fail
     )
-    def _generate_content_with_retry(self, formatted_prompt: str, generation_config: GenerationConfig):
+    def _generate_content_with_retry(self, formatted_prompt: str, generation_config: GenerationConfig, file_identifier_prefix: str, triggering_input_row_id: Any, triggering_company_name: str):
         """
         Internal method to call Gemini API with retry logic.
         """
-        logger.info("Attempting to generate content with Gemini API...")
+        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Attempting to generate content with Gemini API...")
         response = self.model.generate_content(
             formatted_prompt,
             generation_config=generation_config
@@ -189,11 +189,11 @@ class GeminiLLMExtractor:
         # Basic check for safety, though specific non-retriable content blocks
         # would ideally be handled by the caller if they are not exceptions.
         if response and response.prompt_feedback and response.prompt_feedback.block_reason:
-            logger.warning(f"Gemini content generation blocked. Reason: {response.prompt_feedback.block_reason.name}. This might not be retriable by network retries.")
+            logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Gemini content generation blocked. Reason: {response.prompt_feedback.block_reason.name}. This might not be retriable by network retries.")
             # Depending on the block_reason, one might choose to raise a specific non-retryable error here.
             # For now, we let it proceed and the caller handles the content.
 
-        logger.info("Successfully generated content from Gemini API attempt.")
+        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Successfully generated content from Gemini API attempt.")
         return response
 
     def _process_successful_llm_item(
@@ -217,10 +217,13 @@ class GeminiLLMExtractor:
         self,
         input_item_details: Dict[str, Any],
         error_type_str: str = "Error_ProcessingFailed",
-        classification_str: str = "Non-Business"
+        classification_str: str = "Non-Business",
+        file_identifier_prefix: Optional[str] = "N/A", # Added
+        triggering_input_row_id: Optional[Any] = "N/A", # Added
+        triggering_company_name: Optional[str] = "N/A" # Added
     ) -> PhoneNumberLLMOutput:
         """Creates a PhoneNumberLLMOutput for an item that failed processing."""
-        logger.warning(f"Creating error item for input number '{input_item_details.get('number')}' due to: {error_type_str}")
+        logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Creating error item for input number '{input_item_details.get('number')}' from source '{input_item_details.get('source_url', 'Unknown Source')}' due to: {error_type_str}")
         return PhoneNumberLLMOutput(
             number=str(input_item_details.get('number')), # Use the original input number
             type=error_type_str,
@@ -236,7 +239,9 @@ class GeminiLLMExtractor:
         candidate_items: List[Dict[str, str]], # Changed input
         prompt_template_path: str,
         llm_context_dir: str,  # New parameter
-        file_identifier_prefix: str  # New parameter
+        file_identifier_prefix: str,  # New parameter
+        triggering_input_row_id: Any,
+        triggering_company_name: str
     ) -> Tuple[List[PhoneNumberLLMOutput], Optional[str], Optional[Dict[str, int]]]:
         """
         Classifies candidate phone numbers based on their snippets and source URLs using the Gemini API.
@@ -282,7 +287,7 @@ class GeminiLLMExtractor:
         try:
             run_output_dir = os.path.dirname(llm_context_dir)
             if not run_output_dir: # e.g. if llm_context_dir was just "llm_context"
-                logger.warning(f"Could not determine run_output_dir from llm_context_dir: '{llm_context_dir}'. Cannot save prompt template.")
+                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Could not determine run_output_dir from llm_context_dir: '{llm_context_dir}'. Cannot save prompt template.")
             else:
                 # Ensure the parent directory for llm_prompt_template.txt exists
                 os.makedirs(run_output_dir, exist_ok=True)
@@ -291,24 +296,24 @@ class GeminiLLMExtractor:
                 template_output_filepath = os.path.join(run_output_dir, template_output_filename)
 
                 if not os.path.exists(template_output_filepath):
-                    logger.info(f"Attempting to save base LLM prompt template to {template_output_filepath}")
+                    logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Attempting to save base LLM prompt template to {template_output_filepath}")
                     try:
                         # Load the original base prompt template content
                         base_prompt_content = self._load_prompt_template(prompt_template_path)
                         with open(template_output_filepath, 'w', encoding='utf-8') as f_template:
                             f_template.write(base_prompt_content)
-                        logger.info(f"Successfully saved base LLM prompt template to {template_output_filepath}")
+                        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Successfully saved base LLM prompt template to {template_output_filepath}")
                     except FileNotFoundError:
                         # _load_prompt_template logs this. This log is for context of this specific save operation.
-                        logger.error(f"Base prompt template file '{prompt_template_path}' not found. Cannot save a copy to '{template_output_filepath}'.")
+                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Base prompt template file '{prompt_template_path}' not found. Cannot save a copy to '{template_output_filepath}'.")
                     except IOError as e_io:
-                        logger.error(f"IOError saving base LLM prompt template to '{template_output_filepath}': {e_io}")
+                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] IOError saving base LLM prompt template to '{template_output_filepath}': {e_io}")
                     except Exception as e_template_save: # Catch any other error during template loading/saving
-                        logger.error(f"Unexpected error during saving of base LLM prompt template to '{template_output_filepath}': {e_template_save}")
+                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Unexpected error during saving of base LLM prompt template to '{template_output_filepath}': {e_template_save}")
                 else:
-                    logger.debug(f"Base LLM prompt template '{template_output_filepath}' already exists. Skipping save.")
+                    logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Base LLM prompt template '{template_output_filepath}' already exists. Skipping save.")
         except Exception as e_path_setup: # Catch errors from os.path.dirname or os.makedirs
-            logger.error(f"Error in pre-processing for saving prompt template (e.g., path manipulation for '{llm_context_dir}'): {e_path_setup}")
+            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Error in pre-processing for saving prompt template (e.g., path manipulation for '{llm_context_dir}'): {e_path_setup}")
         # --- END NEW LOGIC FOR SAVING TEMPLATE ONCE ---
 
         # --- Initial LLM Call ---
@@ -322,10 +327,10 @@ class GeminiLLMExtractor:
                 candidate_items_json_str_pass1
             )
         except Exception as e:
-            logger.error(f"Failed to load or format prompt for initial call: {e}")
+            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Failed to load or format prompt for initial call: {e}")
             # Populate all with error items
             for i, item_detail in enumerate(candidate_items):
-                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_PromptLoading")
+                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_PromptLoading", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
             return [item for item in final_processed_outputs if item is not None], f"Error loading prompt: {str(e)}", accumulated_token_stats
 
         generation_config_pass1 = GenerationConfig(
@@ -335,8 +340,8 @@ class GeminiLLMExtractor:
         )
 
         try:
-            logger.debug(f"Sending initial request to Gemini for {len(current_items_for_llm_call)} items. Prompt starts with: {formatted_prompt_pass1[:200]}...")
-            response_pass1 = self._generate_content_with_retry(formatted_prompt_pass1, generation_config_pass1)
+            logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Sending initial request to Gemini for {len(current_items_for_llm_call)} items. Prompt starts with: {formatted_prompt_pass1[:200]}...")
+            response_pass1 = self._generate_content_with_retry(formatted_prompt_pass1, generation_config_pass1, file_identifier_prefix, triggering_input_row_id, triggering_company_name)
             raw_llm_response_str_initial = response_pass1.text
 
             if hasattr(response_pass1, 'usage_metadata') and response_pass1.usage_metadata:
@@ -346,14 +351,14 @@ class GeminiLLMExtractor:
                     "total_tokens": response_pass1.usage_metadata.total_token_count
                 }
                 for key in accumulated_token_stats: accumulated_token_stats[key] += token_usage_stats_initial.get(key, 0)
-                logger.info(f"Initial LLM call usage: {token_usage_stats_initial}")
+                logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call usage: {token_usage_stats_initial}")
             else:
-                logger.warning("Initial LLM call: Gemini API usage metadata not found.")
+                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Gemini API usage metadata not found.")
 
             if not response_pass1.candidates:
-                logger.error("No candidates found in initial Gemini response.")
+                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] No candidates found in initial Gemini response.")
                 for i, item_detail in enumerate(candidate_items):
-                    final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_NoLLMCandidates")
+                    final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_NoLLMCandidates", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                 return [item for item in final_processed_outputs if item is not None], json.dumps({"error": "No candidates in initial response", "raw_response_text": raw_llm_response_str_initial}), accumulated_token_stats
 
             if raw_llm_response_str_initial:
@@ -365,9 +370,9 @@ class GeminiLLMExtractor:
                         validated_numbers_pass1 = llm_result_pass1.extracted_numbers
 
                         if len(validated_numbers_pass1) != len(current_items_for_llm_call):
-                            logger.error(f"Initial LLM call: Mismatch in item count. Input: {len(current_items_for_llm_call)}, Output: {len(validated_numbers_pass1)}. Cannot reliably map. Marking all as error.")
+                            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Mismatch in item count. Input: {len(current_items_for_llm_call)}, Output: {len(validated_numbers_pass1)}. Cannot reliably map. Marking all as error.")
                             for i, item_detail in enumerate(candidate_items):
-                                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_LLMItemCountMismatch")
+                                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_LLMItemCountMismatch", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                             return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
                         
                         for i, input_item_detail in enumerate(current_items_for_llm_call):
@@ -375,33 +380,33 @@ class GeminiLLMExtractor:
                             if llm_output_item.number == input_item_detail['number']:
                                 final_processed_outputs[i] = self._process_successful_llm_item(llm_output_item, input_item_detail)
                             else:
-                                logger.warning(f"Initial mismatch for input '{input_item_detail['number']}', LLM returned '{llm_output_item.number}'. Queueing for retry.")
+                                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {input_item_detail.get('original_input_company_name')}] Initial mismatch for input '{input_item_detail['number']}', LLM returned '{llm_output_item.number}'. Queueing for retry.")
                                 items_needing_retry.append((i, input_item_detail))
                     
                     except json.JSONDecodeError as e:
-                        logger.error(f"Initial LLM call: Failed to parse JSON: {e}. Raw: '{raw_llm_response_str_initial[:500]}...'")
-                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialJsonParse")
+                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Failed to parse JSON: {e}. Raw: '{raw_llm_response_str_initial[:500]}...'")
+                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialJsonParse", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                         return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
                     except PydanticValidationError as ve:
-                        logger.error(f"Initial LLM call: Pydantic validation failed: {ve}. Raw: '{raw_llm_response_str_initial[:500]}...'")
-                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialPydanticValidation")
+                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Pydantic validation failed: {ve}. Raw: '{raw_llm_response_str_initial[:500]}...'")
+                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialPydanticValidation", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                         return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
                 else: # No JSON block
-                    logger.warning(f"Initial LLM call: Could not extract JSON block. Raw: {raw_llm_response_str_initial[:500]}...")
-                    for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialNoJsonBlock")
+                    logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Could not extract JSON block. Raw: {raw_llm_response_str_initial[:500]}...")
+                    for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialNoJsonBlock", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                     return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
             else: # Empty response
-                logger.warning("Initial LLM call: Response text is empty.")
-                for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialEmptyResponse")
+                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Response text is empty.")
+                for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialEmptyResponse", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                 return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
 
         except google_exceptions.GoogleAPIError as e:
-            logger.error(f"Initial LLM call: Gemini API error: {e}")
-            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialApiError_{type(e).__name__}")
+            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Gemini API error: {e}")
+            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialApiError_{type(e).__name__}", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
             return [item for item in final_processed_outputs if item is not None], json.dumps({"error": f"Initial Gemini API error: {str(e)}", "type": type(e).__name__}), accumulated_token_stats
         except Exception as e:
-            logger.error(f"Initial LLM call: Unexpected error: {e}", exc_info=True)
-            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialUnexpected_{type(e).__name__}")
+            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Unexpected error: {e}", exc_info=True)
+            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialUnexpected_{type(e).__name__}", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
             return [item for item in final_processed_outputs if item is not None], json.dumps({"error": f"Initial unexpected error: {str(e)}", "type": type(e).__name__}), accumulated_token_stats
 
         # --- Iterative Retry Loop for Mismatched Items ---
@@ -410,7 +415,7 @@ class GeminiLLMExtractor:
 
         while items_needing_retry and current_retry_attempt < self.config.llm_max_retries_on_number_mismatch:
             current_retry_attempt += 1
-            logger.info(f"Attempting LLM retry pass #{current_retry_attempt} for {len(items_needing_retry)} mismatched items.")
+            logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Attempting LLM retry pass #{current_retry_attempt} for {len(items_needing_retry)} mismatched items.")
             
             inputs_for_this_retry_pass = [item_tuple[1] for item_tuple in items_needing_retry]
             original_indices_for_this_pass = [item_tuple[0] for item_tuple in items_needing_retry]
@@ -423,11 +428,11 @@ class GeminiLLMExtractor:
                     candidate_items_json_str_retry
                 )
             except Exception as e:
-                logger.error(f"Failed to load or format prompt for retry pass #{current_retry_attempt}: {e}")
+                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Failed to load or format prompt for retry pass #{current_retry_attempt}: {e}")
                 # Mark remaining items_needing_retry as error and break loop
                 for original_idx, item_detail_retry in items_needing_retry:
                     if final_processed_outputs[original_idx] is None: # Only if not already processed
-                         final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_retry, f"Error_RetryPromptLoading_Pass{current_retry_attempt}")
+                         final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_retry, f"Error_RetryPromptLoading_Pass{current_retry_attempt}", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                 items_needing_retry.clear() # Stop further retries
                 break
 
@@ -436,8 +441,8 @@ class GeminiLLMExtractor:
             )
 
             try:
-                logger.debug(f"Sending retry #{current_retry_attempt} request to Gemini for {len(inputs_for_this_retry_pass)} items.")
-                response_retry = self._generate_content_with_retry(formatted_prompt_retry, generation_config_retry)
+                logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Sending retry #{current_retry_attempt} request to Gemini for {len(inputs_for_this_retry_pass)} items.")
+                response_retry = self._generate_content_with_retry(formatted_prompt_retry, generation_config_retry, file_identifier_prefix, triggering_input_row_id, triggering_company_name)
                 raw_llm_response_str_retry = response_retry.text # Store this retry's raw response
 
                 if hasattr(response_retry, 'usage_metadata') and response_retry.usage_metadata:
@@ -447,13 +452,13 @@ class GeminiLLMExtractor:
                         "total_tokens": response_retry.usage_metadata.total_token_count
                     }
                     for key in accumulated_token_stats: accumulated_token_stats[key] += token_stats_retry.get(key, 0)
-                    logger.info(f"LLM retry #{current_retry_attempt} usage: {token_stats_retry}")
+                    logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM retry #{current_retry_attempt} usage: {token_stats_retry}")
                 else:
-                    logger.warning(f"LLM retry #{current_retry_attempt}: Gemini API usage metadata not found.")
+                    logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM retry #{current_retry_attempt}: Gemini API usage metadata not found.")
 
                 still_mismatched_after_this_retry: List[Tuple[int, Dict[str, Any]]] = []
                 if not response_retry.candidates:
-                    logger.error(f"Retry #{current_retry_attempt}: No candidates in Gemini response. All items in this batch remain mismatched.")
+                    logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: No candidates in Gemini response. All items in this batch remain mismatched.")
                     still_mismatched_after_this_retry.extend(items_needing_retry) # All failed this retry
                 elif raw_llm_response_str_retry:
                     json_candidate_str_retry = self._extract_json_from_text(raw_llm_response_str_retry)
@@ -464,7 +469,7 @@ class GeminiLLMExtractor:
                             validated_numbers_retry = llm_result_retry.extracted_numbers
 
                             if len(validated_numbers_retry) != len(inputs_for_this_retry_pass):
-                                logger.error(f"Retry #{current_retry_attempt}: Mismatch in item count. Input: {len(inputs_for_this_retry_pass)}, Output: {len(validated_numbers_retry)}. All items in this batch remain mismatched.")
+                                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Mismatch in item count. Input: {len(inputs_for_this_retry_pass)}, Output: {len(validated_numbers_retry)}. All items in this batch remain mismatched.")
                                 still_mismatched_after_this_retry.extend(items_needing_retry)
                             else:
                                 for j, retried_input_item_detail in enumerate(inputs_for_this_retry_pass):
@@ -472,41 +477,41 @@ class GeminiLLMExtractor:
                                     retried_llm_output_item = validated_numbers_retry[j]
 
                                     if retried_llm_output_item.number == retried_input_item_detail['number']:
-                                        logger.info(f"Retry pass #{current_retry_attempt} successful for input '{retried_input_item_detail['number']}'.")
+                                        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {retried_input_item_detail.get('original_input_company_name')}] Retry pass #{current_retry_attempt} successful for input '{retried_input_item_detail['number']}'.")
                                         final_processed_outputs[original_input_idx] = self._process_successful_llm_item(retried_llm_output_item, retried_input_item_detail)
                                     else:
-                                        logger.warning(f"Mismatch persists after retry pass #{current_retry_attempt} for input '{retried_input_item_detail['number']}', LLM returned '{retried_llm_output_item.number}'.")
+                                        logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {retried_input_item_detail.get('original_input_company_name')}] Mismatch persists after retry pass #{current_retry_attempt} for input '{retried_input_item_detail['number']}', LLM returned '{retried_llm_output_item.number}'.")
                                         still_mismatched_after_this_retry.append((original_input_idx, retried_input_item_detail))
                         
                         except json.JSONDecodeError as e:
-                            logger.error(f"Retry #{current_retry_attempt}: Failed to parse JSON: {e}. All items in this batch remain mismatched.")
+                            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Failed to parse JSON: {e}. All items in this batch remain mismatched.")
                             still_mismatched_after_this_retry.extend(items_needing_retry)
                         except PydanticValidationError as ve:
-                            logger.error(f"Retry #{current_retry_attempt}: Pydantic validation failed: {ve}. All items in this batch remain mismatched.")
+                            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Pydantic validation failed: {ve}. All items in this batch remain mismatched.")
                             still_mismatched_after_this_retry.extend(items_needing_retry)
                     else: # No JSON block in retry
-                        logger.warning(f"Retry #{current_retry_attempt}: Could not extract JSON block. All items in this batch remain mismatched.")
+                        logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Could not extract JSON block. All items in this batch remain mismatched.")
                         still_mismatched_after_this_retry.extend(items_needing_retry)
                 else: # Empty response in retry
-                    logger.warning(f"Retry #{current_retry_attempt}: Response text is empty. All items in this batch remain mismatched.")
+                    logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Response text is empty. All items in this batch remain mismatched.")
                     still_mismatched_after_this_retry.extend(items_needing_retry)
                 
                 items_needing_retry = still_mismatched_after_this_retry
 
             except google_exceptions.GoogleAPIError as e:
-                logger.error(f"Retry #{current_retry_attempt}: Gemini API error: {e}. All items in this batch remain mismatched for this attempt.")
+                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Gemini API error: {e}. All items in this batch remain mismatched for this attempt.")
                 # No change to items_needing_retry, they will be processed in next attempt or final error handling
                 # We don't clear items_needing_retry here, to allow further retries if configured.
             except Exception as e:
-                logger.error(f"Retry #{current_retry_attempt}: Unexpected error: {e}", exc_info=True)
+                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Unexpected error: {e}", exc_info=True)
                 # As above, items remain for next attempt or final error handling.
 
         # --- Handle Persistently Mismatched Items (after all retries) ---
         if items_needing_retry:
-            logger.warning(f"{len(items_needing_retry)} items still mismatched after all {self.config.llm_max_retries_on_number_mismatch} retries.")
+            logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] {len(items_needing_retry)} items still mismatched after all {self.config.llm_max_retries_on_number_mismatch} retries.")
             for original_idx, item_detail_persist_error in items_needing_retry:
                 if final_processed_outputs[original_idx] is None: # Only if not somehow processed
-                    final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_persist_error, "Error_PersistentMismatchAfterRetries")
+                    final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_persist_error, "Error_PersistentMismatchAfterRetries", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
         
         # --- Handle Initial Mismatches if Retries were Disabled (max_retries = 0) ---
         # This case is covered if items_needing_retry was populated and loop didn't run.
@@ -515,17 +520,31 @@ class GeminiLLMExtractor:
         # --- Final check for any None slots (e.g. if an error occurred before first pass processing for an item) ---
         for i, output_item in enumerate(final_processed_outputs):
             if output_item is None:
-                logger.error(f"Item at original index {i} (input: {candidate_items[i].get('number')}) was not processed. Creating error item.")
-                final_processed_outputs[i] = self._create_error_llm_item(candidate_items[i], "Error_NotProcessed")
+                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {candidate_items[i].get('original_input_company_name')}] Item at original index {i} (input: {candidate_items[i].get('number')}) was not processed. Creating error item.")
+                final_processed_outputs[i] = self._create_error_llm_item(candidate_items[i], "Error_NotProcessed", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
         
         # The primary raw response to return is from the initial call, or the last retry if that's more relevant.
-        # For simplicity, returning the initial raw response. If retries happened, their raw responses are logged.
-        final_raw_llm_response_str = raw_llm_response_str_initial if raw_llm_response_str_initial is not None else \
-                                   (raw_llm_response_str_retry if raw_llm_response_str_retry is not None else \
-                                    json.dumps({"error": "LLM response was not captured."}))
+        response_origin_log_message = ""
+        if raw_llm_response_str_initial is not None and (raw_llm_response_str_retry is None or items_needing_retry or not current_retry_attempt): # Prefer initial if no retries or retries didn't change outcome for all
+            response_origin_log_message = "Using raw response from initial LLM call."
+            final_raw_llm_response_str = raw_llm_response_str_initial
+        elif raw_llm_response_str_retry is not None:
+            response_origin_log_message = f"Using raw response from last LLM retry attempt ({current_retry_attempt})."
+            final_raw_llm_response_str = raw_llm_response_str_retry
+        else: # Neither initial nor retry had a response text (e.g. API error before text, or prompt loading error)
+            response_origin_log_message = "Using default/error JSON as final raw response (no text from LLM)."
+            final_raw_llm_response_str = json.dumps({"error": "LLM response was not captured or was empty."})
+        
+        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] {response_origin_log_message}")
+
 
         # Cast List[Optional[PhoneNumberLLMOutput]] to List[PhoneNumberLLMOutput]
         # All None should have been filled by error items.
         processed_results: List[PhoneNumberLLMOutput] = [item for item in final_processed_outputs if item is not None]
+        
+        # Log summary of processed items
+        successful_items_count = sum(1 for item in processed_results if item and not item.type.startswith("Error_"))
+        error_items_count = len(processed_results) - successful_items_count
+        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM extraction summary: {successful_items_count} successful, {error_items_count} errors out of {len(candidate_items)} candidates.")
 
         return processed_results, final_raw_llm_response_str, accumulated_token_stats

@@ -17,12 +17,15 @@ The pipeline follows these main stages:
 3.  **Regex Extraction**: Applies regular expressions to the scraped text to identify potential phone number patterns and their surrounding context.
 4.  **LLM Extraction**: Utilizes a Large Language Model (Google Gemini) to analyze the scraped text and contextual snippets to extract, confirm, and classify phone numbers.
 5.  **Data Consolidation & Verification**: Consolidates all extracted data globally by *true base domain* (e.g., `http://example.com`). This handles variations in input URLs and ensures each unique website is processed efficiently. Phone numbers are de-duplicated per true base domain, and their original sources (including input company names and specific page URLs) and types are aggregated.
-6.  **Reporting**: Generates four primary Excel reports for each run:
-    *   **Final Contacts Report** (`Final Contacts.xlsx`): One consolidated entry per unique true base domain. Features aggregated company names, a filtered and prioritized list of up to 3 phone numbers (with their types and original sourcing company names), and source URLs. This is the primary report for outreach. (Formerly "Top Contacts Report")
-    *   **Final Processed Contacts Report** (`Final_Processed_Contacts.xlsx`): A cleaner, more concise version of the "Final Contacts Report", with specific columns: Company Name, URL, Number, Number Type, Number Found At. It uses the "Final Contacts.xlsx" as its direct data source.
-    *   **Summary Report** (`phone_validation_output_{RunID}.xlsx`): One row per original input entry, showing top numbers found for its corresponding true base domain and verification statuses.
-    *   **Detailed LLM Extractions Report** (`All_LLM_Extractions_Report_{RunID}.xlsx`): Lists all unique phone numbers found by the LLM for each true base domain, with aggregated types and source URLs.
-    Additionally, detailed (and now rotating) logs and intermediate data dumps are created for traceability.
+6.  **Reporting**: Generates several key outputs for each run:
+    *   **Four primary Excel reports**:
+        *   **Final Contacts Report** (`Final Contacts.xlsx`): One consolidated entry per unique true base domain. Features aggregated company names, a filtered and prioritized list of up to 3 phone numbers (with their types and original sourcing company names), and source URLs. This is the primary report for outreach. (Formerly "Top Contacts Report")
+        *   **Final Processed Contacts Report** (`Final_Processed_Contacts.xlsx`): A cleaner, more concise version of the "Final Contacts Report", with specific columns: Company Name, URL, Number, Number Type, Number Found At. It uses the "Final Contacts.xlsx" as its direct data source.
+        *   **Summary Report** (`phone_validation_output_{RunID}.xlsx`): One row per original input entry, showing top numbers found for its corresponding true base domain and verification statuses.
+        *   **Detailed LLM Extractions Report** (`All_LLM_Extractions_Report_{RunID}.xlsx`): Lists all unique phone numbers found by the LLM for each true base domain, with aggregated types and source URLs.
+    *   **Run Metrics Report** (`run_metrics.md`): A Markdown file summarizing the overall health of the pipeline run, including processing statistics, global errors, and a hierarchical summary of row-level failures by stage.
+    *   **Failed Rows Report** (`failed_rows_{run_id}.csv`): A CSV file detailing rows that encountered errors during processing, including company information, the stage of failure, and specific error messages.
+    Additionally, detailed (and now rotating) logs are created for traceability and debugging.
 
 ## Key Features & Technologies
 
@@ -37,7 +40,7 @@ The pipeline follows these main stages:
     *   `Summary Report`: Per-input-row overview.
     *   `Detailed_LLM_Extractions_Report`: Comprehensive log of all numbers found by LLM per true base domain.
 *   **Robust LLM Interaction**: Includes retry mechanisms for API calls to Google Gemini.
-*   **Enhanced Logging**: Features rotating log files to manage size during long runs.
+*   **Enhanced Logging**: Features rotating log files, configurable log levels (for file and console via `CONSOLE_LOG_LEVEL` environment variable), and detailed contextual information in logs (e.g., `InputRowID`, `CompanyName`, `file_identifier_prefix`) to aid debugging.
 *   **Advanced Scraper Configuration**: Includes options like `SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT` for fine-tuned scraping.
 *   **Highly Configurable**: Behavior can be customized extensively via a `.env` file.
 *   **Configurable Filename Lengths**: Prevents path length errors by allowing configuration of company name length in output filenames.
@@ -84,16 +87,16 @@ phone_validation_pipeline/
 │       └── scraper_logic.py
 └── output_data/           # Default directory for pipeline outputs (created on run)
     └── [RunID]/           # Outputs for a specific pipeline run (e.g., 20240520_110000)
-        ├── pipeline_run_{RunID}.log # Main log file for the run
+        ├── pipeline_run_{RunID}.log # Main, rotating log file for the run
+        ├── run_metrics.md           # Run metrics and failure summary report
+        ├── failed_rows_{RunID}.csv  # Detailed report of rows that failed processing
         ├── scraped_content/
         │   └── cleaned_pages_text/  # Cleaned text from scraped pages
-        ├── intermediate_data/
-        │   └── ..._regex_snippets.json # Regex extracted snippets
         ├── llm_context/
         │   ├── ..._llm_prompt_input.txt # Full prompt sent to LLM
         │   └── ..._llm_raw_output.json  # Raw LLM response
         ├── phone_validation_output_{RunID}.xlsx       # Summary report (per input row)
-        ├── All_LLM_Extractions_Report_{RunID}.xlsx    # Detailed flattened report (was phone_validation_detailed_output)
+        ├── All_LLM_Extractions_Report_{RunID}.xlsx    # Detailed flattened report
         ├── Final Contacts.xlsx                        # Consolidated top contacts report (per true base domain)
         └── Final_Processed_Contacts.xlsx              # Leaner, processed version of Final Contacts
 ```
@@ -149,8 +152,10 @@ This script will:
     *   The Final Processed Contacts Report (`Final_Processed_Contacts.xlsx`).
     *   The Summary Report (`phone_validation_output_{RunID}.xlsx`).
     *   The Detailed LLM Extractions Report (`All_LLM_Extractions_Report_{RunID}.xlsx`).
-    *   A comprehensive run log (`pipeline_run_{RunID}.log`).
-    *   Subdirectories for scraped content, intermediate data (regex snippets), and LLM context (prompts, raw responses).
+    *   The Run Metrics Report (`run_metrics.md`).
+    *   The Failed Rows Report (`failed_rows_{RunID}.csv`).
+    *   A comprehensive, rotating run log (`pipeline_run_{RunID}.log`).
+    *   Subdirectories for scraped content and LLM context (prompts, raw responses).
 
 ## Advanced Usage & Configuration
 

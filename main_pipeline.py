@@ -49,16 +49,34 @@ def is_target_country_number_reliable(phone_number_str: str) -> bool:
 def generate_run_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def log_row_failure(failure_log_writer: Optional[Any], input_row_identifier: Any, stage_of_failure: str, error_reason: str) -> None: 
+def log_row_failure(
+    failure_log_writer: Optional[Any],
+    input_row_identifier: Any,
+    company_name: str,
+    given_url: Optional[str],
+    stage_of_failure: str,
+    error_reason: str,
+    log_timestamp: str,
+    error_details: str = ""
+) -> None:
     """Helper function to write a row-specific failure to the CSV log."""
     if failure_log_writer:
         try:
             sanitized_reason = str(error_reason).replace('\n', ' ').replace('\r', '')
-            failure_log_writer.writerow([input_row_identifier, stage_of_failure, sanitized_reason])
+            sanitized_details = str(error_details).replace('\n', ' ').replace('\r', '')
+            failure_log_writer.writerow([
+                log_timestamp,
+                input_row_identifier,
+                company_name,
+                given_url if given_url is not None else "",
+                stage_of_failure,
+                sanitized_reason,
+                sanitized_details
+            ])
         except Exception as e:
-            logger.error(f"CRITICAL: Failed to write to failure_log_csv: {e}. Row ID: {input_row_identifier}, Stage: {stage_of_failure}", exc_info=True)
+            logger.error(f"CRITICAL: Failed to write to failure_log_csv: {e}. Row ID: {input_row_identifier}, Stage: {stage_of_failure}, Timestamp: {log_timestamp}", exc_info=True)
     else:
-        logger.warning(f"Attempted to log row failure but failure_log_writer is None. Row ID: {input_row_identifier}, Stage: {stage_of_failure}")
+        logger.warning(f"Attempted to log row failure but failure_log_writer is None. Row ID: {input_row_identifier}, Stage: {stage_of_failure}, Timestamp: {log_timestamp}")
 
 
 def main() -> None:
@@ -70,7 +88,8 @@ def main() -> None:
         "data_processing_stats": {
             "input_rows_count": 0,
             "rows_successfully_processed_pass1": 0, 
-            "rows_failed_pass1": 0, 
+            "rows_failed_pass1": 0,
+            "row_level_failure_summary": {}, # New: For stage_of_failure counts
         },
         "scraping_stats": {
             "urls_processed_for_scraping": 0,
@@ -120,8 +139,6 @@ def main() -> None:
     run_output_dir: str = os.path.join(output_base_dir_abs, run_id)
     os.makedirs(run_output_dir, exist_ok=True)
     
-    intermediate_data_dir = os.path.join(run_output_dir, "intermediate_data")
-    os.makedirs(intermediate_data_dir, exist_ok=True)
     llm_context_dir = os.path.join(run_output_dir, app_config.llm_context_subdir)
     os.makedirs(llm_context_dir, exist_ok=True)
     
@@ -240,9 +257,14 @@ def main() -> None:
     rows_processed_in_pass1 = 0
     rows_failed_in_pass1 = 0 
 
+    row_level_failure_counts: Dict[str, int] = {} # Initialize counter for stage_of_failure
+
     with open(failure_log_csv_path, 'w', newline='', encoding='utf-8') as f_failure_log:
         failure_writer = csv.writer(f_failure_log)
-        failure_writer.writerow(['input_row_identifier', 'stage_of_failure', 'error_reason'])
+        failure_writer.writerow([
+            'log_timestamp', 'input_row_identifier', 'CompanyName', 'GivenURL',
+            'stage_of_failure', 'error_reason', 'error_details'
+        ])
 
         for i, (index, row_series) in enumerate(df.iterrows()):
             rows_processed_in_pass1 += 1
@@ -251,7 +273,7 @@ def main() -> None:
             given_url_original: Optional[str] = row.get('GivenURL')
             current_row_number_for_log: int = i + 1
             
-            logger.info(f"--- Processing row {current_row_number_for_log}/{len(df)}: Company '{company_name}', Original URL '{given_url_original}' ---")
+            logger.info(f"[RowID: {index}, Company: {company_name}] --- Processing row {current_row_number_for_log}/{len(df)}: Original URL '{given_url_original}' ---")
 
             current_row_scraper_status: str = "Not_Run"
             # ... (other per-row initializations) ...
@@ -270,7 +292,7 @@ def main() -> None:
                     current_query = parsed_obj.query
                     current_fragment = parsed_obj.fragment
                     if not current_scheme:
-                        logger.info(f"URL '{temp_url_stripped}' is schemeless. Adding 'http://' and re-parsing.")
+                        logger.info(f"[RowID: {index}, Company: {company_name}] URL '{temp_url_stripped}' is schemeless. Adding 'http://' and re-parsing.")
                         temp_for_reparse_schemeless = "http://" + temp_url_stripped
                         parsed_obj_schemed = urlparse(temp_for_reparse_schemeless)
                         current_scheme = parsed_obj_schemed.scheme 
@@ -279,9 +301,9 @@ def main() -> None:
                         current_params = parsed_obj_schemed.params 
                         current_query = parsed_obj_schemed.query   
                         current_fragment = parsed_obj_schemed.fragment 
-                        logger.debug(f"After adding scheme: N='{current_netloc}', P='{current_path}'")
+                        logger.debug(f"[RowID: {index}, Company: {company_name}] After adding scheme: N='{current_netloc}', P='{current_path}'")
                     if " " in current_netloc:
-                        logger.warning(f"Spaces found in domain part '{current_netloc}' for {company_name}. Removing them.")
+                        logger.info(f"[RowID: {index}, Company: {company_name}] Spaces found in domain part '{current_netloc}'. Removing them.")
                         current_netloc = current_netloc.replace(" ", "")
                     current_path = quote(current_path, safe='/%')
                     current_query = quote(current_query, safe='=&/?+%')
@@ -291,26 +313,26 @@ def main() -> None:
                     if current_netloc and not re.search(r'\.[a-zA-Z]{2,}$', current_netloc) and not current_netloc.endswith('.'):
                         is_ip_address = re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", current_netloc)
                         if current_netloc.lower() != 'localhost' and not is_ip_address:
-                            logger.info(f"Input domain '{current_netloc}' for '{company_name}' appears to lack a TLD. Attempting TLD probing...")
+                            logger.info(f"[RowID: {index}, Company: {company_name}] Input domain '{current_netloc}' appears to lack a TLD. Attempting TLD probing...")
                             successfully_probed_tld = False
                             probed_netloc_base = current_netloc # Keep original for logging if all probes fail
                             
                             for tld_to_try in app_config.url_probing_tlds:
                                 candidate_domain_to_probe = f"{probed_netloc_base}.{tld_to_try}"
-                                logger.debug(f"Probing TLD: Trying '{candidate_domain_to_probe}' for '{company_name}'")
+                                logger.debug(f"[RowID: {index}, Company: {company_name}] Probing TLD: Trying '{candidate_domain_to_probe}'")
                                 try:
                                     socket.gethostbyname(candidate_domain_to_probe)
                                     current_netloc = candidate_domain_to_probe # Update current_netloc
-                                    logger.info(f"TLD probe successful for '{company_name}'. Using '{current_netloc}' after trying '.{tld_to_try}'.")
+                                    logger.info(f"[RowID: {index}, Company: {company_name}] TLD probe successful. Using '{current_netloc}' after trying '.{tld_to_try}'.")
                                     successfully_probed_tld = True
                                     break # Stop on first successful probe
                                 except socket.gaierror:
-                                    logger.debug(f"TLD probe DNS lookup failed for '{candidate_domain_to_probe}' for '{company_name}'.")
+                                    logger.debug(f"[RowID: {index}, Company: {company_name}] TLD probe DNS lookup failed for '{candidate_domain_to_probe}'.")
                                 except Exception as sock_e: # Catch other potential socket errors
-                                    logger.debug(f"TLD probe for '{candidate_domain_to_probe}' failed with unexpected socket error: {sock_e}")
+                                    logger.debug(f"[RowID: {index}, Company: {company_name}] TLD probe for '{candidate_domain_to_probe}' failed with unexpected socket error: {sock_e}")
                             
                             if not successfully_probed_tld:
-                                logger.warning(f"TLD probing failed for base domain '{probed_netloc_base}' for '{company_name}'. Proceeding with '{current_netloc}' (which might be the un-suffixed original or last attempted).")
+                                logger.warning(f"[RowID: {index}, Company: {company_name}] TLD probing failed for base domain '{probed_netloc_base}'. Proceeding with '{current_netloc}' (which might be the un-suffixed original or last attempted).")
                                 # current_netloc remains as it was before the loop if no probe succeeded (i.e. probed_netloc_base)
                                 # Or, if a default append is desired here (e.g. .de as a last resort), it could be added.
                                 # For now, we proceed with the netloc as is, and scraper will handle DNS failure.
@@ -325,17 +347,28 @@ def main() -> None:
                     
                     # Log the final decision for the URL to be scraped
                     if processed_url != given_url_original:
-                        logger.info(f"URL for '{company_name}': Original='{given_url_original}', Processed for Scraper='{processed_url}'")
+                        logger.info(f"[RowID: {index}, Company: {company_name}] URL: Original='{given_url_original}', Processed for Scraper='{processed_url}'")
                     else:
-                        logger.info(f"URL for '{company_name}': Using original='{given_url_original}' (no changes after preprocessing).")
+                        logger.info(f"[RowID: {index}, Company: {company_name}] URL: Using original='{given_url_original}' (no changes after preprocessing).")
 
                 if not processed_url or not isinstance(processed_url, str) or not processed_url.startswith(('http://', 'https://')):
-                    logger.warning(f"Skipping row {current_row_number_for_log} ('{company_name}') due to invalid or missing URL after all processing: '{processed_url}' (Original input was: '{given_url_original}')")
+                    logger.warning(f"[RowID: {index}, Company: {company_name}] Skipping row {current_row_number_for_log} due to invalid or missing URL after all processing: '{processed_url}' (Original input was: '{given_url_original}')")
                     df.at[index, 'ScrapingStatus'] = 'InvalidURL'
                     current_row_scraper_status = 'InvalidURL'
                     df.at[index, 'VerificationStatus'] = 'Skipped_InvalidURL'
                     run_metrics["scraping_stats"]["scraping_failure_invalid_url"] += 1
-                    log_row_failure(failure_writer, index, "URL_Validation", f"Invalid or missing URL after processing: {processed_url} (Original: '{given_url_original}')")
+                    log_row_failure(
+                        failure_log_writer=failure_writer,
+                        input_row_identifier=index,
+                        company_name=company_name,
+                        given_url=given_url_original,
+                        stage_of_failure="URL_Validation_InvalidOrMissing",
+                        error_reason=f"Invalid or missing URL after processing: {processed_url}",
+                        log_timestamp=datetime.now().isoformat(),
+                        error_details=json.dumps({"original_url": given_url_original, "processed_url": processed_url})
+                    )
+                    stage_key = "URL_Validation_InvalidOrMissing"
+                    row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
                     rows_failed_in_pass1 +=1
                     continue
      
@@ -346,7 +379,7 @@ def main() -> None:
                 run_metrics["scraping_stats"]["urls_processed_for_scraping"] += 1
                 scrape_task_start_time = time.time()
                 scraped_pages_details, scraper_status, final_canonical_entry_url = asyncio.run(
-                    scrape_website(processed_url, run_output_dir, company_name, globally_processed_urls)
+                    scrape_website(processed_url, run_output_dir, company_name, globally_processed_urls, index)
                 )
                 run_metrics["tasks"].setdefault("scrape_website_total_duration_seconds", 0)
                 run_metrics["tasks"]["scrape_website_total_duration_seconds"] += (time.time() - scrape_task_start_time)
@@ -358,7 +391,7 @@ def main() -> None:
                 given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input" 
                 input_to_canonical_map[given_url_original_str_key] = true_base_domain_for_row
 
-                logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status: {current_row_scraper_status}, Pathful Canonical URL from Scraper: {final_canonical_entry_url}, True Base Domain: {true_base_domain_for_row}")
+                logger.info(f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log}: Scraper status: {current_row_scraper_status}, Pathful Canonical URL from Scraper: {final_canonical_entry_url}, True Base Domain: {true_base_domain_for_row}")
 
                 if current_row_scraper_status == "Success" and final_canonical_entry_url: 
                     if final_canonical_entry_url not in canonical_site_raw_llm_outputs: 
@@ -366,7 +399,7 @@ def main() -> None:
                         run_metrics["regex_extraction_stats"]["sites_processed_for_regex"] += 1
                         regex_extraction_task_start_time = time.time()
 
-                        logger.info(f"Processing new pathful canonical URL for LLM data collection: {final_canonical_entry_url} (from input {given_url_original})")
+                        logger.info(f"[RowID: {index}, Company: {company_name}] Processing new pathful canonical URL for LLM data collection: {final_canonical_entry_url} (from input {given_url_original})")
                         all_candidate_items_for_llm: List[Dict[str, str]] = []
                         if scraped_pages_details: 
                             run_metrics["scraping_stats"]["total_pages_scraped_overall"] += len(scraped_pages_details)
@@ -383,7 +416,7 @@ def main() -> None:
                                     if isinstance(parsed_eval, list):
                                         target_codes_list_for_regex = [str(item) for item in parsed_eval if isinstance(item, (str, int))]
                                 except (ValueError, SyntaxError):
-                                    logger.warning(f"Could not parse TargetCountryCodes string: {target_codes_raw} for {company_name}.")
+                                    logger.warning(f"[RowID: {index}, Company: {company_name}] Could not parse TargetCountryCodes string: {target_codes_raw}.")
                             elif isinstance(target_codes_raw, list):
                                 target_codes_list_for_regex = [str(item) for item in target_codes_raw if isinstance(item, (str, int))]
 
@@ -404,18 +437,33 @@ def main() -> None:
                                         )
                                         all_candidate_items_for_llm.extend(page_candidate_items)
                                     except Exception as file_read_exc:
-                                        logger.error(f"Error reading scraped page content {page_content_file} for {company_name} (canonical: {final_canonical_entry_url}): {file_read_exc}", exc_info=True)
+                                        logger.error(f"[RowID: {index}, Company: {company_name}] Error reading scraped page content {page_content_file} (canonical: {final_canonical_entry_url}): {file_read_exc}", exc_info=True)
                                         run_metrics["errors_encountered"].append(f"File read error for regex: {page_content_file}")
-                                        log_row_failure(failure_writer, index, "Regex_Extraction_FileRead", f"Error reading scraped content file {page_content_file} for canonical {final_canonical_entry_url}: {file_read_exc}")
+                                        log_row_failure(
+                                            failure_log_writer=failure_writer,
+                                            input_row_identifier=index,
+                                            company_name=company_name,
+                                            given_url=given_url_original,
+                                            stage_of_failure="Regex_Extraction_FileReadError",
+                                            error_reason="Error reading scraped content file",
+                                            log_timestamp=datetime.now().isoformat(),
+                                            error_details=json.dumps({
+                                                "file_path": page_content_file,
+                                                "canonical_url": final_canonical_entry_url,
+                                                "exception": str(file_read_exc)
+                                            })
+                                        )
+                                        stage_key = "Regex_Extraction_FileReadError"
+                                        row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
                                 else:
-                                    logger.warning(f"Scraped page content file not found: {page_content_file} for {company_name} (canonical: {final_canonical_entry_url})")
+                                    logger.warning(f"[RowID: {index}, Company: {company_name}] Scraped page content file not found: {page_content_file} (canonical: {final_canonical_entry_url})")
                             
                             run_metrics["tasks"].setdefault("regex_extraction_total_duration_seconds", 0)
                             run_metrics["tasks"]["regex_extraction_total_duration_seconds"] += (time.time() - regex_extraction_task_start_time)
                             if all_candidate_items_for_llm:
                                 run_metrics["regex_extraction_stats"]["sites_with_regex_candidates"] += 1
                                 run_metrics["regex_extraction_stats"]["total_regex_candidates_found"] += len(all_candidate_items_for_llm)
-                            logger.info(f"Generated {len(all_candidate_items_for_llm)} candidate items for LLM for canonical URL {final_canonical_entry_url} (triggered by input row {index}).")
+                            logger.info(f"[RowID: {index}, Company: {company_name}] Generated {len(all_candidate_items_for_llm)} candidate items for LLM for canonical URL {final_canonical_entry_url}.")
      
                         if all_candidate_items_for_llm:
                             run_metrics["llm_processing_stats"]["sites_processed_for_llm"] += 1
@@ -427,31 +475,47 @@ def main() -> None:
                                     prompt_template_abs_path = os.path.join(project_root_dir_local, prompt_template_abs_path)
 
                                 if not os.path.exists(prompt_template_abs_path):
-                                    logger.error(f"LLM prompt template file not found at {prompt_template_abs_path}. Cannot process pathful canonical URL {final_canonical_entry_url}.")
+                                    logger.error(f"[RowID: {index}, Company: {company_name}] LLM prompt template file not found at {prompt_template_abs_path}. Cannot process pathful canonical URL {final_canonical_entry_url}.")
                                     canonical_site_raw_llm_outputs[final_canonical_entry_url] = [] 
                                     canonical_site_pathful_scraper_status[final_canonical_entry_url] = "Error_LLM_PromptMissing"
                                     run_metrics["llm_processing_stats"]["llm_calls_failure_prompt_missing"] += 1
                                     run_metrics["errors_encountered"].append(f"LLM prompt template missing: {prompt_template_abs_path}")
-                                    log_row_failure(failure_writer, index, "LLM_Setup_PromptMissing", f"LLM prompt template missing for canonical {final_canonical_entry_url} (path: {prompt_template_abs_path})")
+                                    log_row_failure(
+                                        failure_log_writer=failure_writer,
+                                        input_row_identifier=index,
+                                        company_name=company_name,
+                                        given_url=given_url_original,
+                                        stage_of_failure="LLM_Setup_PromptTemplateMissing",
+                                        error_reason="LLM prompt template file not found",
+                                        log_timestamp=datetime.now().isoformat(),
+                                        error_details=json.dumps({
+                                            "canonical_url": final_canonical_entry_url,
+                                            "prompt_path": prompt_template_abs_path
+                                        })
+                                    )
+                                    stage_key = "LLM_Setup_PromptTemplateMissing"
+                                    row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
                                 else:
                                     safe_canonical_name_for_file = "".join(c if c.isalnum() else "_" for c in final_canonical_entry_url.replace("http://","").replace("https://",""))
                                     max_len_url_part = 100 
                                     if len(safe_canonical_name_for_file) > max_len_url_part:
                                         safe_canonical_name_for_file = safe_canonical_name_for_file[:max_len_url_part]
-                                        logger.info(f"Truncated safe_canonical_name_for_file for {final_canonical_entry_url} to: {safe_canonical_name_for_file}")
+                                        logger.info(f"[RowID: {index}, Company: {company_name}] Truncated safe_canonical_name_for_file for {final_canonical_entry_url} to: {safe_canonical_name_for_file}")
 
                                     llm_input_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_input_data.json"
                                     llm_input_filepath = os.path.join(llm_context_dir, llm_input_filename)
                                     try:
                                         with open(llm_input_filepath, 'w', encoding='utf-8') as f_in: json.dump(all_candidate_items_for_llm, f_in, indent=2)
-                                        logger.info(f"Saved LLM input data for {final_canonical_entry_url} to {llm_input_filepath}")
-                                    except IOError as e: logger.error(f"IOError saving LLM input data for {final_canonical_entry_url}: {e}")
+                                        logger.info(f"[RowID: {index}, Company: {company_name}] Saved LLM input data for {final_canonical_entry_url} to {llm_input_filepath}")
+                                    except IOError as e: logger.error(f"[RowID: {index}, Company: {company_name}] IOError saving LLM input data for {final_canonical_entry_url}: {e}")
 
                                     llm_classified_outputs, llm_raw_response, token_stats = llm_extractor.extract_phone_numbers(
                                         candidate_items=all_candidate_items_for_llm,
                                         prompt_template_path=prompt_template_abs_path,
                                         llm_context_dir=llm_context_dir,
-                                        file_identifier_prefix=f"CANONICAL_{safe_canonical_name_for_file}"
+                                        file_identifier_prefix=f"CANONICAL_{safe_canonical_name_for_file}",
+                                        triggering_input_row_id=index,
+                                        triggering_company_name=company_name
                                     )
                                     canonical_site_raw_llm_outputs[final_canonical_entry_url] = llm_classified_outputs
                                     canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status 
@@ -463,40 +527,55 @@ def main() -> None:
                                         run_metrics["llm_processing_stats"]["total_llm_prompt_tokens"] += token_stats.get("prompt_tokens", 0)
                                         run_metrics["llm_processing_stats"]["total_llm_completion_tokens"] += token_stats.get("completion_tokens", 0)
                                         run_metrics["llm_processing_stats"]["total_llm_tokens_overall"] += token_stats.get("total_tokens", 0)
-                                        logger.info(f"LLM call for {final_canonical_entry_url} token usage: Prompt={token_stats.get('prompt_tokens',0)}, Completion={token_stats.get('completion_tokens',0)}, Total={token_stats.get('total_tokens',0)}")
+                                        logger.info(f"[RowID: {index}, Company: {company_name}] LLM call for {final_canonical_entry_url} token usage: Prompt={token_stats.get('prompt_tokens',0)}, Completion={token_stats.get('completion_tokens',0)}, Total={token_stats.get('total_tokens',0)}")
                                     else:
-                                        logger.warning(f"Token stats not available for LLM call related to {final_canonical_entry_url}")
+                                        logger.warning(f"[RowID: {index}, Company: {company_name}] Token stats not available for LLM call related to {final_canonical_entry_url}")
                                     
                                     llm_raw_output_filename = f"CANONICAL_{safe_canonical_name_for_file}_llm_raw_output.json"
                                     llm_raw_output_filepath = os.path.join(llm_context_dir, llm_raw_output_filename)
-                                    logger.info(f"Attempting to save LLM raw output. Path: '{llm_raw_output_filepath}', Length: {len(llm_raw_output_filepath)}") 
+                                    logger.info(f"[RowID: {index}, Company: {company_name}] Attempting to save LLM raw output. Path: '{llm_raw_output_filepath}', Length: {len(llm_raw_output_filepath)}")
                                     try:
                                         with open(llm_raw_output_filepath, 'w', encoding='utf-8') as f_llm_out:
                                             f_llm_out.write(llm_raw_response if isinstance(llm_raw_response, str) else json.dumps(llm_raw_response or {}, indent=2))
-                                        logger.info(f"LLM classification for canonical {final_canonical_entry_url} complete. Raw output saved to {llm_raw_output_filepath}")
+                                        logger.info(f"[RowID: {index}, Company: {company_name}] LLM classification for canonical {final_canonical_entry_url} complete. Raw output saved to {llm_raw_output_filepath}")
                                     except IOError as e:
-                                        logger.error(f"IOError saving raw LLM output for {final_canonical_entry_url} to {llm_raw_output_filepath}: {e}")
+                                        logger.error(f"[RowID: {index}, Company: {company_name}] IOError saving raw LLM output for {final_canonical_entry_url} to {llm_raw_output_filepath}: {e}")
                                         run_metrics["errors_encountered"].append(f"IOError saving LLM raw output: {llm_raw_output_filepath}")
                             except Exception as llm_exc:
-                                logger.error(f"Error during LLM processing for pathful canonical {final_canonical_entry_url}: {llm_exc}", exc_info=True)
+                                logger.error(f"[RowID: {index}, Company: {company_name}] Error during LLM processing for pathful canonical {final_canonical_entry_url}: {llm_exc}", exc_info=True)
                                 canonical_site_raw_llm_outputs[final_canonical_entry_url] = []
                                 canonical_site_pathful_scraper_status[final_canonical_entry_url] = "Error_LLM_Processing"
                                 run_metrics["llm_processing_stats"]["llm_calls_failure_processing_error"] += 1
                                 run_metrics["errors_encountered"].append(f"LLM processing error for {final_canonical_entry_url}: {str(llm_exc)}")
-                                log_row_failure(failure_writer, index, "LLM_Processing_Error", f"LLM processing error for canonical {final_canonical_entry_url}: {llm_exc}")
+                                log_row_failure(
+                                    failure_log_writer=failure_writer,
+                                    input_row_identifier=index,
+                                    company_name=company_name,
+                                    given_url=given_url_original,
+                                    stage_of_failure="LLM_Processing_GeneralError",
+                                    error_reason="LLM processing error",
+                                    log_timestamp=datetime.now().isoformat(),
+                                    error_details=json.dumps({
+                                        "canonical_url": final_canonical_entry_url,
+                                        "exception_type": type(llm_exc).__name__,
+                                        "exception_message": str(llm_exc)
+                                    })
+                                )
+                                stage_key = "LLM_Processing_GeneralError"
+                                row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
 
-                            run_metrics["tasks"].setdefault("llm_extraction_total_duration_seconds", 0)
-                            run_metrics["tasks"]["llm_extraction_total_duration_seconds"] += (time.time() - llm_task_start_time)
-                        else: 
-                            logger.info(f"No candidate snippets for LLM from pathful canonical {final_canonical_entry_url}. Storing empty LLM result.")
+                                run_metrics["tasks"].setdefault("llm_extraction_total_duration_seconds", 0)
+                                run_metrics["tasks"]["llm_extraction_total_duration_seconds"] += (time.time() - llm_task_start_time)
+                        else: # Corresponds to 'if all_candidate_items_for_llm:'
+                            logger.info(f"[RowID: {index}, Company: {company_name}] No candidate snippets for LLM from pathful canonical {final_canonical_entry_url}. Storing empty LLM result.")
                             canonical_site_raw_llm_outputs[final_canonical_entry_url] = []
-                            canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status 
+                            canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status
                             run_metrics["llm_processing_stats"]["llm_no_candidates_to_process"] += 1
                     else: 
-                        logger.info(f"Raw LLM data for pathful canonical URL {final_canonical_entry_url} already cached. Input row {given_url_original} maps to it.")
+                        logger.info(f"[RowID: {index}, Company: {company_name}] Raw LLM data for pathful canonical URL {final_canonical_entry_url} already cached. Input row {given_url_original} maps to it.")
                 
                 elif current_row_scraper_status != "Success": 
-                    logger.info(f"Row {current_row_number_for_log} ({company_name}): Scraper status '{current_row_scraper_status}'. No LLM processing for this input.")
+                    logger.info(f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log}: Scraper status '{current_row_scraper_status}'. No LLM processing for this input.")
                     if "Already_Processed" in current_row_scraper_status:
                         run_metrics["scraping_stats"]["scraping_failure_already_processed"] += 1
                     elif "InvalidURL" not in current_row_scraper_status : 
@@ -506,24 +585,52 @@ def main() -> None:
                         canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status
                     df.at[index, 'Overall_VerificationStatus'] = f'Unverified_Scrape_{current_row_scraper_status}'
                     df.at[index, 'Original_Number_Status'] = f'Scrape_{current_row_scraper_status}' if row.get('NormalizedGivenPhoneNumber') else 'Original_Not_Provided'
-                    log_row_failure(failure_writer, index, "Scraping", f"Scraper status: {current_row_scraper_status}, PathfulCanonicalURL: {final_canonical_entry_url}, TrueBaseDomain: {true_base_domain_for_row}")
+                    log_row_failure(
+                        failure_log_writer=failure_writer,
+                        input_row_identifier=index,
+                        company_name=company_name,
+                        given_url=given_url_original,
+                        stage_of_failure=f"Scraping_{current_row_scraper_status}",
+                        error_reason=f"Scraper returned status: {current_row_scraper_status}",
+                        log_timestamp=datetime.now().isoformat(),
+                        error_details=json.dumps({
+                            "pathful_canonical_url": final_canonical_entry_url,
+                            "true_base_domain": true_base_domain_for_row
+                        })
+                    )
+                    stage_key = f"Scraping_{current_row_scraper_status}"
+                    row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
                     rows_failed_in_pass1 +=1
-                
+    
                 if current_row_scraper_status == "Success":
-                     run_metrics["scraping_stats"]["scraping_success"] += 1
-                logger.info(f"Row {current_row_number_for_log} ({company_name}): Pass 1 processing complete. OriginalURL: {given_url_original_str_key}, CanonicalURL: {final_canonical_entry_url}, ScraperStatus: {current_row_scraper_status}")
+                    run_metrics["scraping_stats"]["scraping_success"] += 1
+                logger.info(f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log}: Pass 1 processing complete. OriginalURL: {given_url_original_str_key}, CanonicalURL: {final_canonical_entry_url}, ScraperStatus: {current_row_scraper_status}")
 
             except Exception as e:
-                logger.error(f"Error during Pass 1 processing for row {current_row_number_for_log} ({company_name}), Original URL {given_url_original_str_key}: {e}", exc_info=True)
+                logger.error(f"[RowID: {index}, Company: {company_name}] Error during Pass 1 processing for row {current_row_number_for_log}, Original URL {given_url_original_str_key}: {e}", exc_info=True)
                 df.at[index, 'Overall_VerificationStatus'] = 'Error_Pass1_RowProcessing'
                 current_scraper_status_for_df = df.at[index, 'ScrapingStatus'] 
                 if current_scraper_status_for_df in ["Not_Run", "Success", None] or not current_scraper_status_for_df : 
                      df.at[index, 'ScrapingStatus'] = f'PipelineError_{type(e).__name__}'
                 run_metrics["errors_encountered"].append(f"Pass 1 row processing error for {company_name} (URL: {given_url_original_str_key}): {str(e)}")
-                log_row_failure(failure_writer, index, "Row_Processing_Exception_Pass1", f"Unhandled exception: {e}")
+                log_row_failure(
+                    failure_log_writer=failure_writer,
+                    input_row_identifier=index,
+                    company_name=company_name,
+                    given_url=given_url_original,
+                    stage_of_failure="RowProcessing_Pass1_UnhandledException",
+                    error_reason="Unhandled exception during Pass 1 row processing",
+                    log_timestamp=datetime.now().isoformat(),
+                    error_details=json.dumps({
+                        "exception_type": type(e).__name__,
+                        "exception_message": str(e)
+                    })
+                )
+                stage_key = "RowProcessing_Pass1_UnhandledException"
+                row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
                 rows_failed_in_pass1 +=1
                 logger.error(
-                    f"Row {current_row_number_for_log} ({company_name}) errored in Pass 1. "
+                    f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log} errored in Pass 1. "
                     f"ScraperStatus='{df.at[index, 'ScrapingStatus']}', "
                     f"OverallVerificationStatus='{df.at[index, 'Overall_VerificationStatus']}'"
                 )
@@ -538,6 +645,7 @@ def main() -> None:
     run_metrics["tasks"]["pass1_main_loop_duration_seconds"] = time.time() - pass1_loop_start_time
     run_metrics["data_processing_stats"]["rows_successfully_processed_pass1"] = rows_processed_in_pass1 - rows_failed_in_pass1
     run_metrics["data_processing_stats"]["rows_failed_pass1"] = rows_failed_in_pass1
+    run_metrics["data_processing_stats"]["row_level_failure_summary"] = row_level_failure_counts # Store the collected counts
     logger.info(f"Pass 1 (Scraping and Raw LLM Data Collection) complete. Processed {rows_processed_in_pass1} input rows.")
     logger.info(f"Unique pathful canonical sites for which raw LLM data was collected: {len(canonical_site_raw_llm_outputs)}")
     logger.debug(f"Pathful canonical site raw LLM data cache keys: {list(canonical_site_raw_llm_outputs.keys())}")
@@ -836,23 +944,65 @@ def main() -> None:
             df.at[index, 'Original_Number_Status'] = 'Original_InvalidFormat'
         else: 
             df.at[index, 'Original_Number_Status'] = 'Original_Not_Provided'
+            if df.at[index, 'Original_Number_Status'] == 'LLM_Not_Run_Or_NoOutput_For_Canonical' and canonical_url_summary:
+                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
+                specific_reasons = [
+                    f"{pathful_url}: {canonical_site_pathful_scraper_status.get(pathful_url, 'Status_Unknown')}"
+                    for pathful_url in pathful_urls_for_true_base
+                ]
+                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Original_Number_Status set to LLM_Not_Run_Or_NoOutput_For_Canonical for true_base '{canonical_url_summary}'. Contributing pathful statuses: {'; '.join(specific_reasons) if specific_reasons else 'No specific pathful statuses found.'}")
+            elif df.at[index, 'Original_Number_Status'] == 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' and canonical_url_summary:
+                all_raw_llm_empty_for_base = True
+                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
+                if not pathful_urls_for_true_base: # No pathful URLs means no LLM data could have been fetched
+                     all_raw_llm_empty_for_base = True # Treat as if LLM returned nothing
+                else:
+                    for pathful_url in pathful_urls_for_true_base:
+                        if canonical_site_raw_llm_outputs.get(pathful_url): # If any pathful URL had non-empty raw output
+                            all_raw_llm_empty_for_base = False
+                            break
+                reason_for_empty = "LLM returned no raw candidates for any constituent pathful URLs." if all_raw_llm_empty_for_base else "LLM returned raw candidates, but all were filtered out by data_handler or other post-processing."
+                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Original_Number_Status set to LLM_OutputEmpty_Or_NoRelevant_For_Canonical for true_base '{canonical_url_summary}'. Reason: {reason_for_empty}")
 
-        overall_status = "Unverified" 
+        overall_status = "Unverified"
         scraper_status_for_true_base_domain_summary = true_base_scraper_status.get(str(canonical_url_summary), "Unknown") if canonical_url_summary else "Unknown_NoTrueBase"
 
         if scraper_status_for_true_base_domain_summary != "Success":
             overall_status = f"Unverified_Scrape_{scraper_status_for_true_base_domain_summary}"
-        elif unique_sorted_consolidated_numbers: 
+            if canonical_url_summary: # Log for scrape failures affecting canonical
+                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
+                specific_reasons = [
+                    f"{pathful_url}: {canonical_site_pathful_scraper_status.get(pathful_url, 'Status_Unknown')}"
+                    for pathful_url in pathful_urls_for_true_base
+                ]
+                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. Contributing pathful statuses: {'; '.join(specific_reasons) if specific_reasons else 'No specific pathful statuses found.'}")
+        elif unique_sorted_consolidated_numbers:
             overall_status = "Verified_LLM_Match_Found"
-        elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers: 
+        elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers:
             overall_status = "Unverified_LLM_NoRelevantNumbers"
+            if canonical_url_summary: # Log for LLM_OutputEmpty_Or_NoRelevant
+                all_raw_llm_empty_for_base = True
+                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
+                if not pathful_urls_for_true_base:
+                    all_raw_llm_empty_for_base = True
+                else:
+                    for pathful_url in pathful_urls_for_true_base:
+                        if canonical_site_raw_llm_outputs.get(pathful_url):
+                            all_raw_llm_empty_for_base = False
+                            break
+                reason_for_empty = "LLM returned no raw candidates for any constituent pathful URLs." if all_raw_llm_empty_for_base else "LLM returned raw candidates, but all were filtered out by data_handler or other post-processing."
+                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. Reason: {reason_for_empty}")
         elif scraper_status_for_true_base_domain_summary == "Error_LLM_Processing":
             overall_status = "Error_LLM_Processing_For_Canonical"
+            if canonical_url_summary:
+                 logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. Check LLM processing logs for this canonical.")
         elif scraper_status_for_true_base_domain_summary == "Error_LLM_PromptMissing":
             overall_status = "Error_LLM_PromptMissing_For_Canonical"
+            if canonical_url_summary:
+                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. LLM prompt template was missing.")
         
         original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
-        true_base_domain_from_map = input_to_canonical_map.get(original_input_url_for_map) 
+        true_base_domain_from_map = input_to_canonical_map.get(original_input_url_for_map)
 
         normalized_original_input_base = get_canonical_base_url(original_input_url_for_map, log_level_for_non_domain_input=logging.INFO) if original_input_url_for_map != "None_GivenURL_Input" else None
         
@@ -1081,7 +1231,7 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
             stats = metrics.get("data_processing_stats", {})
             f.write(f"- **Input Rows Processed (Initial Load):** {stats.get('input_rows_count', 0)}\n")
             f.write(f"- **Rows Successfully Processed (Pass 1):** {stats.get('rows_successfully_processed_pass1', 0)}\n")
-            f.write(f"- **Rows Failed During Processing (Pass 1):** {stats.get('rows_failed_pass1', 0)}\n")
+            f.write(f"- **Rows Failed During Processing (Pass 1):** {stats.get('rows_failed_pass1', 0)} (Input rows that did not complete Pass 1 successfully due to errors such as invalid URL, scraping failure, or critical processing exceptions for that row, preventing LLM processing or final data consolidation for that specific input.)\n")
             f.write(f"- **Unique True Base Domains Consolidated:** {stats.get('unique_true_base_domains_consolidated', 0)}\n\n")
 
 
@@ -1148,13 +1298,55 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
             f.write(f"- **Detailed Report Rows Created:** {stats.get('detailed_report_rows', 0)}\n")
             f.write(f"- **Summary Report Rows Created:** {stats.get('summary_report_rows', 0)}\n")
             f.write(f"- **Tertiary Report Rows Created:** {stats.get('tertiary_report_rows', 0)}\n\n")
+
+            f.write("## Summary of Row-Level Failures (from `failed_rows_{run_id}.csv`):\n")
+            row_failures_summary = metrics.get("data_processing_stats", {}).get("row_level_failure_summary", {})
+
+            if row_failures_summary:
+                grouped_failures: Dict[str, Dict[str, Any]] = {
+                    "Scraping": {"total": 0, "details": {}},
+                    "LLM": {"total": 0, "details": {}},
+                    "URL Validation": {"total": 0, "details": {}},
+                    "Regex Extraction": {"total": 0, "details": {}},
+                    "Row Processing": {"total": 0, "details": {}},
+                    "Other": {"total": 0, "details": {}}
+                }
+                failure_category_map: Dict[str, str] = {
+                    "Scraping_": "Scraping",
+                    "LLM_": "LLM",
+                    "URL_Validation_": "URL Validation",
+                    "Regex_Extraction_": "Regex Extraction",
+                    "RowProcessing_": "Row Processing"
+                }
+
+                for stage, count in sorted(row_failures_summary.items()):
+                    matched_category = False
+                    for prefix, category_name in failure_category_map.items():
+                        if stage.startswith(prefix):
+                            grouped_failures[category_name]["total"] += count
+                            grouped_failures[category_name]["details"][stage] = count
+                            matched_category = True
+                            break
+                    if not matched_category:
+                        grouped_failures["Other"]["total"] += count
+                        grouped_failures["Other"]["details"][stage] = count
+
+                for category_name, data in grouped_failures.items():
+                    if data["total"] > 0:
+                        f.write(f"- **Total {category_name} Failures:** {data['total']}\n")
+                        for stage, count in sorted(data["details"].items()):
+                            f.write(f"  - *{stage.replace('_', ' ').title()}:* {count}\n")
+                f.write("\n")
+            else:
+                f.write("- No row-level failures recorded with specific stages.\n")
+            f.write("\n")
             
-            f.write("## Errors Encountered During Pipeline:\n")
+            f.write("## Global Pipeline Errors:\n") # Renamed section
             if metrics.get("errors_encountered"):
                 for error_msg in metrics["errors_encountered"]:
                     f.write(f"- {error_msg}\n")
             else:
-                f.write("- No significant errors recorded.\n")
+                f.write("- No significant global pipeline errors recorded.\n")
             f.write("\n")
 
         logger.info(f"Run metrics successfully written to {metrics_file_path}")
