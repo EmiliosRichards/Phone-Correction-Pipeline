@@ -1,3 +1,5 @@
+Step one for tomorrow/today test issue 2 and merge, finish issue 3 and merge, modulize the project, continue with additional tasks. issue 4? then phase two? think about benchmarks
+
 PHASE 1 --------------
 
 Enable header selection and working with the range config. // 
@@ -6,7 +8,7 @@ Test 2.5 Flash - 1.5 Flash - // 1.5 flash almost identical. //
 
 Check the logs for failures and improve.
 
-Add a final deliverable report for kevin Company name, URL, Number, Number Type, Note/Additional-info, number-found-at, Description?
+Add a final deliverable report for kevin Company name, URL, Number, Number Type, Note/Additional-info, number-found-at, Description? //
 
 And metadata logging, Time spent, Accuracy etc - look at old system reports for ideas. 
 
@@ -19,6 +21,8 @@ Can we benchmark accuracy and compare
 Setup system on contabo, check usage and see how much it costs. 
 
 Add the upgrade? Big Enancement chat.  
+
+Should we increase the snippet char size? avaraging 3000 tokens per api call (costs approx. 0.0005 dollars) 10000 api calls = 5 usd
 
 PHASE 2 ----------------------
 
