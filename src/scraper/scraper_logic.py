@@ -242,12 +242,49 @@ async def is_allowed_by_robots(url: str, client: httpx.AsyncClient) -> bool:
         logger.debug(f"Scraping allowed by robots.txt for URL: {url}")
     return allowed
 
+def _classify_page_type(url_str: str, config: AppConfig) -> str:
+    """Classifies a URL based on keywords in its path."""
+    if not url_str:
+        return "unknown"
+    
+    url_lower = url_str.lower()
+    # Check for specific page types based on keywords in URL path
+    # Order matters if keywords overlap; more specific should come first if necessary.
+    # For now, assuming simple first-match.
+    
+    # Path-based classification
+    parsed_url = urlparse(url_lower)
+    path_lower = parsed_url.path
+
+    if any(kw in path_lower for kw in config.page_type_keywords_contact):
+        return "contact"
+    if any(kw in path_lower for kw in config.page_type_keywords_imprint):
+        return "imprint"
+    if any(kw in path_lower for kw in config.page_type_keywords_legal):
+        return "legal"
+    
+    # Fallback if no path keywords match, check full URL for very generic terms
+    # (less reliable, path is usually better indicator)
+    if any(kw in url_lower for kw in config.page_type_keywords_contact): # broader check on full URL
+        return "contact"
+    if any(kw in url_lower for kw in config.page_type_keywords_imprint):
+        return "imprint"
+    if any(kw in url_lower for kw in config.page_type_keywords_legal):
+        return "legal"
+
+    # If it's just the base domain (e.g., http://example.com or http://example.com/)
+    if not path_lower or path_lower == '/':
+        return "homepage" # Could be a specific type or general_content
+
+    return "general_content"
+
+
 async def scrape_website(
     given_url: str,
     output_dir_for_run: str,
     company_name_or_id: str,
     globally_processed_urls: Set[str]
-) -> Tuple[List[Tuple[str, str]], str, Optional[str]]:
+) -> Tuple[List[Tuple[str, str, str]], str, Optional[str]]: # Modified return type
     start_time = time.time()
     final_canonical_entry_url: Optional[str] = None
     pages_scraped_for_this_domain_count = 0
@@ -276,7 +313,7 @@ async def scrape_website(
         max_len=config_instance.filename_company_name_max_len
     )
  
-    scraped_page_details: List[Tuple[str, str]] = []
+    scraped_page_details: List[Tuple[str, str, str]] = [] # Modified type
     
     # Queue stores: (url_string, depth_int, score_int)
     # Initial URL gets a high score (e.g., 100) to ensure it's processed first.
@@ -352,15 +389,36 @@ async def scrape_website(
                     processed_urls_this_call.add(final_landed_url_normalized)
 
                     cleaned_text = extract_text_from_html(html_content)
+                    # --- NEW LOGIC START ---
+                    # Derive source directory from the landed URL's domain
+                    parsed_landed_url = urlparse(final_landed_url_normalized)
+                    source_domain = parsed_landed_url.netloc
+                    # Sanitize the domain to be a safe directory name
+                    # Remove www. and replace non-alphanumeric characters (except . and -) with _
+                    safe_source_name = re.sub(r'^www\.', '', source_domain)
+                    safe_source_name = re.sub(r'[^\w.-]', '_', safe_source_name)
+                    
+                    # Create the source-specific directory path
+                    # cleaned_pages_storage_dir is already defined as os.path.join(base_scraped_content_dir, "cleaned_pages_text")
+                    source_specific_output_dir = os.path.join(cleaned_pages_storage_dir, safe_source_name)
+                    
+                    # Ensure the source-specific directory exists
+                    os.makedirs(source_specific_output_dir, exist_ok=True)
+                    logger.debug(f"Ensured source-specific directory exists: {source_specific_output_dir}")
+                    # --- NEW LOGIC END ---
+
                     landed_url_safe_name = get_safe_filename(final_landed_url_normalized, for_url=True)
                     cleaned_page_filename = f"{company_safe_name}__{landed_url_safe_name}_cleaned.txt"
-                    cleaned_page_filepath = os.path.join(cleaned_pages_storage_dir, cleaned_page_filename)
+                    # Update filepath to use the new source_specific_output_dir
+                    cleaned_page_filepath = os.path.join(source_specific_output_dir, cleaned_page_filename)
                     logger.info(f"DEBUG PATH: Attempting to save cleaned page. Path: '{cleaned_page_filepath}', Length: {len(cleaned_page_filepath)}") # DEBUG PATH LENGTH
                     try:
                         with open(cleaned_page_filepath, 'w', encoding='utf-8') as f_cleaned_page:
                             f_cleaned_page.write(cleaned_text)
                         logger.info(f"Saved cleaned text from '{final_landed_url_normalized}' (requested as '{current_url_from_queue}') to {cleaned_page_filepath}")
-                        scraped_page_details.append((cleaned_page_filepath, final_landed_url_normalized))
+                        page_type = _classify_page_type(final_landed_url_normalized, config_instance)
+                        scraped_page_details.append((cleaned_page_filepath, final_landed_url_normalized, page_type))
+                        logger.info(f"Classified '{final_landed_url_normalized}' as page type: {page_type}")
                     except IOError as e:
                         logger.error(f"IOError saving cleaned text for '{final_landed_url_normalized}' to {cleaned_page_filepath}: {e}")
 
@@ -459,17 +517,19 @@ async def _test_scraper():
     # Initialize a new set for globally_processed_urls for this test run
     globally_processed_urls_for_test: Set[str] = set()
 
-    scraped_items, status, canonical_url = await scrape_website(
-       test_url, 
+    # Adjust to expect three values from scrape_website
+    scraped_items_with_type, status, canonical_url = await scrape_website(
+       test_url,
        test_run_output_dir, # This is the base for the run, scrape_website will make subdirs
-       "example_company_test", 
+       "example_company_test",
        globally_processed_urls_for_test
     )
 
-    if scraped_items:
-        logger.info(f"Test successful: {len(scraped_items)} page(s) scraped. Status: {status}. Canonical URL: {canonical_url}")
-        for item_path, source_url in scraped_items:
-            logger.info(f"  - Saved: {item_path} (from: {source_url})")
+    if scraped_items_with_type:
+        logger.info(f"Test successful: {len(scraped_items_with_type)} page(s) scraped. Status: {status}. Canonical URL: {canonical_url}")
+        # Adjust loop to handle the new tuple structure (path, url, type)
+        for item_path, source_url, page_type in scraped_items_with_type:
+            logger.info(f"  - Saved: {item_path} (from: {source_url}, type: {page_type})")
     else:
         logger.error(f"Test failed: Status: {status}. Canonical URL: {canonical_url}")
 

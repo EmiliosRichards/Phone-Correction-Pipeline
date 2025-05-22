@@ -84,6 +84,10 @@ class AppConfig:
         log_level (str): Logging level for the file log (e.g., INFO, DEBUG).
         console_log_level (str): Logging level for console output (e.g., WARNING, INFO).
 
+        page_type_keywords_contact (List[str]): Keywords to identify 'contact' pages.
+        page_type_keywords_imprint (List[str]): Keywords to identify 'imprint' pages.
+        page_type_keywords_legal (List[str]): Keywords to identify 'legal' pages.
+
     Methods:
         __init__(): Initializes the AppConfig instance by loading values from
                     environment variables or using defaults.
@@ -208,6 +212,16 @@ class AppConfig:
         # --- Logging Configuration ---
         self.log_level: str = os.getenv('LOG_LEVEL', 'INFO').upper()
         self.console_log_level: str = os.getenv('CONSOLE_LOG_LEVEL', 'WARNING').upper()
+
+        # --- Page Type Classification Keywords ---
+        page_type_contact_str: str = os.getenv('PAGE_TYPE_KEYWORDS_CONTACT', 'contact,kontakt,ansprechpartner')
+        self.page_type_keywords_contact: List[str] = [kw.strip().lower() for kw in page_type_contact_str.split(',') if kw.strip()]
+
+        page_type_imprint_str: str = os.getenv('PAGE_TYPE_KEYWORDS_IMPRINT', 'imprint,impressum,legal-notice,legalnotice')
+        self.page_type_keywords_imprint: List[str] = [kw.strip().lower() for kw in page_type_imprint_str.split(',') if kw.strip()]
+
+        page_type_legal_str: str = os.getenv('PAGE_TYPE_KEYWORDS_LEGAL', 'privacy,datenschutz,terms,agb,legal')
+        self.page_type_keywords_legal: List[str] = [kw.strip().lower() for kw in page_type_legal_str.split(',') if kw.strip()]
 
 
 # For direct execution testing of this config file
