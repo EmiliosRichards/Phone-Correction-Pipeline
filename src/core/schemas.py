@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 class PhoneNumberLLMOutput(BaseModel):
@@ -27,12 +27,14 @@ class PhoneNumberLLMOutput(BaseModel):
     source_url: Optional[str] = Field(default=None, description="The source URL from which the number was originally found.")
     original_input_company_name: Optional[str] = Field(default=None, description="Original input company name for this source.")
 
-class LLMExtractionResult(BaseModel):
+class MinimalExtractionOutput(BaseModel):
     """
-    Defines the structure for the overall list of phone numbers extracted by the LLM.
+    Defines the structure for the overall list of phone numbers extracted by the LLM,
+    representing a minimal enrichment profile (Profile 1).
 
     This Pydantic model is primarily used when the LLM is expected to return a
-    JSON object containing a list of phone number details.
+    JSON object containing a list of phone number details. It reflects the
+    original behavior of extracting phone numbers with minimal enrichment.
 
     Attributes:
         extracted_numbers (List[PhoneNumberLLMOutput]): A list where each item is an
@@ -40,6 +42,32 @@ class LLMExtractionResult(BaseModel):
                                                        representing an extracted phone number.
     """
     extracted_numbers: List[PhoneNumberLLMOutput] = Field(description="A list of phone numbers extracted by the LLM.")
+
+class AdditionalInformation(BaseModel):
+    """
+    Represents a piece of additional information, potentially tied to a phone number,
+    extracted during an enriched profiling process. This supports the 'additional_info'
+    field for Profile 2.
+    """
+    info_type: str = Field(description="Type of information (e.g., 'email', 'name', 'role', 'department', 'location').")
+    value: Any = Field(description="The actual information content. Can be a string, list, or dict depending on info_type for flexibility.")
+    associated_number: Optional[str] = Field(default=None, description="The phone number (ideally E.164) this information is associated with, if any.")
+    source_context: Optional[str] = Field(default=None, description="Brief context or source snippet where this info was found, aiding traceability.")
+    confidence: Optional[float] = Field(default=None, ge=0, le=1, description="Confidence score for this specific piece of information, if available.")
+
+class EnrichedExtractionOutput(BaseModel):
+    """
+    Defines the structure for an enriched extraction output (Profile 2),
+    including phone numbers, additional contact details, and potentially a summary.
+    This schema is designed with an "LLM assessment-first mindset", providing
+    structured and traceable information.
+    """
+    extracted_numbers: List[PhoneNumberLLMOutput] = Field(description="A list of phone numbers extracted by the LLM, similar to MinimalExtractionOutput.")
+    additional_info: Optional[List[AdditionalInformation]] = Field(default_factory=list, description="A list of additional structured information items like emails, names, roles.")
+    homepage_summary: Optional[str] = Field(default=None, description="A brief summary of the homepage content, relevant for summarization tasks linked to Profile 2.")
+    overall_confidence: Optional[float] = Field(default=None, ge=0, le=1, description="Overall confidence score for the entire enriched extraction process and its output.")
+    processing_notes: Optional[List[str]] = Field(default_factory=list, description="Notes generated during the enrichment process (e.g., warnings, steps taken, LLM reasoning snippets).")
+    raw_source_text_snippet: Optional[str] = Field(default=None, description="A snippet of the raw text from which the primary information was extracted, for traceability and assessment.")
 
 
 class ConsolidatedPhoneNumberSource(BaseModel):
