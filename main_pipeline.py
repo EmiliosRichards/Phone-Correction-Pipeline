@@ -22,8 +22,11 @@ import socket # Added for TLD probing
 import phonenumbers
 from phonenumbers import NumberParseException
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv # ADDED
 
-TARGET_COUNTRY_CODES_INT: Set[int] = {49, 41, 43} 
+load_dotenv() # ADDED
+
+TARGET_COUNTRY_CODES_INT: Set[int] = {49, 41, 43}
 EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT: Set[str] = {
     'Unknown', 'Fax', 'Mobile', 'Date', 'ID' 
 }
@@ -812,11 +815,29 @@ def main() -> None:
                                         page_candidate_items: List[Dict[str, str]] = extract_numbers_with_snippets_from_text(
                                             text_content=text_content,
                                             source_url=source_page_url,
-                                            original_input_company_name=company_name, 
+                                            original_input_company_name=company_name,
                                             target_country_codes=target_codes_list_for_regex,
                                             snippet_window_chars=app_config.snippet_window_chars
                                         )
-                                        all_candidate_items_for_llm.extend(page_candidate_items)
+
+                                        # Filter page_candidate_items: if a number is repeated > 3 times from this page, only keep first 3
+                                        filtered_page_candidates: List[Dict[str, str]] = []
+                                        number_counts_on_page: Dict[str, int] = Counter()
+                                        for candidate in page_candidate_items:
+                                            number_str = candidate.get('number') # CORRECTED KEY
+                                            if number_str: # Ensure 'number' exists
+                                                if number_counts_on_page[number_str] < app_config.max_identical_numbers_per_page_to_llm:
+                                                    filtered_page_candidates.append(candidate)
+                                                    number_counts_on_page[number_str] += 1
+                                                else:
+                                                    logger.debug(f"[RowID: {index}, Company: {company_name}] Skipping duplicate candidate number '{number_str}' from page '{source_page_url}' (already have {app_config.max_identical_numbers_per_page_to_llm} instances).")
+                                            else: # Should not happen if regex_extractor works as expected
+                                                filtered_page_candidates.append(candidate) # Keep if no number_str key
+                                        
+                                        if len(page_candidate_items) != len(filtered_page_candidates):
+                                            logger.info(f"[RowID: {index}, Company: {company_name}] Filtered regex candidates for page '{source_page_url}'. Original: {len(page_candidate_items)}, Filtered: {len(filtered_page_candidates)}")
+
+                                        all_candidate_items_for_llm.extend(filtered_page_candidates)
                                     except Exception as file_read_exc:
                                         logger.error(f"[RowID: {index}, Company: {company_name}] Error reading scraped page content {page_content_file} (canonical: {final_canonical_entry_url}): {file_read_exc}", exc_info=True)
                                         run_metrics["errors_encountered"].append(f"File read error for regex: {page_content_file}")

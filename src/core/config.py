@@ -91,6 +91,7 @@ class AppConfig:
         page_type_keywords_contact (List[str]): Keywords to identify 'contact' pages.
         page_type_keywords_imprint (List[str]): Keywords to identify 'imprint' pages.
         page_type_keywords_legal (List[str]): Keywords to identify 'legal' pages.
+        max_identical_numbers_per_page_to_llm (int): Maximum occurrences of an identical phone number string from a single page to send to the LLM.
 
     Methods:
         __init__(): Initializes the AppConfig instance by loading values from
@@ -234,6 +235,9 @@ class AppConfig:
 
         page_type_legal_str: str = os.getenv('PAGE_TYPE_KEYWORDS_LEGAL', 'privacy,datenschutz,terms,agb,legal')
         self.page_type_keywords_legal: List[str] = [kw.strip().lower() for kw in page_type_legal_str.split(',') if kw.strip()]
+
+        # --- Regex Candidate Filtering ---
+        self.max_identical_numbers_per_page_to_llm: int = int(os.getenv('MAX_IDENTICAL_NUMBERS_PER_PAGE_TO_LLM', '3'))
 
 
 # For direct execution testing of this config file
