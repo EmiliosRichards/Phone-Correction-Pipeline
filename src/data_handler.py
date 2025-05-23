@@ -2,11 +2,13 @@ import pandas as pd
 import phonenumbers
 import logging
 import uuid # For RunID
-from typing import Optional, List, Dict, Any, Union # Added List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Iterable # Added Iterable
 from urllib.parse import urlparse, urlunparse # Added for URL parsing
 import os # Added for os.path.exists and os.makedirs
 import re # For new helper functions
 from openpyxl.utils import get_column_letter # For auto-sizing columns
+from openpyxl import load_workbook # Added for smart Excel reading
+import csv # Added for smart CSV reading
 
 # Import AppConfig directly. Its __init__ handles .env loading.
 # If this import fails, it's a critical setup error for the application.
@@ -76,111 +78,195 @@ def get_canonical_base_url(url_string: str, log_level_for_non_domain_input: int 
         logger.error(f"Error parsing URL '{url_string}' to get base URL: {e}", exc_info=True)
         return None
 
+def _is_row_empty(row_values: Iterable) -> bool:
+    """Checks if all values in a row are None, empty string, or whitespace-only."""
+    if not row_values: # Handles case where row_values itself might be None or an empty list/tuple
+        return True
+    return all(pd.isna(value) or (isinstance(value, str) and not value.strip()) for value in row_values)
 
 def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppConfig] = None) -> pd.DataFrame | None:
     """
     Loads data from a CSV or Excel file, standardizes column names, initializes
     new columns required for the pipeline, and applies initial normalization
-    to any existing phone numbers.
-
-    The function expects input files to potentially have German column names
-    like "Unternehmen", "Webseite", "Telefonnummer", which are mapped to
-    "CompanyName", "GivenURL", "GivenPhoneNumber" respectively. It also
-    initializes several other columns (e.g., "ScrapingStatus", "RunID")
-    to prepare the DataFrame for processing by subsequent pipeline stages.
-
-    Args:
-        file_path (str): The path to the input CSV or Excel file.
-
-    Returns:
-        pd.DataFrame | None: A pandas DataFrame containing the preprocessed data
-        if successful, ready for the pipeline. Returns None if file loading
-        or essential preprocessing fails (e.g., file not found, unsupported format,
-        empty file).
-
-    Raises:
-        Prints error messages to logger for specific exceptions like
-        FileNotFoundError, pd.errors.EmptyDataError, or other general exceptions
-        during file processing, and returns None in these cases.
+    to any existing phone numbers. Implements smart reading for open-ended ranges
+    to stop after a configured number of consecutive empty rows.
     """
-    current_config_instance: AppConfig # Declare type for the instance we'll use
+    current_config_instance: AppConfig
     if app_config_instance:
         current_config_instance = app_config_instance
     else:
-        current_config_instance = AppConfig() # Create a new instance if none was passed
-    
-    # Determine skiprows and nrows from config
+        current_config_instance = AppConfig()
+
     skip_rows_val: Optional[int] = None
     nrows_val: Optional[int] = None
+    consecutive_empty_rows_to_stop: int = 3 # Default, will be overridden by config
 
     if hasattr(current_config_instance, 'skip_rows_config'):
         skip_rows_val = current_config_instance.skip_rows_config
     if hasattr(current_config_instance, 'nrows_config'):
         nrows_val = current_config_instance.nrows_config
+    if hasattr(current_config_instance, 'consecutive_empty_rows_to_stop'):
+        consecutive_empty_rows_to_stop = current_config_instance.consecutive_empty_rows_to_stop
 
     log_message_parts = []
     if skip_rows_val is not None:
-        log_message_parts.append(f"skipping {skip_rows_val} rows")
+        log_message_parts.append(f"skipping {skip_rows_val} data rows (0-indexed)")
     if nrows_val is not None:
-        log_message_parts.append(f"reading {nrows_val} rows")
+        log_message_parts.append(f"reading {nrows_val} data rows")
     
+    smart_read_active = (nrows_val is None and consecutive_empty_rows_to_stop > 0)
+    if smart_read_active:
+        log_message_parts.append(f"smart read active (stop after {consecutive_empty_rows_to_stop} empty rows)")
+
     if log_message_parts:
         logger.info(f"Data loading configuration: {', '.join(log_message_parts)}.")
     else:
-        logger.info("No specific row range configured; loading all rows.")
+        logger.info("No specific row range configured; loading all rows (or smart read if enabled).")
 
-    # Determine the correct skiprows argument for pandas
-    # skip_rows_val is the number of 0-indexed *data* rows to skip after the header.
-    # If skip_rows_val is k > 0, we need to skip file lines 1 through k (0-indexed).
-    # If skip_rows_val is 0, pandas skiprows=0 (with header=0) works.
-    # If skip_rows_val is None, pandas skiprows=None (with header=0) works.
-    pandas_skiprows_arg: Union[int, List[int]] # Type hint updated
+    # pandas_skiprows_arg is for when not using smart read or for initial skip in some smart read scenarios
+    pandas_skiprows_arg: Union[int, List[int]]
     if skip_rows_val is not None and skip_rows_val > 0:
-        # Create a list of 0-indexed file line numbers to skip.
-        # These are the data rows immediately following the header (file line 0).
-        # e.g., if skip_rows_val is 4 (skip 4 data rows), we skip file lines 1, 2, 3, 4.
-        pandas_skiprows_arg = list(range(1, skip_rows_val + 1))
+        pandas_skiprows_arg = list(range(1, skip_rows_val + 1)) # Skips file lines 1 to skip_rows_val
     else:
-        # If skip_rows_val is None (process all rows) or 0 (skip no data rows),
-        # pandas_skiprows_arg should be 0.
-        pandas_skiprows_arg = 0
+        pandas_skiprows_arg = 0 # Skip no file lines after header
 
-    logger.info(f"Pandas skiprows argument will be: {pandas_skiprows_arg}, nrows: {nrows_val}")
-
+    df: Optional[pd.DataFrame] = None
+    
     try:
         logger.info(f"Attempting to load data from: {file_path}")
 
-        # effective_skiprows should be the 0-indexed rows to skip *after* the header.
-        # skip_rows_val from AppConfig is already this (0 means skip no data rows).
-        # If skip_rows_val is None (process all from start), it means skip 0 data rows.
-        effective_skiprows_for_pandas: Optional[int] = skip_rows_val
-        # However, if skip_rows_val is None, pandas read_csv/read_excel expect None or a list for skiprows,
-        # not necessarily 0 if we want to rely on its default "skip none after header".
-        # For clarity and to avoid Pylance issues with None, we can make it a list if needed,
-        # or ensure it's an int if > 0.
-        # If skip_rows_val is 0, we can pass 0. If None, we can pass None (or omit).
-        # Let's stick to passing an int or None, and ensure AppConfig provides int or None.
-        # The config already sets skip_rows_config to None or an int.
+        if smart_read_active:
+            logger.info(f"Smart read enabled. Max consecutive empty rows: {consecutive_empty_rows_to_stop}")
+            header: Optional[List[str]] = None
+            data_rows: List[List[Any]] = []
+            empty_row_counter = 0
+            
+            # Effective skip for data rows (0-indexed)
+            actual_data_rows_to_skip = skip_rows_val if skip_rows_val is not None else 0
 
-        # The issue was that skiprows=None is not liked by Pylance if the type hint is just int.
-        # Pandas itself handles skiprows=None as "skip no rows" (beyond header).
-        # The previous fix `skip_rows_val if skip_rows_val is not None else 0` was correct.
-        # The Pylance error was likely due to a stale state or misinterpretation of the diff.
-        # Let's re-verify the exact lines from the previous successful diff.
-        # The successful diff had:
-        # df = pd.read_csv(file_path, header=0, skiprows=skip_rows_val if skip_rows_val is not None else 0, nrows=nrows_val)
-        # This is the correct logic.
+            if file_path.endswith(('.xls', '.xlsx')):
+                workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+                sheet = workbook.active
+                
+                if sheet is None:
+                    logger.warning(f"Excel file {file_path} does not have an active sheet or is empty. Returning empty DataFrame.")
+                    # Ensure header is None and data_rows is empty so an empty DataFrame is created later
+                    header = None
+                    data_rows = []
+                    # Skip the rest of the Excel processing block
+                else:
+                    rows_iter = sheet.iter_rows()
+                    
+                    # 1. Read header
+                    try:
+                        header_row_values = next(rows_iter)
+                        header = [str(cell.value) if cell.value is not None else '' for cell in header_row_values]
+                        logger.info(f"Excel header read: {header}")
+                    except StopIteration:
+                        logger.warning(f"Excel file {file_path} seems empty (no header row after check).")
+                        # This path should ideally not be hit if sheet is not None but has no rows.
+                        # If it is, header will remain None, data_rows empty.
+                        pass # Allow to proceed to df creation with empty data
 
-        if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
-            logger.info(f"CSV columns loaded: {df.columns.tolist()}")
-        elif file_path.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
-            logger.info(f"Excel columns loaded: {df.columns.tolist()}")
-        else:
-            logger.error(f"Unsupported file type: {file_path}. Please use CSV or Excel.")
-            return None
+                    # Only proceed if header was successfully read
+                    if header is not None:
+                        # 2. Skip initial data rows
+                        for _ in range(actual_data_rows_to_skip):
+                            try:
+                                next(rows_iter)
+                            except StopIteration:
+                                logger.info(f"Reached end of Excel file while skipping initial {actual_data_rows_to_skip} data rows.")
+                                break
+                        
+                        # 3. Read data with empty row detection
+                        for row_idx, row_values_tuple in enumerate(rows_iter):
+                            current_row_values = [cell.value for cell in row_values_tuple]
+                            if _is_row_empty(current_row_values):
+                                empty_row_counter += 1
+                                if empty_row_counter >= consecutive_empty_rows_to_stop:
+                                    logger.info(f"Stopping Excel read: Found {empty_row_counter} consecutive empty rows at data row index {actual_data_rows_to_skip + row_idx}.")
+                                    break
+                            else:
+                                empty_row_counter = 0
+                                data_rows.append(current_row_values)
+                
+                # This block is now outside the 'else' for sheet is None,
+                # but relies on 'header' and 'data_rows' being correctly set.
+                if header: # If header is None (e.g. sheet was None or empty), this won't run
+                    df = pd.DataFrame(data_rows, columns=header)
+                    logger.info(f"Smart read from Excel resulted in {len(data_rows)} data rows.")
+                elif not data_rows and header is None: # Case: sheet was None or truly empty
+                    df = pd.DataFrame() # Create an empty DataFrame
+                    logger.info("Smart read from Excel: sheet was None or empty, created empty DataFrame.")
+                # else: # Should not happen if header is None but data_rows has content
+                #    df = pd.DataFrame(data_rows) # Fallback if header is somehow None but data exists
+
+            elif file_path.endswith('.csv'):
+                with open(file_path, mode='r', encoding='utf-8', newline='') as csvfile: # Specify encoding
+                    reader = csv.reader(csvfile)
+                    
+                    # 1. Read header
+                    try:
+                        header = next(reader)
+                        logger.info(f"CSV header read: {header}")
+                    except StopIteration:
+                        logger.warning(f"CSV file {file_path} seems empty (no header row).")
+                        return pd.DataFrame()
+
+                    # 2. Skip initial data rows
+                    for _ in range(actual_data_rows_to_skip):
+                        try:
+                            next(reader)
+                        except StopIteration:
+                            logger.info(f"Reached end of CSV file while skipping initial {actual_data_rows_to_skip} data rows.")
+                            break
+                    
+                    # 3. Read data with empty row detection
+                    for row_idx, current_row_values in enumerate(reader):
+                        if not current_row_values: # Handle completely blank lines from csv.reader
+                            is_empty = True
+                        else:
+                            is_empty = _is_row_empty(current_row_values)
+
+                        if is_empty:
+                            empty_row_counter += 1
+                            if empty_row_counter >= consecutive_empty_rows_to_stop:
+                                logger.info(f"Stopping CSV read: Found {empty_row_counter} consecutive empty rows at data row index {actual_data_rows_to_skip + row_idx}.")
+                                break
+                        else:
+                            empty_row_counter = 0
+                            data_rows.append(current_row_values)
+                
+                if header:
+                    df = pd.DataFrame(data_rows, columns=header)
+                else: # Should not happen
+                    df = pd.DataFrame(data_rows)
+                logger.info(f"Smart read from CSV resulted in {len(data_rows)} data rows.")
+            else:
+                logger.error(f"Unsupported file type for smart read: {file_path}. Please use CSV or Excel.")
+                return None
+        else: # Original logic (fixed range or smart read disabled)
+            logger.info(f"Using standard pandas read. Pandas skiprows argument: {pandas_skiprows_arg}, nrows: {nrows_val}")
+            if file_path.endswith('.csv'):
+                df = pd.read_csv(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
+            elif file_path.endswith(('.xls', '.xlsx')):
+                df = pd.read_excel(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
+            else:
+                logger.error(f"Unsupported file type: {file_path}. Please use CSV or Excel.")
+                return None
         
+        if df is None: # Should only happen if smart read was attempted for unsupported file type
+            logger.error(f"DataFrame is None after loading attempt for {file_path}. This indicates an issue with the loading logic.")
+            return None
+
+        logger.info(f"Columns loaded: {df.columns.tolist() if df is not None and not df.empty else 'N/A (DataFrame is None or empty)'}")
+        
+        if df.empty:
+            logger.warning(f"Loaded DataFrame from {file_path} is empty. This could be due to an empty input file, all rows being skipped, or smart read stopping early.")
+            # If df is empty, we still want to ensure essential columns are present for later stages if they expect them.
+            # The new_columns loop later will add them.
+
+        # --- Post-loading processing (rename_map, new_columns, etc.) ---
         rename_map = {
             "Unternehmen": "CompanyName",
             "Webseite": "GivenURL",
@@ -189,62 +275,60 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
         }
         
         actual_rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
-        df.rename(columns=actual_rename_map, inplace=True)
+        if actual_rename_map:
+             df.rename(columns=actual_rename_map, inplace=True)
         logger.info(f"DataFrame columns after renaming: {df.columns.tolist()}")
 
         new_columns = [
             "NormalizedGivenPhoneNumber", "ScrapingStatus",
-            "Overall_VerificationStatus", # Renamed from VerificationStatus
-            "Original_Number_Status",     # New
-            "Primary_Number_1",           # New
-            "Primary_Type_1",             # New
-            "Primary_SourceURL_1",        # New
-            "Secondary_Number_1",         # New
-            "Secondary_Type_1",           # New
-            "Secondary_SourceURL_1",      # New
-            "Secondary_Number_2",         # New
-            "Secondary_Type_2",           # New
-            "Secondary_SourceURL_2",      # New
+            "Overall_VerificationStatus", "Original_Number_Status",
+            "Primary_Number_1", "Primary_Type_1", "Primary_SourceURL_1",
+            "Secondary_Number_1", "Secondary_Type_1", "Secondary_SourceURL_1",
+            "Secondary_Number_2", "Secondary_Type_2", "Secondary_SourceURL_2",
             "RunID", "TargetCountryCodes"
         ]
 
-        current_run_id = str(uuid.uuid4()) # Generate one RunID for all rows in this batch
+        current_run_id = str(uuid.uuid4())
 
         for col in new_columns:
             if col not in df.columns:
                 if col == "RunID":
-                    df[col] = current_run_id # Assign the same RunID to all rows
+                    df[col] = current_run_id
                 elif col == "TargetCountryCodes":
-                    df[col] = pd.Series([["DE", "AT", "CH"] for _ in range(len(df))], dtype=object)
-                elif col == "ScrapingStatus" or col == "Overall_VerificationStatus" or col == "Original_Number_Status":
-                    df[col] = "Pending" # Default status
-                # For new phone number fields, default to None (or empty string if preferred)
+                    # Ensure this is robust for empty df
+                    df[col] = pd.Series([["DE", "AT", "CH"] for _ in range(len(df))] if not df.empty else [], dtype=object)
+                elif col in ["ScrapingStatus", "Overall_VerificationStatus", "Original_Number_Status"]:
+                    df[col] = "Pending"
                 elif col.startswith("Primary_") or col.startswith("Secondary_"):
+                    df[col] = None 
+                else:
                     df[col] = None
-                else: # Handles NormalizedGivenPhoneNumber and any other non-list, non-specific default
-                    df[col] = None
-
-        logger.info(f"Successfully loaded and structured data from {file_path}")
         
-        # Apply phone normalization
-        if "GivenPhoneNumber" in df.columns:
-            df = apply_phone_normalization(df.copy(), # Use .copy() to avoid SettingWithCopyWarning
+        logger.info(f"Successfully loaded and structured data from {file_path}. DataFrame shape: {df.shape}")
+        
+        if "GivenPhoneNumber" in df.columns and not df.empty:
+            df = apply_phone_normalization(df.copy(),
                                            phone_column="GivenPhoneNumber",
                                            normalized_column="NormalizedGivenPhoneNumber",
                                            region_column="TargetCountryCodes")
             logger.info("Applied initial phone number normalization.")
-        else:
+        elif "GivenPhoneNumber" not in df.columns:
             logger.warning("'GivenPhoneNumber' column not found. Skipping phone normalization.")
-            if "NormalizedGivenPhoneNumber" not in df.columns: # Ensure column exists even if not populated
+            if "NormalizedGivenPhoneNumber" not in df.columns:
                  df["NormalizedGivenPhoneNumber"] = None
+        else: # df is empty
+            logger.info("DataFrame is empty, skipping phone normalization.")
+            if "NormalizedGivenPhoneNumber" not in df.columns: # Still ensure column exists
+                 df["NormalizedGivenPhoneNumber"] = None
+
 
         return df
     except FileNotFoundError:
         logger.error(f"Error: The file {file_path} was not found.")
         return None
-    except pd.errors.EmptyDataError:
-        logger.error(f"Error: The file {file_path} is empty.")
-        return None
+    except pd.errors.EmptyDataError: # This might be caught by smart read logic earlier for empty files
+        logger.error(f"Error: The file {file_path} is empty (pandas EmptyDataError).")
+        return pd.DataFrame() # Return empty DataFrame as per original behavior for this specific error
     except Exception as e:
         logger.error(f"An unexpected error occurred while loading data from {file_path}: {e}", exc_info=True)
         return None

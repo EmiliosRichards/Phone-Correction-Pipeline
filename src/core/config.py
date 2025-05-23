@@ -83,6 +83,7 @@ class AppConfig:
         processed_contacts_report_file_name_template (str): Template for the 'Final Processed Contacts' report Excel file name.
         skip_rows_config (Optional[int]): Number of rows to skip from the start of the input file (0-indexed).
         nrows_config (Optional[int]): Number of rows to read after skipping. None means read to end.
+        consecutive_empty_rows_to_stop (int): Number of consecutive empty rows to detect as end-of-data when ROW_PROCESSING_RANGE is open-ended.
         
         log_level (str): Logging level for the file log (e.g., INFO, DEBUG).
         console_log_level (str): Logging level for console output (e.g., WARNING, INFO).
@@ -217,6 +218,9 @@ class AppConfig:
                 if raw_row_range != "0": # "0" is a valid way to say "all rows"
                     print(f"Warning: Invalid ROW_PROCESSING_RANGE value '{raw_row_range}'. Processing all rows.")
         
+        # --- Data Handling Enhancements ---
+        self.consecutive_empty_rows_to_stop: int = int(os.getenv('CONSECUTIVE_EMPTY_ROWS_TO_STOP', '3'))
+
         # --- Logging Configuration ---
         self.log_level: str = os.getenv('LOG_LEVEL', 'INFO').upper()
         self.console_log_level: str = os.getenv('CONSOLE_LOG_LEVEL', 'WARNING').upper()
