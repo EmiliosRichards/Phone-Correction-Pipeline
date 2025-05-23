@@ -103,14 +103,18 @@ Setup system on contabo, <--------<
 Time stamps in the attrition file are not useful, they are all the same, they are created when the file is created not when the error happens, this will be hard to check with the logs.
 
 
-Obviously need to fix the rows being run to 1m 
+Obviously need to fix the rows being run to 1m - DONE
 
 need to understand the files better, theres 1000 row in attrition. But many are the same company? 
 
-Investigate if these are dupes
+Investigate if these are dupes 
 
 Need to handle input data cleaning - jpynb
 
-failed rows we have 2k+ - investigate. 
+failed rows we have 2k+ - investigate. o
 
 The metrics is good - but how can I found out how many urls were excluded due to leading to the same canonical
+
+
+
+One day I will have to come back to where the rows begin when using range, and check that the exact numbers match the input and we are not losing track or 5+rows randomly when checking reports.

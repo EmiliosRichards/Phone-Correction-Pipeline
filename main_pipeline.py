@@ -1,5 +1,6 @@
 import pandas as pd
 from typing import List, Dict, Set, Optional, Any, Callable, Union, Tuple
+from collections import Counter # Added for duplicate counting
 import csv # Added for failure log
 from src.data_handler import load_and_preprocess_data, process_and_consolidate_contact_data, get_canonical_base_url, generate_processed_contacts_report # Kept main's import
 from src.scraper import scrape_website
@@ -75,27 +76,63 @@ def log_row_failure(
     stage_of_failure: str,
     error_reason: str,
     log_timestamp: str,
-    error_details: str = ""
+    error_details: str = "",
+    associated_pathful_canonical_url: Optional[str] = None # New parameter
 ) -> None:
     """Helper function to write a row-specific failure to the CSV log."""
     if failure_log_writer:
         try:
             sanitized_reason = str(error_reason).replace('\n', ' ').replace('\r', '')
             sanitized_details = str(error_details).replace('\n', ' ').replace('\r', '')
-            failure_log_writer.writerow([
+            row_to_write = [
                 log_timestamp,
                 input_row_identifier,
                 company_name,
                 given_url if given_url is not None else "",
                 stage_of_failure,
                 sanitized_reason,
-                sanitized_details
-            ])
+                sanitized_details,
+                associated_pathful_canonical_url if associated_pathful_canonical_url is not None else "" # New field
+            ]
+            failure_log_writer.writerow(row_to_write)
         except Exception as e:
             logger.error(f"CRITICAL: Failed to write to failure_log_csv: {e}. Row ID: {input_row_identifier}, Stage: {stage_of_failure}, Timestamp: {log_timestamp}", exc_info=True)
     else:
         logger.warning(f"Attempted to log row failure but failure_log_writer is None. Row ID: {input_row_identifier}, Stage: {stage_of_failure}, Timestamp: {log_timestamp}")
 
+
+def get_input_canonical_url(url_string: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a given URL string and extracts its netloc (domain part)
+    to serve as an 'input canonical URL' for pre-computation duplicate checks.
+    """
+    if not url_string or not isinstance(url_string, str):
+        return None
+    
+    temp_url = url_string.strip()
+    if not temp_url: # Handle empty string after strip
+        return None
+
+    # Ensure a scheme is present for consistent parsing by normalize_url and for netloc extraction
+    parsed_initial = urlparse(temp_url)
+    if not parsed_initial.scheme:
+        # logger.debug(f"Input URL '{temp_url}' is schemeless for canonical pre-check. Adding 'http://'.") # Optional: add if more detailed logging is needed here
+        temp_url = "http://" + temp_url
+    
+    try:
+        # normalize_url is imported from src.scraper.scraper_logic
+        normalized = normalize_url(temp_url) # Call without the incorrect parameter
+        if not normalized:
+            logger.debug(f"normalize_url returned None for input: {temp_url} (original: {url_string})")
+            return None
+        parsed_normalized_url = urlparse(normalized)
+        # Return netloc (domain) if it exists, otherwise None.
+        # This ensures that even if normalize_url returns something like "example.com" (no scheme),
+        # urlparse().netloc will be empty, which is a valid outcome for a malformed/unresolvable input.
+        return parsed_normalized_url.netloc if parsed_normalized_url.netloc else None
+    except Exception as e:
+        logger.debug(f"Could not parse/normalize input URL '{url_string}' for canonical pre-check: {e}")
+        return None
 
 def _determine_final_row_outcome_and_fault(
     index: Any,
@@ -206,6 +243,86 @@ def _determine_final_row_outcome_and_fault(
 
     return "Unknown_Processing_Gap_NoContact", FAULT_CATEGORY_MAP_DEFINITION["Unknown_Processing_Gap_NoContact"]
 
+def _determine_final_domain_outcome_and_fault(
+    true_base_domain: str,
+    domain_journey_entry: Dict[str, Any], # The entry from canonical_domain_journey_data
+    true_base_scraper_status_map: Dict[str, str], # Map of true_base_domain to its overall scraper status
+    true_base_to_pathful_map: Dict[str, List[str]], # Maps true_base to list of its pathful URLs
+    canonical_site_pathful_scraper_status: Dict[str, str], # Map of pathful_url to its scraper status
+    canonical_site_regex_candidates_found_status: Dict[str, bool], # Aggregated: if any pathful under this true_base had regex candidates
+    final_consolidated_data: Optional[CompanyContactDetails] # Result of process_and_consolidate_contact_data for this true_base
+) -> Tuple[str, str]:
+    """
+    Determines the final outcome reason for a canonical domain and its primary fault category.
+    This is similar to _determine_final_row_outcome_and_fault but operates on domain-level aggregated data.
+    """
+    # Priority 1: Successful contact extraction for this domain
+    if final_consolidated_data and final_consolidated_data.consolidated_numbers:
+        return "Contact_Successfully_Extracted_For_Domain", "N/A"
+
+    # Priority 2: Scraper status for the true_base_domain
+    # The domain_journey_entry["Overall_Scraper_Status_For_Domain"] should reflect the best status.
+    overall_scraper_status_for_domain = domain_journey_entry.get("Overall_Scraper_Status_For_Domain", "Unknown")
+
+    if overall_scraper_status_for_domain != "Success":
+        # Try to get more specific scraping failure reasons by looking at pathful statuses
+        # This logic mirrors parts of _determine_final_row_outcome_and_fault's scraping failure analysis
+        pathful_urls_for_this_domain = true_base_to_pathful_map.get(true_base_domain, [])
+        all_network_fail = True
+        all_access_denied = True
+        all_not_found = True # Or content not found
+
+        if not pathful_urls_for_this_domain:
+             # This implies the domain itself might have been invalid or unresolvable before pathfuls were attempted
+             # Or, scraper_logic decided not to proceed with any pathfuls.
+            if "InvalidURL" in overall_scraper_status_for_domain or "MaxRedirects" in overall_scraper_status_for_domain: # Check for specific input-like errors
+                 return f"Domain_InputLikeFailure_{overall_scraper_status_for_domain}", FAULT_CATEGORY_MAP_DEFINITION.get("Input_URL_Invalid", "Input Data Issue")
+            return "Scraping_NoPathfulURLs_Processed_ForDomain", FAULT_CATEGORY_MAP_DEFINITION.get("Scraping_AllAttemptsFailed_Network", "Website Issue")
+
+
+        for p_url in pathful_urls_for_this_domain:
+            p_status = canonical_site_pathful_scraper_status.get(p_url, "Unknown")
+            if "Timeout" not in p_status and "DNS" not in p_status and "Network" not in p_status and "Unreachable" not in p_status : all_network_fail = False
+            if "403" not in p_status and "AccessDenied" not in p_status and "Robots" not in p_status: all_access_denied = False
+            if "404" not in p_status and "NotFound" not in p_status : all_not_found = False
+        
+        if all_network_fail: return "Scraping_AllPathfulsFailed_Network_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["Scraping_AllAttemptsFailed_Network"]
+        if all_access_denied: return "Scraping_AllPathfulsFailed_AccessDenied_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["Scraping_AllAttemptsFailed_AccessDenied"]
+        if all_not_found: return "Scraping_AllPathfuls_ContentNotFound_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["Scraping_ContentNotFound_AllAttempts"]
+        
+        # Fallback generic scrape failure for the domain if not fitting above and overall status wasn't success
+        return f"ScrapingFailed_Domain_{overall_scraper_status_for_domain}", FAULT_CATEGORY_MAP_DEFINITION.get("Scraping_AllAttemptsFailed_Network", "Website Issue")
+
+    # Scraping for domain was "Success" (at least one pathful URL was successful)
+    # Now check Regex and LLM stages based on aggregated data in domain_journey_entry
+
+    if not domain_journey_entry.get("Regex_Candidates_Found_For_Any_Pathful", False):
+        # This implies no regex candidates were found on ANY successfully scraped page for this domain.
+        # Check if any pages were actually scraped successfully and had content.
+        if domain_journey_entry.get("Total_Pages_Scraped_For_Domain", 0) == 0:
+             return "Scraping_Success_NoPagesScraped_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["Scraping_Success_NoRelevantContentPagesFound"]
+        return "Domain_NoRegexCandidatesFound_OnAnyPage", FAULT_CATEGORY_MAP_DEFINITION["Canonical_NoRegexCandidatesFound"]
+
+    # Regex candidates were found on at least one page for this domain.
+    # LLM should have been attempted for those pathful URLs.
+    # final_consolidated_data being None or having no consolidated_numbers indicates LLM issues.
+
+    if not domain_journey_entry.get("LLM_Calls_Made_For_Domain", False):
+        # This is unusual if regex candidates were found. Could mean an error before LLM call for all relevant pathfuls.
+        return "LLM_NotCalled_DespiteRegexCandidates_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["LLM_NoInput_NoRegexCandidates"] # Or a pipeline error
+
+    if domain_journey_entry.get("LLM_Processing_Error_Encountered_For_Domain", False):
+        return "LLM_Processing_Error_Encountered_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["LLM_Processing_Error_AllAttempts"]
+
+    # LLM ran, no errors reported at the domain journey level, but still no consolidated numbers.
+    # This implies either LLM found nothing, or found nothing relevant after consolidation.
+    if domain_journey_entry.get("LLM_Total_Raw_Numbers_Extracted", 0) == 0:
+        return "LLM_Output_NoRawNumbersFound_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["LLM_Output_NoNumbersFound_AllAttempts"]
+    else: # Raw numbers were extracted, but none made it through consolidation for the domain
+        return "LLM_Output_RawNumbersFound_NoneConsolidated_ForDomain", FAULT_CATEGORY_MAP_DEFINITION["LLM_Output_NumbersFound_NoneRelevant_AllAttempts"]
+
+    # Fallback if none of the above conditions met but still no consolidated contacts
+    return "Unknown_Domain_Processing_Gap_NoContact", FAULT_CATEGORY_MAP_DEFINITION["Unknown_Processing_Gap_NoContact"]
 def main() -> None:
     pipeline_start_time = time.time() 
     run_metrics: Dict[str, Any] = {
@@ -214,9 +331,16 @@ def main() -> None:
         "tasks": {},
         "data_processing_stats": {
             "input_rows_count": 0,
-            "rows_successfully_processed_pass1": 0, 
+            "rows_successfully_processed_pass1": 0,
             "rows_failed_pass1": 0,
             "row_level_failure_summary": {}, # New: For stage_of_failure counts
+            "input_unique_company_names": 0,
+            "input_unique_canonical_urls": 0,
+            "input_company_names_with_duplicates_count": 0, # Number of company names that appear more than once
+            "input_canonical_urls_with_duplicates_count": 0, # Number of input canonical URLs that appear more than once
+            "input_rows_with_duplicate_company_name": 0, # Total rows that have a company name seen elsewhere
+            "input_rows_with_duplicate_canonical_url": 0, # Total rows that have an input canonical URL seen elsewhere
+            "input_rows_considered_duplicates_overall": 0, # Total rows where either company name or URL is a duplicate
         },
         "scraping_stats": {
             "urls_processed_for_scraping": 0,
@@ -251,8 +375,9 @@ def main() -> None:
             "detailed_report_rows": 0,
             "summary_report_rows": 0,
             "tertiary_report_rows": 0,
+            "canonical_domain_summary_rows": 0, # New report
         },
-        "errors_encountered": [] 
+        "errors_encountered": []
     }
 
     run_id = generate_run_id()
@@ -326,13 +451,13 @@ def main() -> None:
             logger.error(f"Failed to load data from {INPUT_FILE_PATH}. DataFrame is None.")
             run_metrics["errors_encountered"].append(f"Data loading failed: DataFrame is None from {INPUT_FILE_PATH}")
             run_metrics["tasks"]["load_and_preprocess_data_duration_seconds"] = time.time() - task_start_time
-            write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, []) # Pass empty list
+            write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, [], {}) # Pass empty list and empty dict
             return
     except Exception as e:
         logger.error(f"Error loading data in main: {e}", exc_info=True)
         run_metrics["errors_encountered"].append(f"Data loading exception: {str(e)}")
         run_metrics["tasks"]["load_and_preprocess_data_duration_seconds"] = time.time() - task_start_time
-        write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, []) # Pass empty list
+        write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, [], {}) # Pass empty list and empty dict
         return
     run_metrics["tasks"]["load_and_preprocess_data_duration_seconds"] = time.time() - task_start_time
 
@@ -374,9 +499,73 @@ def main() -> None:
         df['Final_Row_Outcome_Reason'] = pd.Series([None] * len(df), dtype=object)
         df['Determined_Fault_Category'] = pd.Series([None] * len(df), dtype=object)
 
-    globally_processed_urls: Set[str] = set() 
-    all_flattened_rows: List[Dict[str, Any]] = [] 
-    all_tertiary_rows: List[Dict[str, Any]] = [] 
+    # --- Pre-computation of Input Duplicate Counts ---
+    logger.info("Starting pre-computation of input duplicate counts...")
+    pre_comp_start_time = time.time()
+    
+    input_company_names_list: List[str] = []
+    input_derived_canonical_urls_list: List[str] = [] # Store non-None, use placeholder for None
+
+    # Use column names from AppConfig if available, otherwise default
+    # These should have been mapped by load_and_preprocess_data
+    company_name_col_key = 'CompanyName'
+    url_col_key = 'GivenURL'
+
+    if company_name_col_key not in df.columns:
+        logger.error(f"Critical: Column '{company_name_col_key}' not found in DataFrame for duplicate pre-computation. This may lead to incorrect duplicate stats.")
+    if url_col_key not in df.columns:
+        logger.error(f"Critical: Column '{url_col_key}' not found in DataFrame for duplicate pre-computation. This may lead to incorrect duplicate stats.")
+
+    for row_tuple in df.itertuples(index=False):
+        company_name_val = str(getattr(row_tuple, company_name_col_key, "MISSING_COMPANY_NAME_INPUT")).strip()
+        input_company_names_list.append(company_name_val)
+        
+        given_url_val = getattr(row_tuple, url_col_key, None)
+        derived_input_canonical = get_input_canonical_url(given_url_val)
+        input_derived_canonical_urls_list.append(derived_input_canonical if derived_input_canonical else "MISSING_OR_INVALID_URL_INPUT")
+
+    company_name_counts = Counter(input_company_names_list)
+    input_canonical_url_counts = Counter(input_derived_canonical_urls_list)
+
+    run_metrics["data_processing_stats"]["input_unique_company_names"] = len(company_name_counts)
+    run_metrics["data_processing_stats"]["input_unique_canonical_urls"] = len(input_canonical_url_counts)
+    
+    # Calculate number of items that are duplicates (appear > 1 times)
+    num_company_names_with_duplicates = sum(1 for name, count in company_name_counts.items() if count > 1 and name != "MISSING_COMPANY_NAME_INPUT")
+    num_urls_with_duplicates = sum(1 for url, count in input_canonical_url_counts.items() if count > 1 and url != "MISSING_OR_INVALID_URL_INPUT")
+    run_metrics["data_processing_stats"]["input_company_names_with_duplicates_count"] = num_company_names_with_duplicates
+    run_metrics["data_processing_stats"]["input_canonical_urls_with_duplicates_count"] = num_urls_with_duplicates
+
+    # Calculate total rows affected by duplicates
+    total_rows_with_dup_company = sum(count for name, count in company_name_counts.items() if count > 1 and name != "MISSING_COMPANY_NAME_INPUT")
+    total_rows_with_dup_url = sum(count for url, count in input_canonical_url_counts.items() if count > 1 and url != "MISSING_OR_INVALID_URL_INPUT")
+    run_metrics["data_processing_stats"]["input_rows_with_duplicate_company_name"] = total_rows_with_dup_company
+    run_metrics["data_processing_stats"]["input_rows_with_duplicate_canonical_url"] = total_rows_with_dup_url
+    
+    # Calculate overall rows considered duplicates
+    rows_considered_duplicates_overall = 0
+    df['temp_input_canonical_url'] = input_derived_canonical_urls_list # Add as temp column for iteration
+    df['temp_input_company_name'] = input_company_names_list # Add as temp column
+
+    for _, row_data in df.iterrows():
+        is_dup_company = company_name_counts[row_data['temp_input_company_name']] > 1 and row_data['temp_input_company_name'] != "MISSING_COMPANY_NAME_INPUT"
+        is_dup_url = input_canonical_url_counts[row_data['temp_input_canonical_url']] > 1 and row_data['temp_input_canonical_url'] != "MISSING_OR_INVALID_URL_INPUT"
+        if is_dup_company or is_dup_url:
+            rows_considered_duplicates_overall += 1
+    run_metrics["data_processing_stats"]["input_rows_considered_duplicates_overall"] = rows_considered_duplicates_overall
+    
+    df.drop(columns=['temp_input_canonical_url', 'temp_input_company_name'], inplace=True) # Clean up temp columns
+
+    logger.info(f"Input duplicate pre-computation complete. Duration: {time.time() - pre_comp_start_time:.2f}s")
+    logger.info(f"  Unique Company Names: {len(company_name_counts)}, Names with Duplicates: {num_company_names_with_duplicates}, Total Rows Affected by Company Duplicates: {total_rows_with_dup_company}")
+    logger.info(f"  Unique Input Canonical URLs: {len(input_canonical_url_counts)}, URLs with Duplicates: {num_urls_with_duplicates}, Total Rows Affected by URL Duplicates: {total_rows_with_dup_url}")
+    logger.info(f"  Total Input Rows Considered Duplicates (either Company or URL): {rows_considered_duplicates_overall}")
+    run_metrics["tasks"]["pre_computation_duplicate_counts_duration_seconds"] = time.time() - pre_comp_start_time
+    # --- End Pre-computation ---
+
+    globally_processed_urls: Set[str] = set()
+    all_flattened_rows: List[Dict[str, Any]] = []
+    all_tertiary_rows: List[Dict[str, Any]] = []
     canonical_site_raw_llm_outputs: Dict[str, List[PhoneNumberLLMOutput]] = {}
     canonical_site_pathful_scraper_status: Dict[str, str] = {}
     input_to_canonical_map: Dict[str, Optional[str]] = {}
@@ -393,25 +582,41 @@ def main() -> None:
         failure_writer = csv.writer(f_failure_log)
         failure_writer.writerow([
             'log_timestamp', 'input_row_identifier', 'CompanyName', 'GivenURL',
-            'stage_of_failure', 'error_reason', 'error_details'
+            'stage_of_failure', 'error_reason', 'error_details',
+            'Associated_Pathful_Canonical_URL' # New header
         ])
 
-        for i, (index, row_series) in enumerate(df.iterrows()):
-            rows_processed_in_pass1 += 1
-            row: pd.Series = row_series
-            company_name: str = str(row.get('CompanyName', f"Row_{index}"))
-            given_url_original: Optional[str] = row.get('GivenURL')
-            current_row_number_for_log: int = i + 1
-            
-            logger.info(f"[RowID: {index}, Company: {company_name}] --- Processing row {current_row_number_for_log}/{len(df)}: Original URL '{given_url_original}' ---")
+    # --- Data structures for new Canonical Domain Journey Report ---
+    canonical_domain_journey_data: Dict[str, Dict[str, Any]] = {}
+    # Helper dicts to aggregate data before putting into canonical_domain_journey_data
+    true_base_to_input_row_ids: Dict[str, Set[Any]] = {}
+    true_base_to_input_company_names: Dict[str, Set[str]] = {}
+    true_base_to_input_given_urls: Dict[str, Set[str]] = {}
+    true_base_to_pathful_urls_attempted: Dict[str, Set[str]] = {} # Stores unique pathful URLs processed under a true_base
+    # true_base_scraper_status is already initialized later, will be used for this report too
+    # canonical_site_regex_candidates_found_status is already initialized, will be aggregated
+    # canonical_site_llm_exception_details is already initialized, will be aggregated
+    # final_consolidated_data_by_true_base will be a key source
 
-            current_row_scraper_status: str = "Not_Run"
-            # ... (other per-row initializations) ...
-            
-            given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input"
-            processed_url = given_url_original 
+    # --- End Data structures for new Canonical Domain Journey Report ---
 
-            try:
+    for i, (index, row_series) in enumerate(df.iterrows()): # Corrected indentation
+        rows_processed_in_pass1 += 1
+        row: pd.Series = row_series
+        company_name: str = str(row.get('CompanyName', f"Row_{index}"))
+        given_url_original: Optional[str] = row.get('GivenURL')
+        current_row_number_for_log: int = i + 1
+        
+        logger.info(f"[RowID: {index}, Company: {company_name}] --- Processing row {current_row_number_for_log}/{len(df)}: Original URL '{given_url_original}' ---")
+
+        current_row_scraper_status: str = "Not_Run"
+        final_canonical_entry_url: Optional[str] = None # Initialize for each row, before the try block
+        # ... (other per-row initializations) ...
+        
+        given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input"
+        processed_url = given_url_original
+
+        try:
                 if given_url_original and isinstance(given_url_original, str):
                     temp_url_stripped = given_url_original.strip()
                     parsed_obj = urlparse(temp_url_stripped)
@@ -495,16 +700,17 @@ def main() -> None:
                         stage_of_failure="URL_Validation_InvalidOrMissing",
                         error_reason=f"Invalid or missing URL after processing: {processed_url}",
                         log_timestamp=datetime.now().isoformat(),
-                        error_details=json.dumps({"original_url": given_url_original, "processed_url": processed_url})
+                        error_details=json.dumps({"original_url": given_url_original, "processed_url": processed_url}),
+                        # No specific pathful canonical URL yet for this type of input failure
                     )
                     stage_key = "URL_Validation_InvalidOrMissing"
                     row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
                     rows_failed_in_pass1 +=1
                     continue
      
-                scraped_pages_details: List[Tuple[str, str, str]] 
+                scraped_pages_details: List[Tuple[str, str, str]]
                 scraper_status: str
-                final_canonical_entry_url: Optional[str] = None 
+                # final_canonical_entry_url is now initialized at the start of the loop iteration
                 
                 run_metrics["scraping_stats"]["urls_processed_for_scraping"] += 1
                 scrape_task_start_time = time.time()
@@ -521,9 +727,48 @@ def main() -> None:
                 given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input" 
                 input_to_canonical_map[given_url_original_str_key] = true_base_domain_for_row
 
+                # --- Start: Populate/Initialize structures for Canonical Domain Journey Report ---
+                if true_base_domain_for_row:
+                    if true_base_domain_for_row not in canonical_domain_journey_data:
+                        canonical_domain_journey_data[true_base_domain_for_row] = {
+                            "Input_Row_IDs": set(),
+                            "Input_CompanyNames": set(),
+                            "Input_GivenURLs": set(),
+                            "Pathful_URLs_Attempted_List": set(),
+                            "Overall_Scraper_Status_For_Domain": "Unknown", # Will be updated later
+                            "Scraped_Pages_Details_Aggregated": Counter(), # page_type: count
+                            "Total_Pages_Scraped_For_Domain": 0,
+                            "Regex_Candidates_Found_For_Any_Pathful": False,
+                            "LLM_Calls_Made_For_Domain": False,
+                            "LLM_Total_Raw_Numbers_Extracted": 0,
+                            "LLM_Total_Consolidated_Numbers_Found": 0, # Placeholder, updated after global consolidation
+                            "LLM_Consolidated_Number_Types_Summary": Counter(), # Placeholder, updated after global consolidation
+                            "LLM_Processing_Error_Encountered_For_Domain": False,
+                            "LLM_Error_Messages_Aggregated": [],
+                            "Final_Domain_Outcome_Reason": "Unknown", # Placeholder
+                            "Primary_Fault_Category_For_Domain": "Unknown" # Placeholder
+                        }
+                    
+                    canonical_domain_journey_data[true_base_domain_for_row]["Input_Row_IDs"].add(index)
+                    canonical_domain_journey_data[true_base_domain_for_row]["Input_CompanyNames"].add(company_name)
+                    if given_url_original:
+                         canonical_domain_journey_data[true_base_domain_for_row]["Input_GivenURLs"].add(given_url_original)
+                    if final_canonical_entry_url:
+                        canonical_domain_journey_data[true_base_domain_for_row]["Pathful_URLs_Attempted_List"].add(final_canonical_entry_url)
+                    
+                    # Also populate the older helper dicts if they are still used elsewhere, or plan to deprecate them.
+                    # For now, keeping them for compatibility during transition.
+                    true_base_to_input_row_ids.setdefault(true_base_domain_for_row, set()).add(index)
+                    true_base_to_input_company_names.setdefault(true_base_domain_for_row, set()).add(company_name)
+                    if given_url_original:
+                         true_base_to_input_given_urls.setdefault(true_base_domain_for_row, set()).add(given_url_original)
+                    if final_canonical_entry_url:
+                        true_base_to_pathful_urls_attempted.setdefault(true_base_domain_for_row, set()).add(final_canonical_entry_url)
+                # --- End: Populate/Initialize structures ---
+
                 logger.info(f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log}: Scraper status: {current_row_scraper_status}, Pathful Canonical URL from Scraper: {final_canonical_entry_url}, True Base Domain: {true_base_domain_for_row}")
 
-                if current_row_scraper_status == "Success" and final_canonical_entry_url: 
+                if current_row_scraper_status == "Success" and final_canonical_entry_url:
                     if final_canonical_entry_url not in canonical_site_raw_llm_outputs: 
                         run_metrics["scraping_stats"]["new_canonical_sites_scraped"] += 1
                         run_metrics["regex_extraction_stats"]["sites_processed_for_regex"] += 1
@@ -550,9 +795,15 @@ def main() -> None:
                             elif isinstance(target_codes_raw, list):
                                 target_codes_list_for_regex = [str(item) for item in target_codes_raw if isinstance(item, (str, int))]
 
-                            for page_content_file, source_page_url, page_type in scraped_pages_details: 
+                            for page_content_file, source_page_url, page_type in scraped_pages_details:
                                 run_metrics["scraping_stats"]["pages_scraped_by_type"][page_type] = \
                                     run_metrics["scraping_stats"]["pages_scraped_by_type"].get(page_type, 0) + 1
+                                
+                                # --- Start: Aggregate page details for Canonical Domain Journey ---
+                                if true_base_domain_for_row and true_base_domain_for_row in canonical_domain_journey_data:
+                                    canonical_domain_journey_data[true_base_domain_for_row]["Scraped_Pages_Details_Aggregated"][page_type] += 1
+                                    canonical_domain_journey_data[true_base_domain_for_row]["Total_Pages_Scraped_For_Domain"] += 1
+                                # --- End: Aggregate page details ---
                                 
                                 if os.path.exists(page_content_file):
                                     try:
@@ -579,9 +830,10 @@ def main() -> None:
                                             log_timestamp=datetime.now().isoformat(),
                                             error_details=json.dumps({
                                                 "file_path": page_content_file,
-                                                "canonical_url": final_canonical_entry_url,
+                                                "canonical_url": final_canonical_entry_url, # This is a pathful canonical
                                                 "exception": str(file_read_exc)
-                                            })
+                                            }),
+                                            associated_pathful_canonical_url=final_canonical_entry_url
                                         )
                                         stage_key = "Regex_Extraction_FileReadError"
                                         row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
@@ -594,12 +846,21 @@ def main() -> None:
                                 run_metrics["regex_extraction_stats"]["sites_with_regex_candidates"] += 1
                                 run_metrics["regex_extraction_stats"]["total_regex_candidates_found"] += len(all_candidate_items_for_llm)
                                 canonical_site_regex_candidates_found_status[final_canonical_entry_url] = True
+                                # --- Start: Update Regex_Candidates_Found for Canonical Domain Journey ---
+                                if true_base_domain_for_row and true_base_domain_for_row in canonical_domain_journey_data:
+                                    canonical_domain_journey_data[true_base_domain_for_row]["Regex_Candidates_Found_For_Any_Pathful"] = True
+                                # --- End: Update Regex_Candidates_Found ---
                             else:
                                 canonical_site_regex_candidates_found_status[final_canonical_entry_url] = False
+                                # No need to set Regex_Candidates_Found_For_Any_Pathful to False here, as it should remain True if any other pathful had candidates.
                             logger.info(f"[RowID: {index}, Company: {company_name}] Generated {len(all_candidate_items_for_llm)} candidate items for LLM for canonical URL {final_canonical_entry_url}. Regex candidates found: {canonical_site_regex_candidates_found_status[final_canonical_entry_url]}.")
      
                         if canonical_site_regex_candidates_found_status.get(final_canonical_entry_url, False): # Check if regex found candidates
                             run_metrics["llm_processing_stats"]["sites_processed_for_llm"] += 1
+                            # --- Start: Update LLM_Calls_Made for Canonical Domain Journey ---
+                            if true_base_domain_for_row and true_base_domain_for_row in canonical_domain_journey_data:
+                                canonical_domain_journey_data[true_base_domain_for_row]["LLM_Calls_Made_For_Domain"] = True
+                            # --- End: Update LLM_Calls_Made ---
                             llm_task_start_time = time.time()
                             try:
                                 prompt_template_abs_path: str = app_config.llm_prompt_template_path
@@ -622,9 +883,10 @@ def main() -> None:
                                         error_reason="LLM prompt template file not found",
                                         log_timestamp=datetime.now().isoformat(),
                                         error_details=json.dumps({
-                                            "canonical_url": final_canonical_entry_url,
+                                            "canonical_url": final_canonical_entry_url, # This is a pathful canonical
                                             "prompt_path": prompt_template_abs_path
-                                        })
+                                        }),
+                                        associated_pathful_canonical_url=final_canonical_entry_url
                                     )
                                     stage_key = "LLM_Setup_PromptTemplateMissing"
                                     row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
@@ -651,9 +913,13 @@ def main() -> None:
                                         triggering_company_name=company_name
                                     )
                                     canonical_site_raw_llm_outputs[final_canonical_entry_url] = llm_classified_outputs
-                                    canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status 
-                                    run_metrics["llm_processing_stats"]["llm_calls_success"] += 1 
+                                    canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status
+                                    run_metrics["llm_processing_stats"]["llm_calls_success"] += 1
                                     run_metrics["llm_processing_stats"]["total_llm_extracted_numbers_raw"] += len(llm_classified_outputs)
+                                    # --- Start: Update LLM_Total_Raw_Numbers_Extracted for Canonical Domain Journey ---
+                                    if true_base_domain_for_row and true_base_domain_for_row in canonical_domain_journey_data:
+                                        canonical_domain_journey_data[true_base_domain_for_row]["LLM_Total_Raw_Numbers_Extracted"] += len(llm_classified_outputs)
+                                    # --- End: Update LLM_Total_Raw_Numbers_Extracted ---
 
                                     if token_stats:
                                         run_metrics["llm_processing_stats"]["llm_successful_calls_with_token_data"] += 1
@@ -682,6 +948,11 @@ def main() -> None:
                                 exception_type_name = type(llm_exc).__name__
                                 exception_message_str = str(llm_exc)
                                 canonical_site_llm_exception_details[final_canonical_entry_url] = f"{exception_type_name}: {exception_message_str}"
+                                # --- Start: Update LLM Error info for Canonical Domain Journey ---
+                                if true_base_domain_for_row and true_base_domain_for_row in canonical_domain_journey_data:
+                                    canonical_domain_journey_data[true_base_domain_for_row]["LLM_Processing_Error_Encountered_For_Domain"] = True
+                                    canonical_domain_journey_data[true_base_domain_for_row]["LLM_Error_Messages_Aggregated"].append(f"PathfulURL ({final_canonical_entry_url}): {exception_type_name}: {exception_message_str}")
+                                # --- End: Update LLM Error info ---
                                 run_metrics["llm_processing_stats"]["llm_calls_failure_processing_error"] += 1
                                 run_metrics["errors_encountered"].append(f"LLM processing error for {final_canonical_entry_url}: {str(llm_exc)}")
                                 log_row_failure(
@@ -693,10 +964,11 @@ def main() -> None:
                                     error_reason="LLM processing error",
                                     log_timestamp=datetime.now().isoformat(),
                                     error_details=json.dumps({
-                                        "canonical_url": final_canonical_entry_url,
+                                        "canonical_url": final_canonical_entry_url, # This is a pathful canonical
                                         "exception_type": type(llm_exc).__name__,
                                         "exception_message": str(llm_exc)
-                                    })
+                                    }),
+                                    associated_pathful_canonical_url=final_canonical_entry_url
                                 )
                                 stage_key = "LLM_Processing_GeneralError"
                                 row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
@@ -737,9 +1009,10 @@ def main() -> None:
                         error_reason=f"Scraper returned status: {current_row_scraper_status}",
                         log_timestamp=datetime.now().isoformat(),
                         error_details=json.dumps({
-                            "pathful_canonical_url": final_canonical_entry_url,
+                            "pathful_canonical_url": final_canonical_entry_url, # This is a pathful canonical
                             "true_base_domain": true_base_domain_for_row
-                        })
+                        }),
+                        associated_pathful_canonical_url=final_canonical_entry_url
                     )
                     stage_key = f"Scraping_{current_row_scraper_status}"
                     row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
@@ -749,41 +1022,44 @@ def main() -> None:
                     run_metrics["scraping_stats"]["scraping_success"] += 1
                 logger.info(f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log}: Pass 1 processing complete. OriginalURL: {given_url_original_str_key}, CanonicalURL: {final_canonical_entry_url}, ScraperStatus: {current_row_scraper_status}")
 
-            except Exception as e:
-                logger.error(f"[RowID: {index}, Company: {company_name}] Error during Pass 1 processing for row {current_row_number_for_log}, Original URL {given_url_original_str_key}: {e}", exc_info=True)
-                df.at[index, 'Overall_VerificationStatus'] = 'Error_Pass1_RowProcessing'
-                current_scraper_status_for_df = df.at[index, 'ScrapingStatus'] 
-                if current_scraper_status_for_df in ["Not_Run", "Success", None] or not current_scraper_status_for_df : 
-                     df.at[index, 'ScrapingStatus'] = f'PipelineError_{type(e).__name__}'
-                run_metrics["errors_encountered"].append(f"Pass 1 row processing error for {company_name} (URL: {given_url_original_str_key}): {str(e)}")
-                log_row_failure(
-                    failure_log_writer=failure_writer,
-                    input_row_identifier=index,
-                    company_name=company_name,
-                    given_url=given_url_original,
-                    stage_of_failure="RowProcessing_Pass1_UnhandledException",
-                    error_reason="Unhandled exception during Pass 1 row processing",
-                    log_timestamp=datetime.now().isoformat(),
-                    error_details=json.dumps({
-                        "exception_type": type(e).__name__,
-                        "exception_message": str(e)
-                    })
-                )
-                stage_key = "RowProcessing_Pass1_UnhandledException"
-                row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
-                rows_failed_in_pass1 +=1
-                logger.error(
-                    f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log} errored in Pass 1. "
-                    f"ScraperStatus='{df.at[index, 'ScrapingStatus']}', "
-                    f"OverallVerificationStatus='{df.at[index, 'Overall_VerificationStatus']}'"
-                )
-                for col_prefix in ['Primary_', 'Secondary_']:
-                    for suffix in ['Number_1', 'Type_1', 'SourceURL_1', 'Number_2', 'Type_2', 'SourceURL_2']:
-                        col_name = f"{col_prefix}{suffix}"
-                        if col_name in df.columns:
-                            df.at[index, col_name] = None
-                if 'Original_Number_Status' in df.columns: 
-                    df.at[index, 'Original_Number_Status'] = 'Error_Pass1_RowProcessing'
+        except Exception as e:
+            logger.error(f"[RowID: {index}, Company: {company_name}] Error during Pass 1 processing for row {current_row_number_for_log}, Original URL {given_url_original_str_key}: {e}", exc_info=True)
+            df.at[index, 'Overall_VerificationStatus'] = 'Error_Pass1_RowProcessing'
+            current_scraper_status_for_df = df.at[index, 'ScrapingStatus']
+            if current_scraper_status_for_df in ["Not_Run", "Success", None] or not current_scraper_status_for_df :
+                 df.at[index, 'ScrapingStatus'] = f'PipelineError_{type(e).__name__}'
+            run_metrics["errors_encountered"].append(f"Pass 1 row processing error for {company_name} (URL: {given_url_original_str_key}): {str(e)}")
+            log_row_failure(
+                failure_log_writer=failure_writer,
+                input_row_identifier=index,
+                company_name=company_name,
+                given_url=given_url_original,
+                stage_of_failure="RowProcessing_Pass1_UnhandledException",
+                error_reason="Unhandled exception during Pass 1 row processing",
+                log_timestamp=datetime.now().isoformat(),
+                error_details=json.dumps({
+                    "exception_type": type(e).__name__,
+                    "exception_message": str(e)
+                }),
+                # Use final_canonical_entry_url (which was initialized at loop start) if available,
+                # otherwise what's in df (if populated by an earlier, successful scrape for this input row), or None.
+                associated_pathful_canonical_url=final_canonical_entry_url if final_canonical_entry_url else (df.at[index, 'CanonicalEntryURL'] if 'CanonicalEntryURL' in df.columns and pd.notna(df.at[index, 'CanonicalEntryURL']) else None)
+            )
+            stage_key = "RowProcessing_Pass1_UnhandledException"
+            row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
+            rows_failed_in_pass1 +=1
+            logger.error(
+                f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log} errored in Pass 1. "
+                f"ScraperStatus='{df.at[index, 'ScrapingStatus']}', "
+                f"OverallVerificationStatus='{df.at[index, 'Overall_VerificationStatus']}'"
+            )
+            for col_prefix in ['Primary_', 'Secondary_']:
+                for suffix in ['Number_1', 'Type_1', 'SourceURL_1', 'Number_2', 'Type_2', 'SourceURL_2']:
+                    col_name = f"{col_prefix}{suffix}"
+                    if col_name in df.columns:
+                        df.at[index, col_name] = None
+            if 'Original_Number_Status' in df.columns:
+                df.at[index, 'Original_Number_Status'] = 'Error_Pass1_RowProcessing'
         
     run_metrics["tasks"]["pass1_main_loop_duration_seconds"] = time.time() - pass1_loop_start_time
     run_metrics["data_processing_stats"]["rows_successfully_processed_pass1"] = rows_processed_in_pass1 - rows_failed_in_pass1
@@ -822,10 +1098,22 @@ def main() -> None:
         true_base_to_pathful_map[true_base].append(pathful_url_key)
         
         current_pathful_status = canonical_site_pathful_scraper_status.get(pathful_url_key, "Unknown")
+        
+        # Update true_base_scraper_status (existing logic)
         if true_base_scraper_status[true_base] == "Unknown" or \
            (current_pathful_status == "Success" and true_base_scraper_status[true_base] != "Success") or \
-           ("Error" not in current_pathful_status and "Error" in true_base_scraper_status[true_base]): 
+           ("Error" not in current_pathful_status and "Error" in true_base_scraper_status[true_base]):
             true_base_scraper_status[true_base] = current_pathful_status
+
+        # --- Start: Update Overall_Scraper_Status_For_Domain in canonical_domain_journey_data ---
+        if true_base in canonical_domain_journey_data:
+            # Use the same logic as for true_base_scraper_status
+            current_domain_overall_status = canonical_domain_journey_data[true_base].get("Overall_Scraper_Status_For_Domain", "Unknown")
+            if current_domain_overall_status == "Unknown" or \
+               (current_pathful_status == "Success" and current_domain_overall_status != "Success") or \
+               ("Error" not in current_pathful_status and "Error" in current_domain_overall_status):
+                canonical_domain_journey_data[true_base]["Overall_Scraper_Status_For_Domain"] = current_pathful_status
+        # --- End: Update Overall_Scraper_Status_For_Domain ---
 
 
     if 'CanonicalEntryURL' in df.columns and 'CompanyName' in df.columns:
@@ -853,12 +1141,42 @@ def main() -> None:
 
         final_consolidated_data_by_true_base[true_base_domain] = process_and_consolidate_contact_data(
             llm_results=all_llm_results_for_this_true_base,
-            company_name_from_input=representative_company_name_for_consolidation, 
-            initial_given_url=true_base_domain 
+            company_name_from_input=representative_company_name_for_consolidation,
+            initial_given_url=true_base_domain
         )
+        # --- Start: Populate LLM consolidated numbers info in canonical_domain_journey_data ---
+        if true_base_domain in canonical_domain_journey_data and final_consolidated_data_by_true_base[true_base_domain]:
+            consolidated_details = final_consolidated_data_by_true_base[true_base_domain]
+            if consolidated_details and consolidated_details.consolidated_numbers:
+                canonical_domain_journey_data[true_base_domain]["LLM_Total_Consolidated_Numbers_Found"] = len(consolidated_details.consolidated_numbers)
+                for cn_item in consolidated_details.consolidated_numbers:
+                    for source_detail in cn_item.sources:
+                        if source_detail.type: # Ensure type is not None
+                             canonical_domain_journey_data[true_base_domain]["LLM_Consolidated_Number_Types_Summary"][source_detail.type] += 1
+        # --- End: Populate LLM consolidated numbers info ---
     logger.info(f"Global Consolidation complete. {len(final_consolidated_data_by_true_base)} true base domains processed.")
     run_metrics["tasks"]["global_consolidation_duration_seconds"] = time.time() - global_consolidation_start_time
     run_metrics["data_processing_stats"]["unique_true_base_domains_consolidated"] = len(final_consolidated_data_by_true_base)
+
+    # --- Determine Final Outcome and Fault Category for each Canonical Domain ---
+    logger.info("Determining final outcomes for each canonical domain...")
+    for domain_key, journey_data_entry in canonical_domain_journey_data.items():
+        final_domain_reason, final_domain_fault = _determine_final_domain_outcome_and_fault(
+            true_base_domain=domain_key,
+            domain_journey_entry=journey_data_entry,
+            true_base_scraper_status_map=true_base_scraper_status, # This was populated during global consolidation
+            true_base_to_pathful_map=true_base_to_pathful_map, # This was populated during global consolidation
+            canonical_site_pathful_scraper_status=canonical_site_pathful_scraper_status, # Populated in Pass 1
+            # For canonical_site_regex_candidates_found_status, we use the aggregated value from the journey data
+            canonical_site_regex_candidates_found_status=journey_data_entry.get("Regex_Candidates_Found_For_Any_Pathful", False),
+            final_consolidated_data=final_consolidated_data_by_true_base.get(domain_key) # Result from process_and_consolidate
+        )
+        canonical_domain_journey_data[domain_key]["Final_Domain_Outcome_Reason"] = final_domain_reason
+        canonical_domain_journey_data[domain_key]["Primary_Fault_Category_For_Domain"] = final_domain_fault
+        if final_domain_reason != "Contact_Successfully_Extracted_For_Domain":
+            logger.info(f"Domain '{domain_key}': Outcome='{final_domain_reason}', Fault='{final_domain_fault}'")
+    logger.info("Final domain outcome determination complete.")
+    # --- End Final Outcome Determination for Canonical Domains ---
  
  
     detailed_columns_order = [
@@ -1097,6 +1415,20 @@ def main() -> None:
                 f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason} (Fault: {fault_category}). GivenURL: '{given_url_original_for_attrition}'"
             )
             # --- Populate Attrition Data List ---
+            # Get pre-computed duplicate counts for this row
+            current_input_company_name_for_counts = str(row_summary.get(company_name_col_key, "MISSING_COMPANY_NAME_INPUT")).strip()
+            current_input_given_url_for_counts = row_summary.get(url_col_key)
+            current_derived_input_canonical_for_counts = get_input_canonical_url(current_input_given_url_for_counts)
+            if not current_derived_input_canonical_for_counts:
+                current_derived_input_canonical_for_counts = "MISSING_OR_INVALID_URL_INPUT"
+
+            input_company_total_count = company_name_counts.get(current_input_company_name_for_counts, 0)
+            input_url_total_count = input_canonical_url_counts.get(current_derived_input_canonical_for_counts, 0)
+
+            is_dup_company_name = input_company_total_count > 1 and current_input_company_name_for_counts != "MISSING_COMPANY_NAME_INPUT"
+            is_dup_input_url = input_url_total_count > 1 and current_derived_input_canonical_for_counts != "MISSING_OR_INVALID_URL_INPUT"
+            is_overall_input_duplicate = is_dup_company_name or is_dup_input_url
+
             attrition_data_list.append({
                 "InputRowID": index,
                 "CompanyName": company_name_for_attrition,
@@ -1105,7 +1437,12 @@ def main() -> None:
                 "Determined_Fault_Category": fault_category,
                 "Relevant_Canonical_URLs": canonical_url_summary if canonical_url_summary else "N/A",
                 "LLM_Error_Detail_Summary": canonical_site_llm_exception_details.get(str(canonical_url_summary), "") if canonical_url_summary and fault_category == "LLM Issue" and "Error" in final_reason else "",
-                "Timestamp_Of_Determination": datetime.now().isoformat()
+                "Timestamp_Of_Determination": datetime.now().isoformat(),
+                "Input_CompanyName_Total_Count": input_company_total_count,
+                "Input_CanonicalURL_Total_Count": input_url_total_count,
+                "Is_Input_CompanyName_Duplicate": "Yes" if is_dup_company_name else "No",
+                "Is_Input_CanonicalURL_Duplicate": "Yes" if is_dup_input_url else "No",
+                "Is_Input_Row_Considered_Duplicate": "Yes" if is_overall_input_duplicate else "No"
             })
         else:
              logger.info(
@@ -1292,12 +1629,22 @@ def main() -> None:
     run_metrics["report_generation_stats"]["tertiary_report_rows"] = len(all_tertiary_rows)
     run_metrics["tasks"]["pass2_report_generation_duration_seconds"] = time.time() - pass2_reports_start_time
     
+    # Write Canonical Domain Summary Report
+    logger.info("Attempting to write Canonical Domain Summary Report...")
+    canonical_domain_summary_rows_written = write_canonical_domain_summary_report(
+        run_id=run_id,
+        domain_journey_data=canonical_domain_journey_data,
+        output_dir=run_output_dir
+    )
+    run_metrics["report_generation_stats"]["canonical_domain_summary_rows"] = canonical_domain_summary_rows_written
+    logger.info(f"Canonical Domain Summary Report: {canonical_domain_summary_rows_written} rows written.")
+
     # Write Row Attrition Report before final metrics
-    num_attrition_rows = write_row_attrition_report(run_id, attrition_data_list, run_output_dir)
+    num_attrition_rows = write_row_attrition_report(run_id, attrition_data_list, run_output_dir, canonical_domain_journey_data, input_to_canonical_map)
     # Potentially add num_attrition_rows to run_metrics if needed for summary in run_metrics.md
     run_metrics["data_processing_stats"]["rows_in_attrition_report"] = num_attrition_rows
  
-    write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, attrition_data_list)
+    write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, attrition_data_list, canonical_domain_journey_data)
 
     logger.info("Attempting to generate 'Final Processed Contacts' report...")
     if os.path.exists(tertiary_output_excel_path):
@@ -1317,7 +1664,7 @@ def main() -> None:
     logger.info(f"Run metrics file created at: {os.path.join(run_output_dir, f'run_metrics_{run_id}.md')}")
 
 
-def write_row_attrition_report(run_id: str, attrition_data: List[Dict[str, Any]], output_dir: str) -> int:
+def write_row_attrition_report(run_id: str, attrition_data: List[Dict[str, Any]], output_dir: str, canonical_domain_journey_data: Dict[str, Dict[str, Any]], input_to_canonical_map: Dict[str, Optional[str]]) -> int:
     """Writes the collected row attrition data to an Excel file with auto-width columns."""
     if not attrition_data:
         logger.info("No data for row attrition report. Skipping file creation.")
@@ -1327,11 +1674,51 @@ def write_row_attrition_report(run_id: str, attrition_data: List[Dict[str, Any]]
     report_path = os.path.join(output_dir, report_filename)
     report_df = pd.DataFrame(attrition_data)
     
-    # Ensure consistent column order, including LLM_Error_Detail_Summary
+    # Ensure consistent column order, including LLM_Error_Detail_Summary and new duplicate fields
+    # Update attrition data with new fields before creating DataFrame
+    for row_data in attrition_data:
+        given_url = row_data.get("GivenURL")
+        row_data["Derived_Input_CanonicalURL"] = get_input_canonical_url(given_url)
+        
+        # 'Relevant_Canonical_URLs' in attrition_data is expected to be the true_base_domain
+        # for the input row if one was determined.
+        final_processed_domain = row_data.get("Relevant_Canonical_URLs")
+        row_data["Final_Processed_Canonical_Domain"] = final_processed_domain if pd.notna(final_processed_domain) and final_processed_domain != "N/A" else None
+
+        link_to_outcome = None
+        if final_processed_domain and pd.notna(final_processed_domain) and final_processed_domain != "N/A":
+            if final_processed_domain in canonical_domain_journey_data:
+                # The "link" is the domain key itself, which can be used for lookups/hyperlinks
+                link_to_outcome = final_processed_domain
+            else:
+                # This case might occur if an input row failed very early,
+                # and its 'Relevant_Canonical_URLs' was populated from df['CanonicalEntryURL']
+                # but that domain didn't make it into canonical_domain_journey_data (e.g. if it was a duplicate canonical not processed further)
+                # Or if the input_to_canonical_map has a mapping but that canonical wasn't processed.
+                # Try to find it via input_to_canonical_map if direct lookup fails
+                input_url_key = str(given_url) if given_url is not None else "None_GivenURL_Input"
+                mapped_canonical = input_to_canonical_map.get(input_url_key)
+                if mapped_canonical and mapped_canonical in canonical_domain_journey_data:
+                    link_to_outcome = mapped_canonical
+                else:
+                    logger.debug(f"AttritionReport: Could not find domain '{final_processed_domain}' (from GivenURL: {given_url}) in canonical_domain_journey_data for linking.")
+        row_data["Link_To_Canonical_Domain_Outcome"] = link_to_outcome
+
+    report_df = pd.DataFrame(attrition_data)
+
     columns_order = [
         "InputRowID", "CompanyName", "GivenURL",
+        "Derived_Input_CanonicalURL", # New
+        "Final_Processed_Canonical_Domain", # New
+        "Link_To_Canonical_Domain_Outcome", # New
         "Final_Row_Outcome_Reason", "Determined_Fault_Category",
-        "Relevant_Canonical_URLs", "LLM_Error_Detail_Summary", # Added
+        "Relevant_Canonical_URLs", # This is the old field, kept for reference, might be same as Final_Processed_Canonical_Domain
+        "LLM_Error_Detail_Summary",
+        "Input_CompanyName_Total_Count",
+        "Input_CanonicalURL_Total_Count",
+        "Is_Input_CompanyName_Duplicate",
+        "Is_Input_CanonicalURL_Duplicate",
+        "Is_Input_Row_Considered_Duplicate",
         "Timestamp_Of_Determination"
     ]
     
@@ -1365,7 +1752,7 @@ def write_row_attrition_report(run_id: str, attrition_data: List[Dict[str, Any]]
         return 0
 
 
-def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pipeline_start_time: float, attrition_data_list_for_metrics: List[Dict[str, Any]]) -> None:
+def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pipeline_start_time: float, attrition_data_list_for_metrics: List[Dict[str, Any]], canonical_domain_journey_data: Dict[str, Dict[str, Any]]) -> None:
     """Writes the collected run metrics to a Markdown file."""
     metrics["total_duration_seconds"] = time.time() - pipeline_start_time
     metrics_file_path = os.path.join(output_dir, f"run_metrics_{run_id}.md")
@@ -1437,7 +1824,39 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
             f.write(f"- **Input Rows Processed (Initial Load):** {stats.get('input_rows_count', 0)}\n")
             f.write(f"- **Rows Successfully Processed (Pass 1):** {stats.get('rows_successfully_processed_pass1', 0)}\n")
             f.write(f"- **Rows Failed During Processing (Pass 1):** {stats.get('rows_failed_pass1', 0)} (Input rows that did not complete Pass 1 successfully due to errors such as invalid URL, scraping failure, or critical processing exceptions for that row, preventing LLM processing or final data consolidation for that specific input.)\n")
-            f.write(f"- **Unique True Base Domains Consolidated:** {stats.get('unique_true_base_domains_consolidated', 0)}\n\n")
+            f.write(f"- **Unique True Base Domains Consolidated:** {stats.get('unique_true_base_domains_consolidated', 0)}\n")
+            # Removed extra \n\n to place new section directly after
+
+            f.write("\n## Input Data Duplicate Analysis:\n")
+            dp_stats = metrics.get("data_processing_stats", {})
+            f.write(f"- **Total Input Rows Analyzed for Duplicates:** {dp_stats.get('input_rows_count', 0)}\n")
+            f.write(f"- **Unique Input CompanyNames Found:** {dp_stats.get('input_unique_company_names', 0)}\n")
+            f.write(f"- **Input CompanyNames Appearing More Than Once:** {dp_stats.get('input_company_names_with_duplicates_count', 0)}\n")
+            f.write(f"- **Total Input Rows with a Duplicate CompanyName:** {dp_stats.get('input_rows_with_duplicate_company_name', 0)}\n")
+            f.write(f"- **Unique Input Canonical URLs Found:** {dp_stats.get('input_unique_canonical_urls', 0)}\n")
+            f.write(f"- **Input Canonical URLs Appearing More Than Once:** {dp_stats.get('input_canonical_urls_with_duplicates_count', 0)}\n")
+            f.write(f"- **Total Input Rows with a Duplicate Input Canonical URL:** {dp_stats.get('input_rows_with_duplicate_canonical_url', 0)}\n")
+            f.write(f"- **Total Input Rows Considered Duplicates (either CompanyName or URL):** {dp_stats.get('input_rows_considered_duplicates_overall', 0)}\n\n")
+
+            # Analyze duplicates within the attrition list
+            attrition_input_company_duplicates = 0
+            attrition_input_url_duplicates = 0
+            attrition_overall_input_duplicates = 0
+            if attrition_data_list_for_metrics:
+                for attrition_row in attrition_data_list_for_metrics:
+                    if attrition_row.get("Is_Input_CompanyName_Duplicate") == "Yes":
+                        attrition_input_company_duplicates += 1
+                    if attrition_row.get("Is_Input_CanonicalURL_Duplicate") == "Yes":
+                        attrition_input_url_duplicates += 1
+                    if attrition_row.get("Is_Input_Row_Considered_Duplicate") == "Yes":
+                        attrition_overall_input_duplicates += 1
+            
+            f.write("### Input Duplicates within Attrition Report:\n")
+            total_attrition_rows = len(attrition_data_list_for_metrics)
+            f.write(f"- **Total Rows in Attrition Report:** {total_attrition_rows}\n")
+            f.write(f"- **Attrition Rows with Original Input CompanyName Duplicate:** {attrition_input_company_duplicates}\n")
+            f.write(f"- **Attrition Rows with Original Input Canonical URL Duplicate:** {attrition_input_url_duplicates}\n")
+            f.write(f"- **Attrition Rows Considered Overall Original Input Duplicates:** {attrition_overall_input_duplicates}\n\n")
 
 
             f.write("## Scraping Statistics:\n")
@@ -1502,7 +1921,41 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
             stats = metrics.get("report_generation_stats", {})
             f.write(f"- **Detailed Report Rows Created:** {stats.get('detailed_report_rows', 0)}\n")
             f.write(f"- **Summary Report Rows Created:** {stats.get('summary_report_rows', 0)}\n")
-            f.write(f"- **Tertiary Report Rows Created:** {stats.get('tertiary_report_rows', 0)}\n\n")
+            f.write(f"- **Tertiary Report Rows Created:** {stats.get('tertiary_report_rows', 0)}\n")
+            f.write(f"- **Canonical Domain Summary Rows Created:** {stats.get('canonical_domain_summary_rows', 0)}\n\n")
+
+            f.write("## Canonical Domain Processing Summary:\n")
+            if canonical_domain_journey_data:
+                total_canonical_domains = len(canonical_domain_journey_data)
+                f.write(f"- **Total Unique Canonical Domains Processed:** {total_canonical_domains}\n")
+
+                outcome_counts: Dict[str, int] = Counter()
+                fault_counts: Dict[str, int] = Counter()
+
+                for domain_data in canonical_domain_journey_data.values():
+                    outcome = domain_data.get("Final_Domain_Outcome_Reason", "Unknown_Outcome")
+                    fault = domain_data.get("Primary_Fault_Category_For_Domain", "Unknown_Fault")
+                    outcome_counts[outcome] += 1
+                    if fault != "N/A": # Only count actual faults
+                        fault_counts[fault] += 1
+                
+                f.write("### Outcomes for Canonical Domains:\n")
+                if outcome_counts:
+                    for outcome, count in sorted(outcome_counts.items()):
+                        f.write(f"  - **{outcome.replace('_', ' ').title()}:** {count}\n")
+                else:
+                    f.write("  - No outcome data recorded for canonical domains.\n")
+                f.write("\n")
+
+                f.write("### Primary Fault Categories for Canonical Domains (where applicable):\n")
+                if fault_counts:
+                    for fault, count in sorted(fault_counts.items()):
+                        f.write(f"  - **{fault.replace('_', ' ').title()}:** {count}\n")
+                else:
+                    f.write("  - No fault data recorded for canonical domains or all succeeded.\n")
+                f.write("\n")
+            else:
+                f.write("- No canonical domain journey data available to summarize.\n\n")
 
             f.write("## Summary of Row-Level Failures (from `failed_rows_{run_id}.csv`):\n")
             row_failures_summary = metrics.get("data_processing_stats", {}).get("row_level_failure_summary", {})
@@ -1592,8 +2045,74 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
         logger.info(f"Run metrics successfully written to {metrics_file_path}")
     except IOError as e:
         logger.error(f"Failed to write run metrics to {metrics_file_path}: {e}", exc_info=True)
-    except Exception as e_global: 
+    except Exception as e_global:
         logger.error(f"An unexpected error occurred while writing metrics to {metrics_file_path}: {e_global}", exc_info=True)
+def write_canonical_domain_summary_report(
+    run_id: str,
+    domain_journey_data: Dict[str, Dict[str, Any]],
+    output_dir: str
+) -> int:
+    """
+    Writes the canonical domain journey data to an Excel file.
+    """
+    if not domain_journey_data:
+        logger.info("No data for canonical domain summary report. Skipping file creation.")
+        return 0
+
+    report_filename = f"canonical_domain_processing_summary_{run_id}.xlsx"
+    report_path = os.path.join(output_dir, report_filename)
+
+    report_data_list = []
+    for domain, data in domain_journey_data.items():
+        row = {"Canonical_Domain": domain}
+        row.update(data)
+        report_data_list.append(row)
+    
+    report_df = pd.DataFrame(report_data_list)
+
+    columns_order = [
+        "Canonical_Domain", "Input_Row_IDs", "Input_CompanyNames", "Input_GivenURLs",
+        "Pathful_URLs_Attempted_List", "Overall_Scraper_Status_For_Domain",
+        "Total_Pages_Scraped_For_Domain", "Scraped_Pages_Details_Aggregated",
+        "Regex_Candidates_Found_For_Any_Pathful", "LLM_Calls_Made_For_Domain",
+        "LLM_Total_Raw_Numbers_Extracted", "LLM_Total_Consolidated_Numbers_Found",
+        "LLM_Consolidated_Number_Types_Summary", "LLM_Processing_Error_Encountered_For_Domain",
+        "LLM_Error_Messages_Aggregated", "Final_Domain_Outcome_Reason",
+        "Primary_Fault_Category_For_Domain"
+    ]
+
+    for col in columns_order:
+        if col not in report_df.columns:
+            report_df[col] = None
+            logger.warning(f"Column '{col}' was not found in canonical_domain_summary_report DataFrame and was initialized to None.")
+    report_df = report_df[columns_order]
+
+    for col_name in ["Input_Row_IDs", "Input_CompanyNames", "Input_GivenURLs", "Pathful_URLs_Attempted_List", "LLM_Error_Messages_Aggregated"]:
+        if col_name in report_df.columns:
+            report_df[col_name] = report_df[col_name].apply(lambda x: ", ".join(sorted(list(map(str, x)))) if isinstance(x, (set, list)) else x)
+    
+    for col_with_counter in ["Scraped_Pages_Details_Aggregated", "LLM_Consolidated_Number_Types_Summary"]:
+        if col_with_counter in report_df.columns:
+            report_df[col_with_counter] = report_df[col_with_counter].apply(
+                lambda x: json.dumps(dict(x)) if isinstance(x, Counter) else x
+            )
+
+    try:
+        with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+            report_df.to_excel(writer, index=False, sheet_name='Canonical_Domain_Summary')
+            worksheet = writer.sheets['Canonical_Domain_Summary']
+            for col_idx, col_name in enumerate(report_df.columns):
+                series_data = report_df[col_name]
+                max_val_len = series_data.astype(str).map(len).max() if not series_data.empty else 0
+                column_header_len = len(str(col_name))
+                adjusted_width = max(max_val_len, column_header_len) + 5
+                worksheet.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+        
+        logger.info(f"Canonical domain summary report successfully saved to {report_path}")
+        return len(report_df)
+    except Exception as e:
+        logger.error(f"Failed to write canonical domain summary report to {report_path}: {e}", exc_info=True)
+        return 0
 
 
 if __name__ == '__main__':
