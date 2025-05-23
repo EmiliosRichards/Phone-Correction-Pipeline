@@ -274,277 +274,239 @@ class GeminiLLMExtractor:
             the prompt, `google_exceptions.GoogleAPIError` for API issues,
             `json.JSONDecodeError`, and `PydanticValidationError`.
         """
-        raw_llm_response_str: Optional[str] = None
-        final_processed_outputs: List[Optional[PhoneNumberLLMOutput]] = [None] * len(candidate_items)
-        items_needing_retry: List[Tuple[int, Dict[str, Any]]] = [] # Stores (original_index, input_item_dict)
-        raw_llm_response_str_initial: Optional[str] = None
-        token_usage_stats_initial: Optional[Dict[str, int]] = None
-        # To accumulate token stats from multiple calls
+        overall_processed_outputs: List[PhoneNumberLLMOutput] = []
+        overall_raw_responses: List[str] = []
         accumulated_token_stats: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
+        chunk_size = self.config.llm_candidate_chunk_size
+        max_chunks = self.config.llm_max_chunks_per_url
+        chunks_processed_count = 0
 
-        # --- BEGIN NEW LOGIC FOR SAVING TEMPLATE ONCE ---
+        # --- BEGIN LOGIC FOR SAVING TEMPLATE ONCE (moved outside chunk loop) ---
         try:
             run_output_dir = os.path.dirname(llm_context_dir)
-            if not run_output_dir: # e.g. if llm_context_dir was just "llm_context"
+            if not run_output_dir:
                 logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Could not determine run_output_dir from llm_context_dir: '{llm_context_dir}'. Cannot save prompt template.")
             else:
-                # Ensure the parent directory for llm_prompt_template.txt exists
                 os.makedirs(run_output_dir, exist_ok=True)
-
                 template_output_filename = "llm_prompt_template.txt"
                 template_output_filepath = os.path.join(run_output_dir, template_output_filename)
-
                 if not os.path.exists(template_output_filepath):
                     logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Attempting to save base LLM prompt template to {template_output_filepath}")
                     try:
-                        # Load the original base prompt template content
                         base_prompt_content = self._load_prompt_template(prompt_template_path)
                         with open(template_output_filepath, 'w', encoding='utf-8') as f_template:
                             f_template.write(base_prompt_content)
                         logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Successfully saved base LLM prompt template to {template_output_filepath}")
-                    except FileNotFoundError:
-                        # _load_prompt_template logs this. This log is for context of this specific save operation.
-                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Base prompt template file '{prompt_template_path}' not found. Cannot save a copy to '{template_output_filepath}'.")
-                    except IOError as e_io:
-                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] IOError saving base LLM prompt template to '{template_output_filepath}': {e_io}")
-                    except Exception as e_template_save: # Catch any other error during template loading/saving
-                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Unexpected error during saving of base LLM prompt template to '{template_output_filepath}': {e_template_save}")
+                    except Exception as e_template_save:
+                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Error saving base LLM prompt template: {e_template_save}")
                 else:
-                    logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Base LLM prompt template '{template_output_filepath}' already exists. Skipping save.")
-        except Exception as e_path_setup: # Catch errors from os.path.dirname or os.makedirs
-            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Error in pre-processing for saving prompt template (e.g., path manipulation for '{llm_context_dir}'): {e_path_setup}")
-        # --- END NEW LOGIC FOR SAVING TEMPLATE ONCE ---
+                    logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Base LLM prompt template '{template_output_filepath}' already exists.")
+        except Exception as e_path_setup:
+            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Error in pre-processing for saving prompt template: {e_path_setup}")
+        # --- END LOGIC FOR SAVING TEMPLATE ONCE ---
 
-        # --- Initial LLM Call ---
-        current_items_for_llm_call = list(candidate_items) # Make a mutable copy
-        
-        try:
-            prompt_template_pass1 = self._load_prompt_template(prompt_template_path)
-            candidate_items_json_str_pass1 = json.dumps(current_items_for_llm_call, indent=2)
-            formatted_prompt_pass1 = prompt_template_pass1.replace(
-                "[Insert JSON list of (candidate_number, source_url, snippet) objects here]",
-                candidate_items_json_str_pass1
-            )
-        except Exception as e:
-            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Failed to load or format prompt for initial call: {e}")
-            # Populate all with error items
-            for i, item_detail in enumerate(candidate_items):
-                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_PromptLoading", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-            return [item for item in final_processed_outputs if item is not None], f"Error loading prompt: {str(e)}", accumulated_token_stats
-
-        generation_config_pass1 = GenerationConfig(
-            candidate_count=1,
-            max_output_tokens=self.config.llm_max_tokens,
-            temperature=self.config.llm_temperature
-        )
-
-        try:
-            logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Sending initial request to Gemini for {len(current_items_for_llm_call)} items. Prompt starts with: {formatted_prompt_pass1[:200]}...")
-            response_pass1 = self._generate_content_with_retry(formatted_prompt_pass1, generation_config_pass1, file_identifier_prefix, triggering_input_row_id, triggering_company_name)
-            raw_llm_response_str_initial = response_pass1.text
-
-            if hasattr(response_pass1, 'usage_metadata') and response_pass1.usage_metadata:
-                token_usage_stats_initial = {
-                    "prompt_tokens": response_pass1.usage_metadata.prompt_token_count,
-                    "completion_tokens": response_pass1.usage_metadata.candidates_token_count,
-                    "total_tokens": response_pass1.usage_metadata.total_token_count
-                }
-                for key in accumulated_token_stats: accumulated_token_stats[key] += token_usage_stats_initial.get(key, 0)
-                logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call usage: {token_usage_stats_initial}")
-            else:
-                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Gemini API usage metadata not found.")
-
-            if not response_pass1.candidates:
-                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] No candidates found in initial Gemini response.")
-                for i, item_detail in enumerate(candidate_items):
-                    final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_NoLLMCandidates", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                return [item for item in final_processed_outputs if item is not None], json.dumps({"error": "No candidates in initial response", "raw_response_text": raw_llm_response_str_initial}), accumulated_token_stats
-
-            if raw_llm_response_str_initial:
-                json_candidate_str_pass1 = self._extract_json_from_text(raw_llm_response_str_initial)
-                if json_candidate_str_pass1:
-                    try:
-                        parsed_json_object_pass1 = json.loads(json_candidate_str_pass1)
-                        llm_result_pass1 = MinimalExtractionOutput(**parsed_json_object_pass1)
-                        validated_numbers_pass1 = llm_result_pass1.extracted_numbers
-
-                        if len(validated_numbers_pass1) != len(current_items_for_llm_call):
-                            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Mismatch in item count. Input: {len(current_items_for_llm_call)}, Output: {len(validated_numbers_pass1)}. Cannot reliably map. Marking all as error.")
-                            for i, item_detail in enumerate(candidate_items):
-                                final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_LLMItemCountMismatch", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                            return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
-                        
-                        for i, input_item_detail in enumerate(current_items_for_llm_call):
-                            llm_output_item = validated_numbers_pass1[i]
-                            if llm_output_item.number == input_item_detail['number']:
-                                final_processed_outputs[i] = self._process_successful_llm_item(llm_output_item, input_item_detail)
-                            else:
-                                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {input_item_detail.get('original_input_company_name')}] Initial mismatch for input '{input_item_detail['number']}', LLM returned '{llm_output_item.number}'. Queueing for retry.")
-                                items_needing_retry.append((i, input_item_detail))
-                    
-                    except json.JSONDecodeError as e:
-                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Failed to parse JSON: {e}. Raw: '{raw_llm_response_str_initial[:500]}...'")
-                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialJsonParse", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                        return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
-                    except PydanticValidationError as ve:
-                        logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Pydantic validation failed: {ve}. Raw: '{raw_llm_response_str_initial[:500]}...'")
-                        for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialPydanticValidation", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                        return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
-                else: # No JSON block
-                    logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Could not extract JSON block. Raw: {raw_llm_response_str_initial[:500]}...")
-                    for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialNoJsonBlock", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                    return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
-            else: # Empty response
-                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Response text is empty.")
-                for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, "Error_InitialEmptyResponse", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                return [item for item in final_processed_outputs if item is not None], raw_llm_response_str_initial, accumulated_token_stats
-
-        except google_exceptions.GoogleAPIError as e:
-            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Gemini API error: {e}")
-            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialApiError_{type(e).__name__}", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-            return [item for item in final_processed_outputs if item is not None], json.dumps({"error": f"Initial Gemini API error: {str(e)}", "type": type(e).__name__}), accumulated_token_stats
-        except Exception as e:
-            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Initial LLM call: Unexpected error: {e}", exc_info=True)
-            for i, item_detail in enumerate(candidate_items): final_processed_outputs[i] = self._create_error_llm_item(item_detail, f"Error_InitialUnexpected_{type(e).__name__}", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-            return [item for item in final_processed_outputs if item is not None], json.dumps({"error": f"Initial unexpected error: {str(e)}", "type": type(e).__name__}), accumulated_token_stats
-
-        # --- Iterative Retry Loop for Mismatched Items ---
-        current_retry_attempt = 0
-        raw_llm_response_str_retry: Optional[str] = None # To store the last retry response
-
-        while items_needing_retry and current_retry_attempt < self.config.llm_max_retries_on_number_mismatch:
-            current_retry_attempt += 1
-            logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Attempting LLM retry pass #{current_retry_attempt} for {len(items_needing_retry)} mismatched items.")
+        for i in range(0, len(candidate_items), chunk_size):
+            if chunks_processed_count >= max_chunks:
+                logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Reached max_chunks limit ({max_chunks}). Processing {chunks_processed_count * chunk_size} candidates out of {len(candidate_items)}.")
+                break
             
-            inputs_for_this_retry_pass = [item_tuple[1] for item_tuple in items_needing_retry]
-            original_indices_for_this_pass = [item_tuple[0] for item_tuple in items_needing_retry]
+            current_chunk_candidate_items = candidate_items[i : i + chunk_size]
+            if not current_chunk_candidate_items:
+                break # Should not happen if loop condition is correct
+
+            chunks_processed_count += 1
+            chunk_file_identifier_prefix = f"{file_identifier_prefix}_chunk_{chunks_processed_count}"
+            
+            logger.info(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Processing chunk {chunks_processed_count}/{max_chunks if max_chunks > 0 else 'unlimited'} with {len(current_chunk_candidate_items)} items.")
+
+            # --- Per-Chunk LLM Call Logic (adapted from original single call logic) ---
+            final_processed_outputs_for_chunk: List[Optional[PhoneNumberLLMOutput]] = [None] * len(current_chunk_candidate_items)
+            items_needing_retry_for_chunk: List[Tuple[int, Dict[str, Any]]] = []
+            raw_llm_response_str_initial_for_chunk: Optional[str] = None
             
             try:
-                prompt_template_retry = self._load_prompt_template(prompt_template_path) # Reload, though it's same
-                candidate_items_json_str_retry = json.dumps(inputs_for_this_retry_pass, indent=2)
-                formatted_prompt_retry = prompt_template_retry.replace(
+                prompt_template_chunk = self._load_prompt_template(prompt_template_path)
+                candidate_items_json_str_chunk = json.dumps(current_chunk_candidate_items, indent=2)
+                formatted_prompt_chunk = prompt_template_chunk.replace(
                     "[Insert JSON list of (candidate_number, source_url, snippet) objects here]",
-                    candidate_items_json_str_retry
+                    candidate_items_json_str_chunk
                 )
             except Exception as e:
-                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Failed to load or format prompt for retry pass #{current_retry_attempt}: {e}")
-                # Mark remaining items_needing_retry as error and break loop
-                for original_idx, item_detail_retry in items_needing_retry:
-                    if final_processed_outputs[original_idx] is None: # Only if not already processed
-                         final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_retry, f"Error_RetryPromptLoading_Pass{current_retry_attempt}", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-                items_needing_retry.clear() # Stop further retries
-                break
+                logger.error(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Failed to load/format prompt for chunk: {e}")
+                for k, item_detail_chunk in enumerate(current_chunk_candidate_items):
+                    final_processed_outputs_for_chunk[k] = self._create_error_llm_item(item_detail_chunk, "Error_PromptLoading", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                overall_processed_outputs.extend([item for item in final_processed_outputs_for_chunk if item is not None])
+                overall_raw_responses.append(json.dumps({"error": f"Error loading prompt for chunk: {str(e)}"}))
+                continue # Next chunk
 
-            generation_config_retry = GenerationConfig( # Same config as initial
+            generation_config_chunk = GenerationConfig(
                 candidate_count=1, max_output_tokens=self.config.llm_max_tokens, temperature=self.config.llm_temperature
             )
 
             try:
-                logger.debug(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Sending retry #{current_retry_attempt} request to Gemini for {len(inputs_for_this_retry_pass)} items.")
-                response_retry = self._generate_content_with_retry(formatted_prompt_retry, generation_config_retry, file_identifier_prefix, triggering_input_row_id, triggering_company_name)
-                raw_llm_response_str_retry = response_retry.text # Store this retry's raw response
+                response_chunk = self._generate_content_with_retry(formatted_prompt_chunk, generation_config_chunk, chunk_file_identifier_prefix, triggering_input_row_id, triggering_company_name)
+                raw_llm_response_str_initial_for_chunk = response_chunk.text
 
-                if hasattr(response_retry, 'usage_metadata') and response_retry.usage_metadata:
-                    token_stats_retry = {
-                        "prompt_tokens": response_retry.usage_metadata.prompt_token_count,
-                        "completion_tokens": response_retry.usage_metadata.candidates_token_count,
-                        "total_tokens": response_retry.usage_metadata.total_token_count
+                if hasattr(response_chunk, 'usage_metadata') and response_chunk.usage_metadata:
+                    token_stats_chunk = {
+                        "prompt_tokens": response_chunk.usage_metadata.prompt_token_count,
+                        "completion_tokens": response_chunk.usage_metadata.candidates_token_count,
+                        "total_tokens": response_chunk.usage_metadata.total_token_count
                     }
-                    for key in accumulated_token_stats: accumulated_token_stats[key] += token_stats_retry.get(key, 0)
-                    logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM retry #{current_retry_attempt} usage: {token_stats_retry}")
+                    for key_token in accumulated_token_stats: accumulated_token_stats[key_token] += token_stats_chunk.get(key_token, 0)
+                    logger.info(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call usage: {token_stats_chunk}")
                 else:
-                    logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM retry #{current_retry_attempt}: Gemini API usage metadata not found.")
+                    logger.warning(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Gemini API usage metadata not found.")
 
-                still_mismatched_after_this_retry: List[Tuple[int, Dict[str, Any]]] = []
-                if not response_retry.candidates:
-                    logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: No candidates in Gemini response. All items in this batch remain mismatched.")
-                    still_mismatched_after_this_retry.extend(items_needing_retry) # All failed this retry
-                elif raw_llm_response_str_retry:
-                    json_candidate_str_retry = self._extract_json_from_text(raw_llm_response_str_retry)
-                    if json_candidate_str_retry:
+                if not response_chunk.candidates:
+                    logger.error(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] No candidates in Gemini response for chunk.")
+                    for k, item_detail_chunk in enumerate(current_chunk_candidate_items):
+                        final_processed_outputs_for_chunk[k] = self._create_error_llm_item(item_detail_chunk, "Error_NoLLMCandidates", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                elif raw_llm_response_str_initial_for_chunk:
+                    json_candidate_str_chunk = self._extract_json_from_text(raw_llm_response_str_initial_for_chunk)
+                    if json_candidate_str_chunk:
                         try:
-                            parsed_json_object_retry = json.loads(json_candidate_str_retry)
-                            llm_result_retry = MinimalExtractionOutput(**parsed_json_object_retry)
-                            validated_numbers_retry = llm_result_retry.extracted_numbers
+                            parsed_json_object_chunk = json.loads(json_candidate_str_chunk)
+                            llm_result_chunk = MinimalExtractionOutput(**parsed_json_object_chunk)
+                            validated_numbers_chunk = llm_result_chunk.extracted_numbers
 
-                            if len(validated_numbers_retry) != len(inputs_for_this_retry_pass):
-                                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Mismatch in item count. Input: {len(inputs_for_this_retry_pass)}, Output: {len(validated_numbers_retry)}. All items in this batch remain mismatched.")
-                                still_mismatched_after_this_retry.extend(items_needing_retry)
+                            if len(validated_numbers_chunk) != len(current_chunk_candidate_items):
+                                logger.error(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Mismatch in item count. Input: {len(current_chunk_candidate_items)}, Output: {len(validated_numbers_chunk)}. Marking all in chunk as error.")
+                                for k_err, item_detail_chunk_err in enumerate(current_chunk_candidate_items):
+                                    final_processed_outputs_for_chunk[k_err] = self._create_error_llm_item(item_detail_chunk_err, "Error_LLMItemCountMismatch", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
                             else:
-                                for j, retried_input_item_detail in enumerate(inputs_for_this_retry_pass):
-                                    original_input_idx = original_indices_for_this_pass[j]
-                                    retried_llm_output_item = validated_numbers_retry[j]
-
-                                    if retried_llm_output_item.number == retried_input_item_detail['number']:
-                                        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {retried_input_item_detail.get('original_input_company_name')}] Retry pass #{current_retry_attempt} successful for input '{retried_input_item_detail['number']}'.")
-                                        final_processed_outputs[original_input_idx] = self._process_successful_llm_item(retried_llm_output_item, retried_input_item_detail)
+                                for k, input_item_detail_chunk in enumerate(current_chunk_candidate_items):
+                                    llm_output_item_chunk = validated_numbers_chunk[k]
+                                    if llm_output_item_chunk.number == input_item_detail_chunk['number']:
+                                        final_processed_outputs_for_chunk[k] = self._process_successful_llm_item(llm_output_item_chunk, input_item_detail_chunk)
                                     else:
-                                        logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {retried_input_item_detail.get('original_input_company_name')}] Mismatch persists after retry pass #{current_retry_attempt} for input '{retried_input_item_detail['number']}', LLM returned '{retried_llm_output_item.number}'.")
-                                        still_mismatched_after_this_retry.append((original_input_idx, retried_input_item_detail))
-                        
-                        except json.JSONDecodeError as e:
-                            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Failed to parse JSON: {e}. All items in this batch remain mismatched.")
-                            still_mismatched_after_this_retry.extend(items_needing_retry)
-                        except PydanticValidationError as ve:
-                            logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Pydantic validation failed: {ve}. All items in this batch remain mismatched.")
-                            still_mismatched_after_this_retry.extend(items_needing_retry)
-                    else: # No JSON block in retry
-                        logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Could not extract JSON block. All items in this batch remain mismatched.")
-                        still_mismatched_after_this_retry.extend(items_needing_retry)
-                else: # Empty response in retry
-                    logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Response text is empty. All items in this batch remain mismatched.")
-                    still_mismatched_after_this_retry.extend(items_needing_retry)
+                                        items_needing_retry_for_chunk.append((k, input_item_detail_chunk)) # k is index within chunk
+                        except (json.JSONDecodeError, PydanticValidationError) as e_parse_validate:
+                            logger.error(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Failed to parse/validate JSON: {e_parse_validate}. Raw: '{raw_llm_response_str_initial_for_chunk[:200]}...'")
+                            for k_err, item_detail_chunk_err in enumerate(current_chunk_candidate_items):
+                                final_processed_outputs_for_chunk[k_err] = self._create_error_llm_item(item_detail_chunk_err, f"Error_ChunkJsonParseValidate_{type(e_parse_validate).__name__}", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                    else: # No JSON block in chunk
+                        logger.warning(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Could not extract JSON block.")
+                        for k_err, item_detail_chunk_err in enumerate(current_chunk_candidate_items):
+                             final_processed_outputs_for_chunk[k_err] = self._create_error_llm_item(item_detail_chunk_err, "Error_ChunkNoJsonBlock", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                else: # Empty response for chunk
+                    logger.warning(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Response text is empty.")
+                    for k_err, item_detail_chunk_err in enumerate(current_chunk_candidate_items):
+                        final_processed_outputs_for_chunk[k_err] = self._create_error_llm_item(item_detail_chunk_err, "Error_ChunkEmptyResponse", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+
+            except google_exceptions.GoogleAPIError as e_api:
+                logger.error(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Gemini API error: {e_api}")
+                for k_err, item_detail_chunk_err in enumerate(current_chunk_candidate_items):
+                    final_processed_outputs_for_chunk[k_err] = self._create_error_llm_item(item_detail_chunk_err, f"Error_ChunkApiError_{type(e_api).__name__}", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                raw_llm_response_str_initial_for_chunk = json.dumps({"error": f"Chunk Gemini API error: {str(e_api)}", "type": type(e_api).__name__})
+            except Exception as e_gen:
+                logger.error(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM chunk call: Unexpected error: {e_gen}", exc_info=True)
+                for k_err, item_detail_chunk_err in enumerate(current_chunk_candidate_items):
+                    final_processed_outputs_for_chunk[k_err] = self._create_error_llm_item(item_detail_chunk_err, f"Error_ChunkUnexpected_{type(e_gen).__name__}", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                raw_llm_response_str_initial_for_chunk = json.dumps({"error": f"Chunk unexpected error: {str(e_gen)}", "type": type(e_gen).__name__})
+            
+            # --- Mismatch Retry Loop for the Current Chunk ---
+            # This internal retry logic is complex and operates on indices within the current chunk.
+            # It's adapted from the original single-batch retry.
+            current_chunk_retry_attempt = 0
+            raw_llm_response_str_retry_for_chunk: Optional[str] = None
+
+            while items_needing_retry_for_chunk and current_chunk_retry_attempt < self.config.llm_max_retries_on_number_mismatch:
+                current_chunk_retry_attempt += 1
+                logger.info(f"[{chunk_file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Attempting LLM chunk retry pass #{current_chunk_retry_attempt} for {len(items_needing_retry_for_chunk)} items.")
                 
-                items_needing_retry = still_mismatched_after_this_retry
+                inputs_for_this_chunk_retry_pass = [item_tuple[1] for item_tuple in items_needing_retry_for_chunk]
+                original_indices_within_chunk_for_this_pass = [item_tuple[0] for item_tuple in items_needing_retry_for_chunk]
 
-            except google_exceptions.GoogleAPIError as e:
-                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Gemini API error: {e}. All items in this batch remain mismatched for this attempt.")
-                # No change to items_needing_retry, they will be processed in next attempt or final error handling
-                # We don't clear items_needing_retry here, to allow further retries if configured.
-            except Exception as e:
-                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Retry #{current_retry_attempt}: Unexpected error: {e}", exc_info=True)
-                # As above, items remain for next attempt or final error handling.
+                # ... (Prompt formatting for retry chunk - similar to initial chunk) ...
+                try:
+                    prompt_template_chunk_retry = self._load_prompt_template(prompt_template_path)
+                    candidate_items_json_str_chunk_retry = json.dumps(inputs_for_this_chunk_retry_pass, indent=2)
+                    formatted_prompt_chunk_retry = prompt_template_chunk_retry.replace(
+                        "[Insert JSON list of (candidate_number, source_url, snippet) objects here]",
+                        candidate_items_json_str_chunk_retry
+                    )
+                except Exception as e_prompt_retry:
+                    logger.error(f"[{chunk_file_identifier_prefix}] Failed to load/format prompt for chunk retry #{current_chunk_retry_attempt}: {e_prompt_retry}")
+                    for original_idx_in_chunk, item_detail_retry_err in items_needing_retry_for_chunk:
+                        if final_processed_outputs_for_chunk[original_idx_in_chunk] is None:
+                            final_processed_outputs_for_chunk[original_idx_in_chunk] = self._create_error_llm_item(item_detail_retry_err, f"Error_ChunkRetryPromptLoading_Pass{current_chunk_retry_attempt}", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                    items_needing_retry_for_chunk.clear()
+                    break # Break from this chunk's retry loop
 
-        # --- Handle Persistently Mismatched Items (after all retries) ---
-        if items_needing_retry:
-            logger.warning(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] {len(items_needing_retry)} items still mismatched after all {self.config.llm_max_retries_on_number_mismatch} retries.")
-            for original_idx, item_detail_persist_error in items_needing_retry:
-                if final_processed_outputs[original_idx] is None: # Only if not somehow processed
-                    final_processed_outputs[original_idx] = self._create_error_llm_item(item_detail_persist_error, "Error_PersistentMismatchAfterRetries", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+                generation_config_chunk_retry = GenerationConfig(
+                    candidate_count=1, max_output_tokens=self.config.llm_max_tokens, temperature=self.config.llm_temperature
+                )
+                
+                try:
+                    response_chunk_retry = self._generate_content_with_retry(formatted_prompt_chunk_retry, generation_config_chunk_retry, f"{chunk_file_identifier_prefix}_retry{current_chunk_retry_attempt}", triggering_input_row_id, triggering_company_name)
+                    raw_llm_response_str_retry_for_chunk = response_chunk_retry.text
+                    
+                    if hasattr(response_chunk_retry, 'usage_metadata') and response_chunk_retry.usage_metadata: # Accumulate tokens for retry
+                        token_stats_chunk_retry = { "prompt_tokens": response_chunk_retry.usage_metadata.prompt_token_count, "completion_tokens": response_chunk_retry.usage_metadata.candidates_token_count, "total_tokens": response_chunk_retry.usage_metadata.total_token_count }
+                        for key_token_r in accumulated_token_stats: accumulated_token_stats[key_token_r] += token_stats_chunk_retry.get(key_token_r, 0)
+                        logger.info(f"[{chunk_file_identifier_prefix}] LLM chunk retry #{current_chunk_retry_attempt} usage: {token_stats_chunk_retry}")
+
+                    still_mismatched_after_this_chunk_retry: List[Tuple[int, Dict[str, Any]]] = []
+                    if not response_chunk_retry.candidates: # No candidates in retry response
+                        still_mismatched_after_this_chunk_retry.extend(items_needing_retry_for_chunk)
+                    elif raw_llm_response_str_retry_for_chunk:
+                        json_candidate_str_chunk_retry = self._extract_json_from_text(raw_llm_response_str_retry_for_chunk)
+                        if json_candidate_str_chunk_retry:
+                            try:
+                                parsed_json_object_chunk_retry = json.loads(json_candidate_str_chunk_retry)
+                                llm_result_chunk_retry = MinimalExtractionOutput(**parsed_json_object_chunk_retry)
+                                validated_numbers_chunk_retry = llm_result_chunk_retry.extracted_numbers
+
+                                if len(validated_numbers_chunk_retry) != len(inputs_for_this_chunk_retry_pass):
+                                    still_mismatched_after_this_chunk_retry.extend(items_needing_retry_for_chunk)
+                                else:
+                                    for j_retry, retried_input_item_detail_chunk in enumerate(inputs_for_this_chunk_retry_pass):
+                                        original_idx_within_chunk = original_indices_within_chunk_for_this_pass[j_retry]
+                                        retried_llm_output_item_chunk = validated_numbers_chunk_retry[j_retry]
+                                        if retried_llm_output_item_chunk.number == retried_input_item_detail_chunk['number']:
+                                            final_processed_outputs_for_chunk[original_idx_within_chunk] = self._process_successful_llm_item(retried_llm_output_item_chunk, retried_input_item_detail_chunk)
+                                        else:
+                                            still_mismatched_after_this_chunk_retry.append((original_idx_within_chunk, retried_input_item_detail_chunk))
+                            except (json.JSONDecodeError, PydanticValidationError):
+                                still_mismatched_after_this_chunk_retry.extend(items_needing_retry_for_chunk)
+                        else: # No JSON block in chunk retry
+                            still_mismatched_after_this_chunk_retry.extend(items_needing_retry_for_chunk)
+                    else: # Empty response in chunk retry
+                        still_mismatched_after_this_chunk_retry.extend(items_needing_retry_for_chunk)
+                    items_needing_retry_for_chunk = still_mismatched_after_this_chunk_retry
+                except google_exceptions.GoogleAPIError as e_api_retry:
+                     logger.error(f"[{chunk_file_identifier_prefix}] Retry #{current_chunk_retry_attempt}: Gemini API error: {e_api_retry}")
+                except Exception as e_gen_retry:
+                     logger.error(f"[{chunk_file_identifier_prefix}] Retry #{current_chunk_retry_attempt}: Unexpected error: {e_gen_retry}", exc_info=True)
+            
+            if items_needing_retry_for_chunk: # Persistently mismatched in chunk
+                for original_idx_in_chunk_persist, item_detail_persist_error_chunk in items_needing_retry_for_chunk:
+                    if final_processed_outputs_for_chunk[original_idx_in_chunk_persist] is None:
+                        final_processed_outputs_for_chunk[original_idx_in_chunk_persist] = self._create_error_llm_item(item_detail_persist_error_chunk, "Error_PersistentMismatchAfterRetries", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+
+            # Fill any remaining None slots in this chunk's outputs with errors
+            for k_final_check, output_item_chunk_final in enumerate(final_processed_outputs_for_chunk):
+                if output_item_chunk_final is None:
+                    final_processed_outputs_for_chunk[k_final_check] = self._create_error_llm_item(current_chunk_candidate_items[k_final_check], "Error_NotProcessedInChunk", file_identifier_prefix=chunk_file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
+
+            overall_processed_outputs.extend([item for item in final_processed_outputs_for_chunk if item is not None])
+            if raw_llm_response_str_initial_for_chunk: # Store the initial response for this chunk
+                 overall_raw_responses.append(raw_llm_response_str_initial_for_chunk)
+            elif raw_llm_response_str_retry_for_chunk: # Or the last retry response if initial was problematic
+                 overall_raw_responses.append(raw_llm_response_str_retry_for_chunk)
+            else: # Fallback if no response text was captured for the chunk
+                 overall_raw_responses.append(json.dumps({"error": f"LLM response for chunk {chunks_processed_count} not captured."}))
+
+
+        # Combine raw responses (e.g., join with a separator or return as a list of strings)
+        # For simplicity, returning the list of raw responses. The caller can decide how to use/store them.
+        # Or, if a single string is preferred:
+        final_combined_raw_response_str = "\n\n---CHUNK_SEPARATOR---\n\n".join(overall_raw_responses) if overall_raw_responses else json.dumps({"error": "No LLM responses captured."})
         
-        # --- Handle Initial Mismatches if Retries were Disabled (max_retries = 0) ---
-        # This case is covered if items_needing_retry was populated and loop didn't run.
-        # The previous block "Handle Persistently Mismatched Items" will catch them if max_retries was 0.
+        successful_items_count = sum(1 for item in overall_processed_outputs if item and not item.type.startswith("Error_"))
+        error_items_count = len(overall_processed_outputs) - successful_items_count
+        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] Overall LLM extraction summary: {successful_items_count} successful, {error_items_count} errors out of {len(candidate_items)} candidates processed over {chunks_processed_count} chunks.")
 
-        # --- Final check for any None slots (e.g. if an error occurred before first pass processing for an item) ---
-        for i, output_item in enumerate(final_processed_outputs):
-            if output_item is None:
-                logger.error(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}, ItemCompany: {candidate_items[i].get('original_input_company_name')}] Item at original index {i} (input: {candidate_items[i].get('number')}) was not processed. Creating error item.")
-                final_processed_outputs[i] = self._create_error_llm_item(candidate_items[i], "Error_NotProcessed", file_identifier_prefix=file_identifier_prefix, triggering_input_row_id=triggering_input_row_id, triggering_company_name=triggering_company_name)
-        
-        # The primary raw response to return is from the initial call, or the last retry if that's more relevant.
-        response_origin_log_message = ""
-        if raw_llm_response_str_initial is not None and (raw_llm_response_str_retry is None or items_needing_retry or not current_retry_attempt): # Prefer initial if no retries or retries didn't change outcome for all
-            response_origin_log_message = "Using raw response from initial LLM call."
-            final_raw_llm_response_str = raw_llm_response_str_initial
-        elif raw_llm_response_str_retry is not None:
-            response_origin_log_message = f"Using raw response from last LLM retry attempt ({current_retry_attempt})."
-            final_raw_llm_response_str = raw_llm_response_str_retry
-        else: # Neither initial nor retry had a response text (e.g. API error before text, or prompt loading error)
-            response_origin_log_message = "Using default/error JSON as final raw response (no text from LLM)."
-            final_raw_llm_response_str = json.dumps({"error": "LLM response was not captured or was empty."})
-        
-        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] {response_origin_log_message}")
-
-
-        # Cast List[Optional[PhoneNumberLLMOutput]] to List[PhoneNumberLLMOutput]
-        # All None should have been filled by error items.
-        processed_results: List[PhoneNumberLLMOutput] = [item for item in final_processed_outputs if item is not None]
-        
-        # Log summary of processed items
-        successful_items_count = sum(1 for item in processed_results if item and not item.type.startswith("Error_"))
-        error_items_count = len(processed_results) - successful_items_count
-        logger.info(f"[{file_identifier_prefix}, RowID: {triggering_input_row_id}, Company: {triggering_company_name}] LLM extraction summary: {successful_items_count} successful, {error_items_count} errors out of {len(candidate_items)} candidates.")
-
-        return processed_results, final_raw_llm_response_str, accumulated_token_stats
+        return overall_processed_outputs, final_combined_raw_response_str, accumulated_token_stats

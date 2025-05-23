@@ -23,6 +23,7 @@ import phonenumbers
 from phonenumbers import NumberParseException
 from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv # ADDED
+from pathlib import Path # ADDED for augmented report path
 
 load_dotenv() # ADDED
 
@@ -439,10 +440,10 @@ def main() -> None:
     task_start_time = time.time()
     try:
         logger.info(f"Attempting to load data from: {INPUT_FILE_PATH}")
-        df = load_and_preprocess_data(INPUT_FILE_PATH, app_config_instance=app_config)
+        df, original_phone_col_name_for_profile = load_and_preprocess_data(INPUT_FILE_PATH, app_config_instance=app_config)
         if df is not None:
-            logger.info(f"Successfully loaded and preprocessed data from {INPUT_FILE_PATH}. Shape: {df.shape}")
-            logger.info(f"DataFrame columns: {df.columns.tolist()}") 
+            logger.info(f"Successfully loaded and preprocessed data from {INPUT_FILE_PATH}. Shape: {df.shape}. Original phone column for profile: '{original_phone_col_name_for_profile}'")
+            logger.info(f"DataFrame columns: {df.columns.tolist()}")
             run_metrics["data_processing_stats"]["input_rows_count"] = len(df)
             if 'GivenURL' in df.columns:
                 logger.info(f"First 5 'GivenURL' values: {df['GivenURL'].head().tolist()}")
@@ -580,46 +581,49 @@ def main() -> None:
     rows_failed_in_pass1 = 0
     attrition_data_list: List[Dict[str, Any]] = [] # For Row Attrition Report
     row_level_failure_counts: Dict[str, int] = {} # Initialize counter for stage_of_failure
-
-    with open(failure_log_csv_path, 'w', newline='', encoding='utf-8') as f_failure_log:
-        failure_writer = csv.writer(f_failure_log)
+    
+    failure_log_file_handle = None
+    failure_writer = None
+    try:
+        failure_log_file_handle = open(failure_log_csv_path, 'w', newline='', encoding='utf-8')
+        failure_writer = csv.writer(failure_log_file_handle)
         failure_writer.writerow([
             'log_timestamp', 'input_row_identifier', 'CompanyName', 'GivenURL',
             'stage_of_failure', 'error_reason', 'error_details',
             'Associated_Pathful_Canonical_URL' # New header
         ])
 
-    # --- Data structures for new Canonical Domain Journey Report ---
-    canonical_domain_journey_data: Dict[str, Dict[str, Any]] = {}
-    # Helper dicts to aggregate data before putting into canonical_domain_journey_data
-    true_base_to_input_row_ids: Dict[str, Set[Any]] = {}
-    true_base_to_input_company_names: Dict[str, Set[str]] = {}
-    true_base_to_input_given_urls: Dict[str, Set[str]] = {}
-    true_base_to_pathful_urls_attempted: Dict[str, Set[str]] = {} # Stores unique pathful URLs processed under a true_base
-    # true_base_scraper_status is already initialized later, will be used for this report too
-    # canonical_site_regex_candidates_found_status is already initialized, will be aggregated
-    # canonical_site_llm_exception_details is already initialized, will be aggregated
-    # final_consolidated_data_by_true_base will be a key source
+        # --- Data structures for new Canonical Domain Journey Report ---
+        canonical_domain_journey_data: Dict[str, Dict[str, Any]] = {}
+        # Helper dicts to aggregate data before putting into canonical_domain_journey_data
+        true_base_to_input_row_ids: Dict[str, Set[Any]] = {}
+        true_base_to_input_company_names: Dict[str, Set[str]] = {}
+        true_base_to_input_given_urls: Dict[str, Set[str]] = {}
+        true_base_to_pathful_urls_attempted: Dict[str, Set[str]] = {} # Stores unique pathful URLs processed under a true_base
+        # true_base_scraper_status is already initialized later, will be used for this report too
+        # canonical_site_regex_candidates_found_status is already initialized, will be aggregated
+        # canonical_site_llm_exception_details is already initialized, will be aggregated
+        # final_consolidated_data_by_true_base will be a key source
 
-    # --- End Data structures for new Canonical Domain Journey Report ---
+        # --- End Data structures for new Canonical Domain Journey Report ---
 
-    for i, (index, row_series) in enumerate(df.iterrows()): # Corrected indentation
-        rows_processed_in_pass1 += 1
-        row: pd.Series = row_series
-        company_name: str = str(row.get('CompanyName', f"Row_{index}"))
-        given_url_original: Optional[str] = row.get('GivenURL')
-        current_row_number_for_log: int = i + 1
-        
-        logger.info(f"[RowID: {index}, Company: {company_name}] --- Processing row {current_row_number_for_log}/{len(df)}: Original URL '{given_url_original}' ---")
+        for i, (index, row_series) in enumerate(df.iterrows()): # Corrected indentation
+            rows_processed_in_pass1 += 1
+            row: pd.Series = row_series
+            company_name: str = str(row.get('CompanyName', f"Row_{index}"))
+            given_url_original: Optional[str] = row.get('GivenURL')
+            current_row_number_for_log: int = i + 1
+            
+            logger.info(f"[RowID: {index}, Company: {company_name}] --- Processing row {current_row_number_for_log}/{len(df)}: Original URL '{given_url_original}' ---")
 
-        current_row_scraper_status: str = "Not_Run"
-        final_canonical_entry_url: Optional[str] = None # Initialize for each row, before the try block
-        # ... (other per-row initializations) ...
-        
-        given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input"
-        processed_url = given_url_original
+            current_row_scraper_status: str = "Not_Run"
+            final_canonical_entry_url: Optional[str] = None # Initialize for each row, before the try block
+            # ... (other per-row initializations) ...
+            
+            given_url_original_str_key = str(given_url_original) if given_url_original is not None else "None_GivenURL_Input"
+            processed_url = given_url_original
 
-        try:
+            try:
                 if given_url_original and isinstance(given_url_original, str):
                     temp_url_stripped = given_url_original.strip()
                     parsed_obj = urlparse(temp_url_stripped)
@@ -1043,595 +1047,561 @@ def main() -> None:
                     run_metrics["scraping_stats"]["scraping_success"] += 1
                 logger.info(f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log}: Pass 1 processing complete. OriginalURL: {given_url_original_str_key}, CanonicalURL: {final_canonical_entry_url}, ScraperStatus: {current_row_scraper_status}")
 
-        except Exception as e:
-            logger.error(f"[RowID: {index}, Company: {company_name}] Error during Pass 1 processing for row {current_row_number_for_log}, Original URL {given_url_original_str_key}: {e}", exc_info=True)
-            df.at[index, 'Overall_VerificationStatus'] = 'Error_Pass1_RowProcessing'
-            current_scraper_status_for_df = df.at[index, 'ScrapingStatus']
-            if current_scraper_status_for_df in ["Not_Run", "Success", None] or not current_scraper_status_for_df :
-                 df.at[index, 'ScrapingStatus'] = f'PipelineError_{type(e).__name__}'
-            run_metrics["errors_encountered"].append(f"Pass 1 row processing error for {company_name} (URL: {given_url_original_str_key}): {str(e)}")
-            log_row_failure(
-                failure_log_writer=failure_writer,
-                input_row_identifier=index,
-                company_name=company_name,
-                given_url=given_url_original,
-                stage_of_failure="RowProcessing_Pass1_UnhandledException",
-                error_reason="Unhandled exception during Pass 1 row processing",
-                log_timestamp=datetime.now().isoformat(),
-                error_details=json.dumps({
-                    "exception_type": type(e).__name__,
-                    "exception_message": str(e)
-                }),
-                # Use final_canonical_entry_url (which was initialized at loop start) if available,
-                # otherwise what's in df (if populated by an earlier, successful scrape for this input row), or None.
-                associated_pathful_canonical_url=final_canonical_entry_url if final_canonical_entry_url else (df.at[index, 'CanonicalEntryURL'] if 'CanonicalEntryURL' in df.columns and pd.notna(df.at[index, 'CanonicalEntryURL']) else None)
-            )
-            stage_key = "RowProcessing_Pass1_UnhandledException"
-            row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
-            rows_failed_in_pass1 +=1
-            logger.error(
-                f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log} errored in Pass 1. "
-                f"ScraperStatus='{df.at[index, 'ScrapingStatus']}', "
-                f"OverallVerificationStatus='{df.at[index, 'Overall_VerificationStatus']}'"
-            )
-            for col_prefix in ['Primary_', 'Secondary_']:
-                for suffix in ['Number_1', 'Type_1', 'SourceURL_1', 'Number_2', 'Type_2', 'SourceURL_2']:
-                    col_name = f"{col_prefix}{suffix}"
-                    if col_name in df.columns:
-                        df.at[index, col_name] = None
-            if 'Original_Number_Status' in df.columns:
-                df.at[index, 'Original_Number_Status'] = 'Error_Pass1_RowProcessing'
+            except Exception as e:
+                logger.error(f"[RowID: {index}, Company: {company_name}] Error during Pass 1 processing for row {current_row_number_for_log}, Original URL {given_url_original_str_key}: {e}", exc_info=True)
+                df.at[index, 'Overall_VerificationStatus'] = 'Error_Pass1_RowProcessing'
+                current_scraper_status_for_df = df.at[index, 'ScrapingStatus']
+                if current_scraper_status_for_df in ["Not_Run", "Success", None] or not current_scraper_status_for_df :
+                     df.at[index, 'ScrapingStatus'] = f'PipelineError_{type(e).__name__}'
+                run_metrics["errors_encountered"].append(f"Pass 1 row processing error for {company_name} (URL: {given_url_original_str_key}): {str(e)}")
+                log_row_failure(
+                    failure_log_writer=failure_writer,
+                    input_row_identifier=index,
+                    company_name=company_name,
+                    given_url=given_url_original,
+                    stage_of_failure="RowProcessing_Pass1_UnhandledException",
+                    error_reason="Unhandled exception during Pass 1 row processing",
+                    log_timestamp=datetime.now().isoformat(),
+                    error_details=json.dumps({
+                        "exception_type": type(e).__name__,
+                        "exception_message": str(e)
+                    }),
+                    # Use final_canonical_entry_url (which was initialized at loop start) if available,
+                    # otherwise what's in df (if populated by an earlier, successful scrape for this input row), or None.
+                    associated_pathful_canonical_url=final_canonical_entry_url if final_canonical_entry_url else (df.at[index, 'CanonicalEntryURL'] if 'CanonicalEntryURL' in df.columns and pd.notna(df.at[index, 'CanonicalEntryURL']) else None)
+                )
+                stage_key = "RowProcessing_Pass1_UnhandledException"
+                row_level_failure_counts[stage_key] = row_level_failure_counts.get(stage_key, 0) + 1
+                rows_failed_in_pass1 +=1
+                logger.error(
+                    f"[RowID: {index}, Company: {company_name}] Row {current_row_number_for_log} errored in Pass 1. "
+                    f"ScraperStatus='{df.at[index, 'ScrapingStatus']}', "
+                    f"OverallVerificationStatus='{df.at[index, 'Overall_VerificationStatus']}'"
+                )
+                for col_prefix in ['Primary_', 'Secondary_']:
+                    for suffix in ['Number_1', 'Type_1', 'SourceURL_1', 'Number_2', 'Type_2', 'SourceURL_2']:
+                        col_name = f"{col_prefix}{suffix}"
+                        if col_name in df.columns:
+                            df.at[index, col_name] = None
+                if 'Original_Number_Status' in df.columns:
+                    df.at[index, 'Original_Number_Status'] = 'Error_Pass1_RowProcessing'
         
-    run_metrics["tasks"]["pass1_main_loop_duration_seconds"] = time.time() - pass1_loop_start_time
-    run_metrics["data_processing_stats"]["rows_successfully_processed_pass1"] = rows_processed_in_pass1 - rows_failed_in_pass1
-    run_metrics["data_processing_stats"]["rows_failed_pass1"] = rows_failed_in_pass1
-    run_metrics["data_processing_stats"]["row_level_failure_summary"] = row_level_failure_counts # Store the collected counts
-    logger.info(f"Pass 1 (Scraping and Raw LLM Data Collection) complete. Processed {rows_processed_in_pass1} input rows.")
-    logger.info(f"Unique pathful canonical sites for which raw LLM data was collected: {len(canonical_site_raw_llm_outputs)}")
-    logger.debug(f"Pathful canonical site raw LLM data cache keys: {list(canonical_site_raw_llm_outputs.keys())}")
-    logger.debug(f"Pathful canonical site scraper status cache: {list(canonical_site_pathful_scraper_status.keys())}")
-    logger.debug(f"Input to True Base Domain map entries: {len(input_to_canonical_map)}")
-    
-    run_metrics["scraping_stats"]["total_urls_fetched_by_scraper"] = run_metrics["scraping_stats"]["total_pages_scraped_overall"]
-
-    if "processed_canonical_sites_for_success_count" in run_metrics["scraping_stats"]:
-        del run_metrics["scraping_stats"]["processed_canonical_sites_for_success_count"]
- 
-    global_consolidation_start_time = time.time()
-    logger.info("Starting Global Consolidation of LLM data by True Base Domain...")
-    final_consolidated_data_by_true_base: Dict[str, Optional[CompanyContactDetails]] = {}
-    true_base_to_pathful_map: Dict[str, List[str]] = {}
-    true_base_to_input_company_names: Dict[str, Set[str]] = {}
-    true_base_scraper_status: Dict[str, str] = {}
-
-
-    for pathful_url_key, raw_llm_list in canonical_site_raw_llm_outputs.items():
-        true_base = get_canonical_base_url(pathful_url_key)
-        if not true_base:
-            logger.warning(f"Could not get true_base_domain for pathful_url_key '{pathful_url_key}' during global consolidation. Skipping.")
-            continue
+        run_metrics["tasks"]["pass1_main_loop_duration_seconds"] = time.time() - pass1_loop_start_time
+        run_metrics["data_processing_stats"]["rows_successfully_processed_pass1"] = rows_processed_in_pass1 - rows_failed_in_pass1
+        run_metrics["data_processing_stats"]["rows_failed_pass1"] = rows_failed_in_pass1
+        run_metrics["data_processing_stats"]["row_level_failure_summary"] = row_level_failure_counts # Store the collected counts
+        logger.info(f"Pass 1 (Scraping and Raw LLM Data Collection) complete. Processed {rows_processed_in_pass1} input rows.")
+        logger.info(f"Unique pathful canonical sites for which raw LLM data was collected: {len(canonical_site_raw_llm_outputs)}")
+        logger.debug(f"Pathful canonical site raw LLM data cache keys: {list(canonical_site_raw_llm_outputs.keys())}")
+        logger.debug(f"Pathful canonical site scraper status cache: {list(canonical_site_pathful_scraper_status.keys())}")
+        logger.debug(f"Input to True Base Domain map entries: {len(input_to_canonical_map)}")
         
-        if true_base not in true_base_to_pathful_map:
-            true_base_to_pathful_map[true_base] = []
-            true_base_to_input_company_names[true_base] = set()
-            true_base_scraper_status[true_base] = "Unknown" 
-        
-        true_base_to_pathful_map[true_base].append(pathful_url_key)
-        
-        current_pathful_status = canonical_site_pathful_scraper_status.get(pathful_url_key, "Unknown")
-        
-        # Update true_base_scraper_status (existing logic)
-        if true_base_scraper_status[true_base] == "Unknown" or \
-           (current_pathful_status == "Success" and true_base_scraper_status[true_base] != "Success") or \
-           ("Error" not in current_pathful_status and "Error" in true_base_scraper_status[true_base]):
-            true_base_scraper_status[true_base] = current_pathful_status
+        run_metrics["scraping_stats"]["total_urls_fetched_by_scraper"] = run_metrics["scraping_stats"]["total_pages_scraped_overall"]
 
-        # --- Start: Update Overall_Scraper_Status_For_Domain in canonical_domain_journey_data ---
-        if true_base in canonical_domain_journey_data:
-            # Use the same logic as for true_base_scraper_status
-            current_domain_overall_status = canonical_domain_journey_data[true_base].get("Overall_Scraper_Status_For_Domain", "Unknown")
-            if current_domain_overall_status == "Unknown" or \
-               (current_pathful_status == "Success" and current_domain_overall_status != "Success") or \
-               ("Error" not in current_pathful_status and "Error" in current_domain_overall_status):
-                canonical_domain_journey_data[true_base]["Overall_Scraper_Status_For_Domain"] = current_pathful_status
-        # --- End: Update Overall_Scraper_Status_For_Domain ---
+        if "processed_canonical_sites_for_success_count" in run_metrics["scraping_stats"]:
+            del run_metrics["scraping_stats"]["processed_canonical_sites_for_success_count"]
+     
+        global_consolidation_start_time = time.time()
+        logger.info("Starting Global Consolidation of LLM data by True Base Domain...")
+        final_consolidated_data_by_true_base: Dict[str, Optional[CompanyContactDetails]] = {}
+        true_base_to_pathful_map: Dict[str, List[str]] = {}
+        true_base_to_input_company_names: Dict[str, Set[str]] = {}
+        true_base_scraper_status: Dict[str, str] = {}
 
 
-    if 'CanonicalEntryURL' in df.columns and 'CompanyName' in df.columns:
-        for true_base_domain_key in true_base_to_pathful_map.keys():
-            mask = df['CanonicalEntryURL'].notna() & (df['CanonicalEntryURL'] == true_base_domain_key)
-            matching_companies = df.loc[mask, 'CompanyName'].dropna().astype(str).unique()
-            if len(matching_companies) > 0:
-                 true_base_to_input_company_names[true_base_domain_key].update(matching_companies)
-            else: 
-                 first_pathful_for_base = true_base_to_pathful_map[true_base_domain_key][0]
-                 logger.warning(f"No matching company names found in df for true_base_domain '{true_base_domain_key}'. Company name in report might be from first pathful trigger.")
-
-
-    for true_base_domain, list_of_pathful_urls in true_base_to_pathful_map.items():
-        all_llm_results_for_this_true_base: List[PhoneNumberLLMOutput] = []
-        for pathful_url_item in list_of_pathful_urls:
-            all_llm_results_for_this_true_base.extend(canonical_site_raw_llm_outputs.get(pathful_url_item, []))
-        
-        representative_company_name_for_consolidation = "Unknown"
-        if true_base_to_input_company_names.get(true_base_domain):
-            representative_company_name_for_consolidation = sorted(list(true_base_to_input_company_names[true_base_domain]))[0]
-        elif list_of_pathful_urls: 
-            pass
-
-
-        final_consolidated_data_by_true_base[true_base_domain] = process_and_consolidate_contact_data(
-            llm_results=all_llm_results_for_this_true_base,
-            company_name_from_input=representative_company_name_for_consolidation,
-            initial_given_url=true_base_domain
-        )
-        # --- Start: Populate LLM consolidated numbers info in canonical_domain_journey_data ---
-        if true_base_domain in canonical_domain_journey_data and final_consolidated_data_by_true_base[true_base_domain]:
-            consolidated_details = final_consolidated_data_by_true_base[true_base_domain]
-            if consolidated_details and consolidated_details.consolidated_numbers:
-                canonical_domain_journey_data[true_base_domain]["LLM_Total_Consolidated_Numbers_Found"] = len(consolidated_details.consolidated_numbers)
-                for cn_item in consolidated_details.consolidated_numbers:
-                    for source_detail in cn_item.sources:
-                        if source_detail.type: # Ensure type is not None
-                             canonical_domain_journey_data[true_base_domain]["LLM_Consolidated_Number_Types_Summary"][source_detail.type] += 1
-        # --- End: Populate LLM consolidated numbers info ---
-    logger.info(f"Global Consolidation complete. {len(final_consolidated_data_by_true_base)} true base domains processed.")
-    run_metrics["tasks"]["global_consolidation_duration_seconds"] = time.time() - global_consolidation_start_time
-    run_metrics["data_processing_stats"]["unique_true_base_domains_consolidated"] = len(final_consolidated_data_by_true_base)
-
-    # --- Determine Final Outcome and Fault Category for each Canonical Domain ---
-    logger.info("Determining final outcomes for each canonical domain...")
-    for domain_key, journey_data_entry in canonical_domain_journey_data.items():
-        final_domain_reason, final_domain_fault = _determine_final_domain_outcome_and_fault(
-            true_base_domain=domain_key,
-            domain_journey_entry=journey_data_entry,
-            true_base_scraper_status_map=true_base_scraper_status, # This was populated during global consolidation
-            true_base_to_pathful_map=true_base_to_pathful_map, # This was populated during global consolidation
-            canonical_site_pathful_scraper_status=canonical_site_pathful_scraper_status, # Populated in Pass 1
-            # For canonical_site_regex_candidates_found_status, we use the aggregated value from the journey data
-            canonical_site_regex_candidates_found_status=journey_data_entry.get("Regex_Candidates_Found_For_Any_Pathful", False),
-            final_consolidated_data=final_consolidated_data_by_true_base.get(domain_key) # Result from process_and_consolidate
-        )
-        canonical_domain_journey_data[domain_key]["Final_Domain_Outcome_Reason"] = final_domain_reason
-        canonical_domain_journey_data[domain_key]["Primary_Fault_Category_For_Domain"] = final_domain_fault
-        if final_domain_reason != "Contact_Successfully_Extracted_For_Domain":
-            logger.info(f"Domain '{domain_key}': Outcome='{final_domain_reason}', Fault='{final_domain_fault}'")
-    logger.info("Final domain outcome determination complete.")
-    # --- End Final Outcome Determination for Canonical Domains ---
- 
- 
-    detailed_columns_order = [
-        'CompanyName', 'Number', 'LLM_Type', 'LLM_Classification', 
-        'LLM_Source_URL', 'ScrapingStatus', 'TargetCountryCodes', 'RunID'
-    ]
-
-    summary_columns_order = [
-        'CompanyName', 'GivenURL', 'GivenPhoneNumber', 'Original_Number_Status',
-        'Top_Number_1', 'Top_Type_1', 'Description', 'ScrapingStatus_Canonical', 
-        'CanonicalEntryURL', 'Top_Number_1', 'Top_Type_1', 'Top_Number_2', 
-        'Top_Type_2', 'Top_Number_3', 'Top_Type_3', 'Top_SourceURL_1', 
-        'Top_SourceURL_2', 'Top_SourceURL_3', 'TargetCountryCodes', 'RunID'
-    ]
-
-    tertiary_report_columns_order = [
-        'CompanyName', 'GivenURL', 'CanonicalEntryURL', 'ScrapingStatus', 
-        'PhoneNumber_1', 'PhoneNumber_2', 'PhoneNumber_3', 
-        'SourceURL_1', 'SourceURL_2', 'SourceURL_3'
-    ]
-
-    logger.info("Starting Pass 2: Building Detailed Flattened and Summary Reports...")
-    pass2_reports_start_time = time.time()
- 
-    classification_precedence = { 
-        'Primary': 1, 'Secondary': 2, 'Support': 3,
-        'Low Relevance': 4, 'Non-Business': 5, None: 99
-    }
-
-    for index, original_row_data in df.iterrows(): 
-        company_name_pass2 = str(original_row_data.get('CompanyName', f"Row_{index}"))
-        given_url_pass2 = original_row_data.get('GivenURL')
-        canonical_url_pass2 = original_row_data.get('CanonicalEntryURL')
-        scraper_status_pass2 = original_row_data.get('ScrapingStatus')
-
-        company_contact_details_pass2: Optional[CompanyContactDetails] = None
-        if canonical_url_pass2 and canonical_url_pass2 in final_consolidated_data_by_true_base: 
-            company_contact_details_pass2 = final_consolidated_data_by_true_base[canonical_url_pass2]
-        
-        scraper_status_for_true_base_detailed = true_base_scraper_status.get(str(canonical_url_pass2), "Unknown") if canonical_url_pass2 else "Unknown_NoTrueBase"
-
-        if scraper_status_for_true_base_detailed == "Success" and company_contact_details_pass2 and company_contact_details_pass2.consolidated_numbers:
-            for consolidated_number_item in company_contact_details_pass2.consolidated_numbers:
-                aggregated_types = []
-                aggregated_source_urls = []
-                seen_types_for_number = set() 
-                
-                for source_detail in consolidated_number_item.sources:
-                    type_with_path = f"{source_detail.type} (from {source_detail.source_path})"
-                    if source_detail.type not in seen_types_for_number: 
-                        aggregated_types.append(source_detail.type)
-                        seen_types_for_number.add(source_detail.type)
-                    if source_detail.original_full_url not in aggregated_source_urls: 
-                         aggregated_source_urls.append(source_detail.original_full_url)
-
-                llm_type_str = ", ".join(aggregated_types) if aggregated_types else consolidated_number_item.sources[0].type if consolidated_number_item.sources else "Unknown"
-                llm_source_url_str = ", ".join(aggregated_source_urls) if aggregated_source_urls else consolidated_number_item.sources[0].original_full_url if consolidated_number_item.sources else "N/A"
-
-                new_flattened_row: Dict[str, Any] = {
-                    'CompanyName': company_name_pass2,
-                    'Number': consolidated_number_item.number,
-                    'LLM_Type': llm_type_str, 
-                    'LLM_Classification': consolidated_number_item.classification, 
-                    'LLM_Source_URL': llm_source_url_str, 
-                    'ScrapingStatus': scraper_status_for_true_base_detailed, 
-                    'TargetCountryCodes': original_row_data.get('TargetCountryCodes'),
-                    'RunID': run_id 
-                }
-                all_flattened_rows.append(new_flattened_row)
-        
-
-    logger.info("Starting Aggregation for Top_Contacts_Report...")
-    top_contacts_aggregation_map: Dict[str, Dict[str, Any]] = {}
-
-    if 'CanonicalEntryURL' not in df.columns:
-        logger.error("'CanonicalEntryURL' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to None.")
-        df['CanonicalEntryURL'] = None
-    if 'CompanyName' not in df.columns:
-        logger.error("'CompanyName' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to 'Unknown_Input_Company'.")
-        df['CompanyName'] = "Unknown_Input_Company"
-    if 'GivenURL' not in df.columns:
-        logger.error("'GivenURL' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to 'Unknown_Input_GivenURL'.")
-        df['GivenURL'] = "Unknown_Input_GivenURL"
-
-    for true_base_domain_key_agg, company_contact_details_object in final_consolidated_data_by_true_base.items():
-        if company_contact_details_object is None:
-            logger.warning(f"Skipping true_base_domain '{true_base_domain_key_agg}' for Top_Contacts_Report aggregation as its CompanyContactDetails is None.")
-            continue
-
-        matching_input_rows = df[df['CanonicalEntryURL'].astype(str) == str(true_base_domain_key_agg)]
-
-        unique_original_company_names: Set[str]
-        unique_original_given_urls: Set[str]
-
-        if matching_input_rows.empty:
-            logger.warning(f"No input rows found in df mapping to true_base_domain '{true_base_domain_key_agg}'. "
-                           f"Using company name ('{company_contact_details_object.company_name}') from CompanyContactDetails and its original_input_urls as fallback.")
-            unique_original_company_names = {str(company_contact_details_object.company_name)} if company_contact_details_object.company_name else {"Unknown_Company"}
-            unique_original_given_urls = set(map(str, company_contact_details_object.original_input_urls))
-        else:
-            unique_original_company_names = set(matching_input_rows['CompanyName'].dropna().astype(str))
-            unique_original_given_urls = set(matching_input_rows['GivenURL'].dropna().astype(str))
-            if not unique_original_company_names:
-                 unique_original_company_names = {str(company_contact_details_object.company_name)} if company_contact_details_object.company_name else {"Unknown_Company"}
-            if not unique_original_given_urls:
-                 unique_original_given_urls = set(map(str, company_contact_details_object.original_input_urls))
-
-        report_company_name = f"{true_base_domain_key_agg} - {' - '.join(sorted(list(unique_original_company_names)))}"
-        report_given_urls = ", ".join(sorted(list(unique_original_given_urls)))
-        
-        top_contacts_aggregation_map[true_base_domain_key_agg] = {
-            "report_company_name": report_company_name,
-            "report_given_urls": report_given_urls,
-            "canonical_entry_url": true_base_domain_key_agg, 
-            "scraper_status": true_base_scraper_status.get(true_base_domain_key_agg, "Unknown"), 
-            "contact_details": company_contact_details_object,
-            "all_input_companies_for_canonical": sorted(list(unique_original_company_names))
-        }
-    logger.info(f"Aggregation for Top_Contacts_Report complete. Found {len(top_contacts_aggregation_map)} unique canonical URLs to report on.")
-
-    logger.info("Building Top_Contacts_Report (formerly Tertiary) from aggregated data...")
-    all_tertiary_rows.clear()
-
-    for aggregated_entry in top_contacts_aggregation_map.values():
-        company_contact_details_for_report = aggregated_entry["contact_details"]
-        
-        new_tertiary_row: Dict[str, Any] = {
-            'CompanyName': aggregated_entry["report_company_name"],
-            'GivenURL': aggregated_entry["report_given_urls"],
-            'CanonicalEntryURL': aggregated_entry["canonical_entry_url"],
-            'ScrapingStatus': aggregated_entry["scraper_status"],
-            'PhoneNumber_1': None, 'PhoneNumber_2': None, 'PhoneNumber_3': None,
-            'SourceURL_1': None, 'SourceURL_2': None, 'SourceURL_3': None
-        }
-
-        if company_contact_details_for_report and company_contact_details_for_report.consolidated_numbers:
-            eligible_numbers_for_report: List[ConsolidatedPhoneNumber] = []
-            for cn_item in company_contact_details_for_report.consolidated_numbers:
-                source_types = {s.type for s in cn_item.sources if s.type}
-                if cn_item.classification != 'Non-Business' and \
-                   not EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT.intersection(source_types):
-                    eligible_numbers_for_report.append(cn_item)
-                else:
-                    excluded_reasons = []
-                    if cn_item.classification == 'Non-Business':
-                        excluded_reasons.append("classification is Non-Business")
-                    intersecting_types = EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT.intersection(source_types)
-                    if intersecting_types:
-                        excluded_reasons.append(f"excluded types: {intersecting_types}")
-                    logger.debug(f"Excluding number {cn_item.number} from Top_Contacts_Report for company '{aggregated_entry['report_company_name']}' due to: {'; '.join(excluded_reasons)}")
-
-            for i, consolidated_number_item in enumerate(eligible_numbers_for_report[:3]): 
-                phone_num_key = f'PhoneNumber_{i+1}'
-                source_url_key = f'SourceURL_{i+1}'
-                
-                number_str = consolidated_number_item.number
-                types_str = ", ".join(sorted(list(set(s.type for s in consolidated_number_item.sources))))
-                
-                companies_for_this_number = sorted(list(set(
-                    s.original_input_company_name
-                    for s in consolidated_number_item.sources
-                    if s.original_input_company_name
-                )))
-                companies_for_this_number_str = ", ".join(companies_for_this_number) if companies_for_this_number else "UnknownCompany" 
-
-                new_tertiary_row[phone_num_key] = f"{number_str} ({types_str}) [{companies_for_this_number_str}]"
-                new_tertiary_row[source_url_key] = ", ".join(sorted(list(set(s.original_full_url for s in consolidated_number_item.sources))))
-        
-        if new_tertiary_row['PhoneNumber_1'] or new_tertiary_row['PhoneNumber_2'] or new_tertiary_row['PhoneNumber_3']:
-            all_tertiary_rows.append(new_tertiary_row)
-        else:
-            logger.info(f"Skipping row for canonical URL '{aggregated_entry['canonical_entry_url']}' (Company: '{aggregated_entry['report_company_name']}') in Top_Contacts_Report as it has no eligible phone numbers after filtering.")
+        for pathful_url_key, raw_llm_list in canonical_site_raw_llm_outputs.items():
+            true_base = get_canonical_base_url(pathful_url_key)
+            if not true_base:
+                logger.warning(f"Could not get true_base_domain for pathful_url_key '{pathful_url_key}' during global consolidation. Skipping.")
+                continue
             
-    logger.info(f"Finished building Top_Contacts_Report. {len(all_tertiary_rows)} rows created.")
+            if true_base not in true_base_to_pathful_map:
+                true_base_to_pathful_map[true_base] = []
+                true_base_to_input_company_names[true_base] = set()
+                true_base_scraper_status[true_base] = "Unknown"
+            
+            true_base_to_pathful_map[true_base].append(pathful_url_key)
+            
+            current_pathful_status = canonical_site_pathful_scraper_status.get(pathful_url_key, "Unknown")
+            
+            # Update true_base_scraper_status (existing logic)
+            if true_base_scraper_status[true_base] == "Unknown" or \
+               (current_pathful_status == "Success" and true_base_scraper_status[true_base] != "Success") or \
+               ("Error" not in current_pathful_status and "Error" in true_base_scraper_status[true_base]):
+                true_base_scraper_status[true_base] = current_pathful_status
+
+            # --- Start: Update Overall_Scraper_Status_For_Domain in canonical_domain_journey_data ---
+            if true_base in canonical_domain_journey_data:
+                # Use the same logic as for true_base_scraper_status
+                current_domain_overall_status = canonical_domain_journey_data[true_base].get("Overall_Scraper_Status_For_Domain", "Unknown")
+                if current_domain_overall_status == "Unknown" or \
+                   (current_pathful_status == "Success" and current_domain_overall_status != "Success") or \
+                   ("Error" not in current_pathful_status and "Error" in current_domain_overall_status):
+                    canonical_domain_journey_data[true_base]["Overall_Scraper_Status_For_Domain"] = current_pathful_status
+            # --- End: Update Overall_Scraper_Status_For_Domain ---
 
 
-    for index, row_summary in df.iterrows():
-        # Preserve original values needed by the helper or for other logic
-        given_url_original_for_attrition = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else ""
-        company_name_for_attrition = str(row_summary.get('CompanyName', f"Row_{index}"))
-        canonical_url_summary = row_summary.get('CanonicalEntryURL') # This is the true_base_domain
+        if 'CanonicalEntryURL' in df.columns and 'CompanyName' in df.columns:
+            for true_base_domain_key in true_base_to_pathful_map.keys():
+                mask = df['CanonicalEntryURL'].notna() & (df['CanonicalEntryURL'] == true_base_domain_key)
+                matching_companies = df.loc[mask, 'CompanyName'].dropna().astype(str).unique()
+                if len(matching_companies) > 0:
+                     true_base_to_input_company_names[true_base_domain_key].update(matching_companies)
+                else:
+                     first_pathful_for_base = true_base_to_pathful_map[true_base_domain_key][0]
+                     logger.warning(f"No matching company names found in df for true_base_domain '{true_base_domain_key}'. Company name in report might be from first pathful trigger.")
 
-        # Snapshot of relevant df statuses for this row before they might be overwritten
-        df_status_snapshot_for_helper = {
-            'ScrapingStatus': row_summary.get('ScrapingStatus'), # Initial scrape status for the input URL
-            # Add other df statuses if _determine_final_row_outcome_and_fault needs them
+
+        for true_base_domain, list_of_pathful_urls in true_base_to_pathful_map.items():
+            all_llm_results_for_this_true_base: List[PhoneNumberLLMOutput] = []
+            for pathful_url_item in list_of_pathful_urls:
+                all_llm_results_for_this_true_base.extend(canonical_site_raw_llm_outputs.get(pathful_url_item, []))
+            
+            representative_company_name_for_consolidation = "Unknown"
+            if true_base_to_input_company_names.get(true_base_domain):
+                representative_company_name_for_consolidation = sorted(list(true_base_to_input_company_names[true_base_domain]))[0]
+            elif list_of_pathful_urls:
+                pass
+
+
+            final_consolidated_data_by_true_base[true_base_domain] = process_and_consolidate_contact_data(
+                llm_results=all_llm_results_for_this_true_base,
+                company_name_from_input=representative_company_name_for_consolidation,
+                initial_given_url=true_base_domain
+            )
+            # --- Start: Populate LLM consolidated numbers info in canonical_domain_journey_data ---
+            if true_base_domain in canonical_domain_journey_data and final_consolidated_data_by_true_base[true_base_domain]:
+                consolidated_details = final_consolidated_data_by_true_base[true_base_domain]
+                if consolidated_details and consolidated_details.consolidated_numbers:
+                    canonical_domain_journey_data[true_base_domain]["LLM_Total_Consolidated_Numbers_Found"] = len(consolidated_details.consolidated_numbers)
+                    for cn_item in consolidated_details.consolidated_numbers:
+                        for source_detail in cn_item.sources:
+                            if source_detail.type: # Ensure type is not None
+                                 canonical_domain_journey_data[true_base_domain]["LLM_Consolidated_Number_Types_Summary"][source_detail.type] += 1
+            # --- End: Populate LLM consolidated numbers info ---
+        logger.info(f"Global Consolidation complete. {len(final_consolidated_data_by_true_base)} true base domains processed.")
+        run_metrics["tasks"]["global_consolidation_duration_seconds"] = time.time() - global_consolidation_start_time
+        run_metrics["data_processing_stats"]["unique_true_base_domains_consolidated"] = len(final_consolidated_data_by_true_base)
+
+        # --- Determine Final Outcome and Fault Category for each Canonical Domain ---
+        logger.info("Determining final outcomes for each canonical domain...")
+        for domain_key, journey_data_entry in canonical_domain_journey_data.items():
+            final_domain_reason, final_domain_fault = _determine_final_domain_outcome_and_fault(
+                true_base_domain=domain_key,
+                domain_journey_entry=journey_data_entry,
+                true_base_scraper_status_map=true_base_scraper_status, # This was populated during global consolidation
+                true_base_to_pathful_map=true_base_to_pathful_map, # This was populated during global consolidation
+                canonical_site_pathful_scraper_status=canonical_site_pathful_scraper_status, # Populated in Pass 1
+                # For canonical_site_regex_candidates_found_status, we use the aggregated value from the journey data
+                canonical_site_regex_candidates_found_status=journey_data_entry.get("Regex_Candidates_Found_For_Any_Pathful", False),
+                final_consolidated_data=final_consolidated_data_by_true_base.get(domain_key) # Result from process_and_consolidate
+            )
+            canonical_domain_journey_data[domain_key]["Final_Domain_Outcome_Reason"] = final_domain_reason
+            canonical_domain_journey_data[domain_key]["Primary_Fault_Category_For_Domain"] = final_domain_fault
+            if final_domain_reason != "Contact_Successfully_Extracted_For_Domain":
+                logger.info(f"Domain '{domain_key}': Outcome='{final_domain_reason}', Fault='{final_domain_fault}'")
+        logger.info("Final domain outcome determination complete.")
+        # --- End Final Outcome Determination for Canonical Domains ---
+     
+     
+        detailed_columns_order = [
+            'CompanyName', 'Number', 'LLM_Type', 'LLM_Classification',
+            'LLM_Source_URL', 'ScrapingStatus', 'TargetCountryCodes', 'RunID'
+        ]
+
+        summary_columns_order = [
+            'CompanyName', 'GivenURL', 'GivenPhoneNumber', 'Original_Number_Status',
+            'Top_Number_1', 'Top_Type_1', 'Description', 'ScrapingStatus_Canonical',
+            'CanonicalEntryURL', 'Top_Number_1', 'Top_Type_1', 'Top_Number_2',
+            'Top_Type_2', 'Top_Number_3', 'Top_Type_3', 'Top_SourceURL_1',
+            'Top_SourceURL_2', 'Top_SourceURL_3', 'TargetCountryCodes', 'RunID'
+        ]
+
+        tertiary_report_columns_order = [
+            'CompanyName', 'GivenURL', 'CanonicalEntryURL', 'ScrapingStatus',
+            'PhoneNumber_1', 'PhoneNumber_2', 'PhoneNumber_3',
+            'SourceURL_1', 'SourceURL_2', 'SourceURL_3'
+        ]
+
+        logger.info("Starting Pass 2: Building Detailed Flattened and Summary Reports...")
+        pass2_reports_start_time = time.time()
+     
+        classification_precedence = {
+            'Primary': 1, 'Secondary': 2, 'Support': 3,
+            'Low Relevance': 4, 'Non-Business': 5, None: 99
         }
 
-        company_contact_details_summary: Optional[CompanyContactDetails] = None
-        if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base:
-            company_contact_details_summary = final_consolidated_data_by_true_base[canonical_url_summary]
+        for index, original_row_data in df.iterrows():
+            company_name_pass2 = str(original_row_data.get('CompanyName', f"Row_{index}"))
+            given_url_pass2 = original_row_data.get('GivenURL')
+            canonical_url_pass2 = original_row_data.get('CanonicalEntryURL')
+            scraper_status_pass2 = original_row_data.get('ScrapingStatus')
 
-        unique_sorted_consolidated_numbers: List[ConsolidatedPhoneNumber] = []
-        if company_contact_details_summary:
-            unique_sorted_consolidated_numbers = company_contact_details_summary.consolidated_numbers
+            company_contact_details_pass2: Optional[CompanyContactDetails] = None
+            if canonical_url_pass2 and canonical_url_pass2 in final_consolidated_data_by_true_base:
+                company_contact_details_pass2 = final_consolidated_data_by_true_base[canonical_url_pass2]
+            
+            scraper_status_for_true_base_detailed = true_base_scraper_status.get(str(canonical_url_pass2), "Unknown") if canonical_url_pass2 else "Unknown_NoTrueBase"
 
-        # --- Populate Top Numbers (existing logic, kept for now) ---
-        if len(unique_sorted_consolidated_numbers) > 0:
-            top_item_1 = unique_sorted_consolidated_numbers[0]
-            df.at[index, 'Top_Number_1'] = top_item_1.number
-            df.at[index, 'Top_Type_1'] = ", ".join(list(set(s.type for s in top_item_1.sources)))
-            df.at[index, 'Top_SourceURL_1'] = ", ".join(list(set(s.original_full_url for s in top_item_1.sources)))
-        if len(unique_sorted_consolidated_numbers) > 1:
-            top_item_2 = unique_sorted_consolidated_numbers[1]
-            df.at[index, 'Top_Number_2'] = top_item_2.number
-            df.at[index, 'Top_Type_2'] = ", ".join(list(set(s.type for s in top_item_2.sources)))
-            df.at[index, 'Top_SourceURL_2'] = ", ".join(list(set(s.original_full_url for s in top_item_2.sources)))
-        if len(unique_sorted_consolidated_numbers) > 2:
-            top_item_3 = unique_sorted_consolidated_numbers[2]
-            df.at[index, 'Top_Number_3'] = top_item_3.number
-            df.at[index, 'Top_Type_3'] = ", ".join(list(set(s.type for s in top_item_3.sources)))
-            df.at[index, 'Top_SourceURL_3'] = ", ".join(list(set(s.original_full_url for s in top_item_3.sources)))
-        # --- End Populate Top Numbers ---
-
-        # --- Determine Final Row Outcome Reason and Fault Category ---
-        final_reason, fault_category = _determine_final_row_outcome_and_fault(
-            index=index,
-            row_summary=row_summary,
-            df_status_snapshot=df_status_snapshot_for_helper,
-            company_contact_details_summary=company_contact_details_summary,
-            unique_sorted_consolidated_numbers=unique_sorted_consolidated_numbers,
-            canonical_url_summary=canonical_url_summary,
-            true_base_scraper_status_map=true_base_scraper_status,
-            true_base_to_pathful_map=true_base_to_pathful_map,
-            canonical_site_pathful_scraper_status=canonical_site_pathful_scraper_status,
-            canonical_site_raw_llm_outputs=canonical_site_raw_llm_outputs,
-            canonical_site_regex_candidates_found_status=canonical_site_regex_candidates_found_status, # Pass new dict
-            canonical_site_llm_exception_details=canonical_site_llm_exception_details # Pass new dict
-        )
-        df.at[index, 'Final_Row_Outcome_Reason'] = final_reason
-        df.at[index, 'Determined_Fault_Category'] = fault_category
-
-        # --- Log the determined outcome for the input row ---
-        if final_reason != "Contact_Successfully_Extracted":
-            logger.info(
-                f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason} (Fault: {fault_category}). GivenURL: '{given_url_original_for_attrition}'"
-            )
-            # --- Populate Attrition Data List ---
-            # Get pre-computed duplicate counts for this row
-            current_input_company_name_for_counts = str(row_summary.get(company_name_col_key, "MISSING_COMPANY_NAME_INPUT")).strip()
-            current_input_given_url_for_counts = row_summary.get(url_col_key)
-            current_derived_input_canonical_for_counts = get_input_canonical_url(current_input_given_url_for_counts)
-            if not current_derived_input_canonical_for_counts:
-                current_derived_input_canonical_for_counts = "MISSING_OR_INVALID_URL_INPUT"
-
-            input_company_total_count = company_name_counts.get(current_input_company_name_for_counts, 0)
-            input_url_total_count = input_canonical_url_counts.get(current_derived_input_canonical_for_counts, 0)
-
-            is_dup_company_name = input_company_total_count > 1 and current_input_company_name_for_counts != "MISSING_COMPANY_NAME_INPUT"
-            is_dup_input_url = input_url_total_count > 1 and current_derived_input_canonical_for_counts != "MISSING_OR_INVALID_URL_INPUT"
-            is_overall_input_duplicate = is_dup_company_name or is_dup_input_url
-
-            attrition_data_list.append({
-                "InputRowID": index,
-                "CompanyName": company_name_for_attrition,
-                "GivenURL": given_url_original_for_attrition,
-                "Final_Row_Outcome_Reason": final_reason,
-                "Determined_Fault_Category": fault_category,
-                "Relevant_Canonical_URLs": canonical_url_summary if canonical_url_summary else "N/A",
-                "LLM_Error_Detail_Summary": canonical_site_llm_exception_details.get(str(canonical_url_summary), "") if canonical_url_summary and fault_category == "LLM Issue" and "Error" in final_reason else "",
-                "Timestamp_Of_Determination": datetime.now().isoformat(),
-                "Input_CompanyName_Total_Count": input_company_total_count,
-                "Input_CanonicalURL_Total_Count": input_url_total_count,
-                "Is_Input_CompanyName_Duplicate": "Yes" if is_dup_company_name else "No",
-                "Is_Input_CanonicalURL_Duplicate": "Yes" if is_dup_input_url else "No",
-                "Is_Input_Row_Considered_Duplicate": "Yes" if is_overall_input_duplicate else "No"
-            })
-        else:
-             logger.info(
-                f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason}. GivenURL: '{given_url_original_for_attrition}'"
-            )
-
-
-        # --- Original_Number_Status logic (kept for now, might be simplified later) ---
-        original_norm_phone_summary = row_summary.get('NormalizedGivenPhoneNumber')
-        if original_norm_phone_summary and original_norm_phone_summary != "InvalidFormat":
-            found_original_in_top_llm = False
-            for top_num_item in unique_sorted_consolidated_numbers[:3]:
-                if top_num_item.number == original_norm_phone_summary:
-                    found_original_in_top_llm = True
-                    break
-            if found_original_in_top_llm:
-                df.at[index, 'Original_Number_Status'] = 'Verified'
-            elif unique_sorted_consolidated_numbers:
-                df.at[index, 'Original_Number_Status'] = 'Corrected'
-            # The following conditions are now largely covered by Final_Row_Outcome_Reason
-            # We might simplify this or make it dependent on Final_Row_Outcome_Reason
-            elif final_reason == "LLM_Output_NoNumbersFound_AllAttempts" or final_reason == "LLM_Output_NumbersFound_NoneRelevant_AllAttempts":
-                 df.at[index, 'Original_Number_Status'] = 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' # Keep old status for compatibility if needed
-            elif final_reason.startswith("LLM_NoInput") or final_reason.startswith("LLM_Processing_Error") or final_reason.startswith("ScrapingFailed_Canonical") or final_reason == "Unknown_NoCanonicalURLDetermined":
-                 df.at[index, 'Original_Number_Status'] = 'LLM_Not_Run_Or_NoOutput_For_Canonical' # Keep old status
-            else: # Fallback if original phone was provided but no LLM match and not covered above
-                 df.at[index, 'Original_Number_Status'] = 'No Relevant Match Found by LLM'
-
-        elif original_norm_phone_summary == "InvalidFormat":
-            df.at[index, 'Original_Number_Status'] = 'Original_InvalidFormat'
-        else:
-            df.at[index, 'Original_Number_Status'] = 'Original_Not_Provided'
-        # --- End Original_Number_Status logic ---
-
-        # --- Overall_VerificationStatus logic (kept for now, review for simplification later) ---
-        # This logic might be redundant or can be derived from Final_Row_Outcome_Reason
-        overall_status = "Unverified"
-        scraper_status_for_true_base_domain_summary = true_base_scraper_status.get(str(canonical_url_summary), "Unknown") if canonical_url_summary else "Unknown_NoTrueBase"
-
-        if final_reason == "Contact_Successfully_Extracted":
-            overall_status = "Verified_LLM_Match_Found"
-        elif final_reason.startswith("ScrapingFailed_Canonical") or final_reason == "Scraping_AllAttemptsFailed_Network" or final_reason == "Scraping_AllAttemptsFailed_AccessDenied" or final_reason == "Scraping_ContentNotFound_AllAttempts":
-            overall_status = f"Unverified_Scrape_{scraper_status_for_true_base_domain_summary}"
-        elif final_reason == "LLM_Output_NumbersFound_NoneRelevant_AllAttempts" or final_reason == "LLM_Output_NoNumbersFound_AllAttempts":
-            overall_status = "Unverified_LLM_NoRelevantNumbers"
-        elif final_reason == "LLM_Processing_Error_AllAttempts": # Covers prompt missing too if helper sets it
-            overall_status = "Error_LLM_Processing_For_Canonical"
-        # Add more mappings from final_reason to overall_status if needed
-
-        original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
-        normalized_original_input_base = get_canonical_base_url(original_input_url_for_map, log_level_for_non_domain_input=logging.INFO) if original_input_url_for_map != "None_GivenURL_Input" else None
-        
-        if canonical_url_summary and normalized_original_input_base and normalized_original_input_base != canonical_url_summary:
-            if overall_status != "Verified_LLM_Match_Found" or not overall_status.startswith("RedirectedTo"): # Avoid double prefix
-                 overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
-        
-        df.at[index, 'Overall_VerificationStatus'] = overall_status
-        df.at[index, 'ScrapingStatus_Canonical'] = scraper_status_for_true_base_domain_summary
-        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None and unique_sorted_consolidated_numbers else scraper_status_for_true_base_domain_summary
-
-    if all_flattened_rows:
-        df_detailed_flattened = pd.DataFrame(all_flattened_rows)
-        
-        classification_sort_order = ['Primary', 'Secondary', 'Support', 'Low Relevance', 'Non-Business']
-        df_detailed_flattened['LLM_Classification_Sort'] = pd.Categorical(
-            df_detailed_flattened['LLM_Classification'],
-            categories=classification_sort_order,
-            ordered=True
-        )
-        df_detailed_flattened = df_detailed_flattened.sort_values(
-            by=['CompanyName', 'LLM_Classification_Sort', 'Number'],
-            na_position='last' 
-        ).drop(columns=['LLM_Classification_Sort'])
-        
-        for col in detailed_columns_order:
-            if col not in df_detailed_flattened.columns:
-                df_detailed_flattened[col] = None 
-        
-        df_detailed_export = df_detailed_flattened[detailed_columns_order].copy()
-
-        detailed_output_filename = f"All_LLM_Extractions_Report_{run_id}.xlsx" 
-        detailed_output_excel_path = os.path.join(run_output_dir, detailed_output_filename)
-        try:
-            logger.info(f"Attempting to save detailed report to: {detailed_output_excel_path}")
-            with pd.ExcelWriter(detailed_output_excel_path, engine='openpyxl') as writer:
-                df_detailed_export.to_excel(writer, index=False, sheet_name='Detailed_Phone_Data')
-                worksheet_detailed = writer.sheets['Detailed_Phone_Data']
-                for col_idx, col_name in enumerate(df_detailed_export.columns):
-                    series_data = df_detailed_export.iloc[:, col_idx]
-                    if series_data.empty:
-                        max_val_len = 0
-                    else:
-                        lengths = series_data.astype(str).map(len)
-                        max_val_len = lengths.max() if not lengths.empty else 0
+            if scraper_status_for_true_base_detailed == "Success" and company_contact_details_pass2 and company_contact_details_pass2.consolidated_numbers:
+                for consolidated_number_item in company_contact_details_pass2.consolidated_numbers:
+                    aggregated_types = []
+                    aggregated_source_urls = []
+                    seen_types_for_number = set()
                     
-                    column_header_len = len(str(col_name))
-                    adjusted_width = max(max_val_len, column_header_len) + 2
-                    worksheet_detailed.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
-            logger.info(f"Detailed report saved successfully to {detailed_output_excel_path}")
-        except Exception as e_detailed:
-            logger.error(f"Error saving detailed report to {detailed_output_excel_path}: {e_detailed}", exc_info=True)
-    else:
-        logger.info("No data for detailed flattened report. Skipping file creation.")
-    run_metrics["report_generation_stats"]["detailed_report_rows"] = len(all_flattened_rows)
- 
-    unique_summary_cols_needed = list(dict.fromkeys(summary_columns_order)) 
+                    for source_detail in consolidated_number_item.sources:
+                        type_with_path = f"{source_detail.type} (from {source_detail.source_path})"
+                        if source_detail.type not in seen_types_for_number:
+                            aggregated_types.append(source_detail.type)
+                            seen_types_for_number.add(source_detail.type)
+                        if source_detail.original_full_url not in aggregated_source_urls:
+                             aggregated_source_urls.append(source_detail.original_full_url)
 
-    for col_name in unique_summary_cols_needed:
-        if col_name not in df.columns:
-            if col_name in ['Original_Number_Status', 'Overall_VerificationStatus',
-                            'CanonicalEntryURL', 'ScrapingStatus_Canonical', 'LLM_Processing_Status_Canonical',
-                            'Top_Number_1', 'Top_Type_1', 'Top_SourceURL_1',
-                            'Top_Number_2', 'Top_Type_2', 'Top_SourceURL_2',
-                            'Top_Number_3', 'Top_Type_3', 'Top_SourceURL_3']:
-                df[col_name] = None 
-                logger.warning(f"Summary report column '{col_name}' was not found in DataFrame and was initialized to None. Check population logic.")
-            elif col_name == 'RunID':
-                df[col_name] = run_id 
-            elif col_name not in ['CompanyName', 'GivenURL', 'GivenPhoneNumber', 'Description', 'TargetCountryCodes']:
-                 logger.error(f"Unexpected summary column '{col_name}' missing and not covered by specific initialization. Defaulting to None.")
-                 df[col_name] = None
+                    llm_type_str = ", ".join(aggregated_types) if aggregated_types else consolidated_number_item.sources[0].type if consolidated_number_item.sources else "Unknown"
+                    llm_source_url_str = ", ".join(aggregated_source_urls) if aggregated_source_urls else consolidated_number_item.sources[0].original_full_url if consolidated_number_item.sources else "N/A"
 
+                    new_flattened_row: Dict[str, Any] = {
+                        'CompanyName': company_name_pass2,
+                        'Number': consolidated_number_item.number,
+                        'LLM_Type': llm_type_str,
+                        'LLM_Classification': consolidated_number_item.classification,
+                        'LLM_Source_URL': llm_source_url_str,
+                        'ScrapingStatus': scraper_status_for_true_base_detailed,
+                        'TargetCountryCodes': original_row_data.get('TargetCountryCodes'),
+                        'RunID': run_id
+                    }
+                    all_flattened_rows.append(new_flattened_row)
+            
 
-    df_summary_export = df[summary_columns_order].copy()
-    
-    summary_output_filename = app_config.output_excel_file_name_template.format(run_id=run_id)
-    summary_output_excel_path = os.path.join(run_output_dir, summary_output_filename)
-    try:
-        logger.info(f"Attempting to save summary report to: {summary_output_excel_path}")
-        with pd.ExcelWriter(summary_output_excel_path, engine='openpyxl') as writer:
-            df_summary_export.to_excel(writer, index=False, sheet_name='Phone_Validation_Summary')
-            worksheet_summary = writer.sheets['Phone_Validation_Summary']
-            for col_idx, col_name in enumerate(df_summary_export.columns):
-                series_data = df_summary_export.iloc[:, col_idx]
-                if series_data.empty:
-                    max_val_len = 0
-                else:
-                    lengths = series_data.astype(str).map(len)
-                    max_val_len = lengths.max() if not lengths.empty else 0
+        logger.info("Starting Aggregation for Top_Contacts_Report...")
+        top_contacts_aggregation_map: Dict[str, Dict[str, Any]] = {}
+
+        if 'CanonicalEntryURL' not in df.columns:
+            logger.error("'CanonicalEntryURL' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to None.")
+            df['CanonicalEntryURL'] = None
+        if 'CompanyName' not in df.columns:
+            logger.error("'CompanyName' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to 'Unknown_Input_Company'.")
+            df['CompanyName'] = "Unknown_Input_Company"
+        if 'GivenURL' not in df.columns:
+            logger.error("'GivenURL' column is missing from DataFrame. This is critical for Top_Contacts_Report aggregation. Initializing to 'Unknown_Input_GivenURL'.")
+            df['GivenURL'] = "Unknown_Input_GivenURL"
+
+        for true_base_domain_key_agg, company_contact_details_object in final_consolidated_data_by_true_base.items():
+            if company_contact_details_object is None:
+                logger.warning(f"Skipping true_base_domain '{true_base_domain_key_agg}' for Top_Contacts_Report aggregation as its CompanyContactDetails is None.")
+                continue
+
+            matching_input_rows = df[df['CanonicalEntryURL'].astype(str) == str(true_base_domain_key_agg)]
+
+            unique_original_company_names: Set[str]
+            unique_original_given_urls: Set[str]
+
+            if matching_input_rows.empty:
+                logger.warning(f"No input rows found in df mapping to true_base_domain '{true_base_domain_key_agg}'. "
+                               f"Using company name ('{company_contact_details_object.company_name}') from CompanyContactDetails and its original_input_urls as fallback.")
+                unique_original_company_names = {str(company_contact_details_object.company_name)} if company_contact_details_object.company_name else {"Unknown_Company"}
+                unique_original_given_urls = set(map(str, company_contact_details_object.original_input_urls))
+            else:
+                unique_original_company_names = set(matching_input_rows['CompanyName'].dropna().astype(str))
+                unique_original_given_urls = set(matching_input_rows['GivenURL'].dropna().astype(str))
+                if not unique_original_company_names:
+                     unique_original_company_names = {str(company_contact_details_object.company_name)} if company_contact_details_object.company_name else {"Unknown_Company"}
+                if not unique_original_given_urls:
+                     unique_original_given_urls = set(map(str, company_contact_details_object.original_input_urls))
+
+            report_company_name = f"{true_base_domain_key_agg} - {' - '.join(sorted(list(unique_original_company_names)))}"
+            report_given_urls = ", ".join(sorted(list(unique_original_given_urls)))
+            
+            top_contacts_aggregation_map[true_base_domain_key_agg] = {
+                "report_company_name": report_company_name,
+                "report_given_urls": report_given_urls,
+                "canonical_entry_url": true_base_domain_key_agg,
+                "scraper_status": true_base_scraper_status.get(true_base_domain_key_agg, "Unknown"),
+                "contact_details": company_contact_details_object,
+                "all_input_companies_for_canonical": sorted(list(unique_original_company_names))
+            }
+        logger.info(f"Aggregation for Top_Contacts_Report complete. Found {len(top_contacts_aggregation_map)} unique canonical URLs to report on.")
+
+        logger.info("Building Top_Contacts_Report (formerly Tertiary) from aggregated data...")
+        all_tertiary_rows.clear()
+
+        for aggregated_entry in top_contacts_aggregation_map.values():
+            company_contact_details_for_report = aggregated_entry["contact_details"]
+            
+            new_tertiary_row: Dict[str, Any] = {
+                'CompanyName': aggregated_entry["report_company_name"],
+                'GivenURL': aggregated_entry["report_given_urls"],
+                'CanonicalEntryURL': aggregated_entry["canonical_entry_url"],
+                'ScrapingStatus': aggregated_entry["scraper_status"],
+                'PhoneNumber_1': None, 'PhoneNumber_2': None, 'PhoneNumber_3': None,
+                'SourceURL_1': None, 'SourceURL_2': None, 'SourceURL_3': None
+            }
+
+            if company_contact_details_for_report and company_contact_details_for_report.consolidated_numbers:
+                eligible_numbers_for_report: List[ConsolidatedPhoneNumber] = []
+                for cn_item in company_contact_details_for_report.consolidated_numbers:
+                    source_types = {s.type for s in cn_item.sources if s.type}
+                    if cn_item.classification != 'Non-Business' and \
+                       not EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT.intersection(source_types):
+                        eligible_numbers_for_report.append(cn_item)
+                    else:
+                        excluded_reasons = []
+                        if cn_item.classification == 'Non-Business':
+                            excluded_reasons.append("classification is Non-Business")
+                        intersecting_types = EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT.intersection(source_types)
+                        if intersecting_types:
+                            excluded_reasons.append(f"excluded types: {intersecting_types}")
+                        logger.debug(f"Excluding number {cn_item.number} from Top_Contacts_Report for company '{aggregated_entry['report_company_name']}' due to: {'; '.join(excluded_reasons)}")
+
+                for i, consolidated_number_item in enumerate(eligible_numbers_for_report[:3]):
+                    phone_num_key = f'PhoneNumber_{i+1}'
+                    source_url_key = f'SourceURL_{i+1}'
+                    
+                    number_str = consolidated_number_item.number
+                    types_str = ", ".join(sorted(list(set(s.type for s in consolidated_number_item.sources))))
+                    
+                    companies_for_this_number = sorted(list(set(
+                        s.original_input_company_name
+                        for s in consolidated_number_item.sources
+                        if s.original_input_company_name
+                    )))
+                    companies_for_this_number_str = ", ".join(companies_for_this_number) if companies_for_this_number else "UnknownCompany"
+
+                    new_tertiary_row[phone_num_key] = f"{number_str} ({types_str}) [{companies_for_this_number_str}]"
+                    new_tertiary_row[source_url_key] = ", ".join(sorted(list(set(s.original_full_url for s in consolidated_number_item.sources))))
+            
+            if new_tertiary_row['PhoneNumber_1'] or new_tertiary_row['PhoneNumber_2'] or new_tertiary_row['PhoneNumber_3']:
+                all_tertiary_rows.append(new_tertiary_row)
+            else:
+                logger.info(f"Skipping row for canonical URL '{aggregated_entry['canonical_entry_url']}' (Company: '{aggregated_entry['report_company_name']}') in Top_Contacts_Report as it has no eligible phone numbers after filtering.")
                 
-                column_header_len = len(str(col_name))
-                adjusted_width = max(max_val_len, column_header_len) + 2
-                worksheet_summary.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
-        logger.info(f"Summary report saved successfully to {summary_output_excel_path}")
-    except Exception as e_summary:
-        logger.error(f"Error saving summary report to {summary_output_excel_path}: {e_summary}", exc_info=True)
-        run_metrics["errors_encountered"].append(f"Error saving summary report: {str(e_summary)}")
-    run_metrics["report_generation_stats"]["summary_report_rows"] = len(df_summary_export) if 'df_summary_export' in locals() else 0
- 
-    tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id) 
-    tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
+        logger.info(f"Finished building Top_Contacts_Report. {len(all_tertiary_rows)} rows created.")
 
-    if all_tertiary_rows:
-        df_tertiary_report = pd.DataFrame(all_tertiary_rows)
-        
-        for col_t in tertiary_report_columns_order:
-            if col_t not in df_tertiary_report.columns:
-                df_tertiary_report[col_t] = None 
-        
-        df_tertiary_export = df_tertiary_report[tertiary_report_columns_order].copy()
 
+        for index, row_summary in df.iterrows():
+            # Preserve original values needed by the helper or for other logic
+            given_url_original_for_attrition = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else ""
+            company_name_for_attrition = str(row_summary.get('CompanyName', f"Row_{index}"))
+            canonical_url_summary = row_summary.get('CanonicalEntryURL') # This is the true_base_domain
+
+            # Snapshot of relevant df statuses for this row before they might be overwritten
+            df_status_snapshot_for_helper = {
+                'ScrapingStatus': row_summary.get('ScrapingStatus'), # Initial scrape status for the input URL
+                # Add other df statuses if _determine_final_row_outcome_and_fault needs them
+            }
+
+            company_contact_details_summary: Optional[CompanyContactDetails] = None
+            if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base:
+                company_contact_details_summary = final_consolidated_data_by_true_base[canonical_url_summary]
+
+            unique_sorted_consolidated_numbers: List[ConsolidatedPhoneNumber] = []
+            if company_contact_details_summary:
+                unique_sorted_consolidated_numbers = company_contact_details_summary.consolidated_numbers
+
+            # --- Populate Top Numbers (existing logic, kept for now) ---
+            if len(unique_sorted_consolidated_numbers) > 0:
+                top_item_1 = unique_sorted_consolidated_numbers[0]
+                df.at[index, 'Top_Number_1'] = top_item_1.number
+                df.at[index, 'Top_Type_1'] = ", ".join(list(set(s.type for s in top_item_1.sources)))
+                df.at[index, 'Top_SourceURL_1'] = ", ".join(list(set(s.original_full_url for s in top_item_1.sources)))
+            if len(unique_sorted_consolidated_numbers) > 1:
+                top_item_2 = unique_sorted_consolidated_numbers[1]
+                df.at[index, 'Top_Number_2'] = top_item_2.number
+                df.at[index, 'Top_Type_2'] = ", ".join(list(set(s.type for s in top_item_2.sources)))
+                df.at[index, 'Top_SourceURL_2'] = ", ".join(list(set(s.original_full_url for s in top_item_2.sources)))
+            if len(unique_sorted_consolidated_numbers) > 2:
+                top_item_3 = unique_sorted_consolidated_numbers[2]
+                df.at[index, 'Top_Number_3'] = top_item_3.number
+                df.at[index, 'Top_Type_3'] = ", ".join(list(set(s.type for s in top_item_3.sources)))
+                df.at[index, 'Top_SourceURL_3'] = ", ".join(list(set(s.original_full_url for s in top_item_3.sources)))
+            # --- End Populate Top Numbers ---
+
+            # --- Determine Final Row Outcome Reason and Fault Category ---
+            final_reason, fault_category = _determine_final_row_outcome_and_fault(
+                index=index,
+                row_summary=row_summary,
+                df_status_snapshot=df_status_snapshot_for_helper,
+                company_contact_details_summary=company_contact_details_summary,
+                unique_sorted_consolidated_numbers=unique_sorted_consolidated_numbers,
+                canonical_url_summary=canonical_url_summary,
+                true_base_scraper_status_map=true_base_scraper_status,
+                true_base_to_pathful_map=true_base_to_pathful_map,
+                canonical_site_pathful_scraper_status=canonical_site_pathful_scraper_status,
+                canonical_site_raw_llm_outputs=canonical_site_raw_llm_outputs,
+                canonical_site_regex_candidates_found_status=canonical_site_regex_candidates_found_status, # Pass new dict
+                canonical_site_llm_exception_details=canonical_site_llm_exception_details # Pass new dict
+            )
+            df.at[index, 'Final_Row_Outcome_Reason'] = final_reason
+            df.at[index, 'Determined_Fault_Category'] = fault_category
+
+            # --- Log the determined outcome for the input row ---
+            if final_reason != "Contact_Successfully_Extracted":
+                logger.info(
+                    f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason} (Fault: {fault_category}). GivenURL: '{given_url_original_for_attrition}'"
+                )
+                # --- Populate Attrition Data List ---
+                # Get pre-computed duplicate counts for this row
+                current_input_company_name_for_counts = str(row_summary.get(company_name_col_key, "MISSING_COMPANY_NAME_INPUT")).strip()
+                current_input_given_url_for_counts = row_summary.get(url_col_key)
+                current_derived_input_canonical_for_counts = get_input_canonical_url(current_input_given_url_for_counts)
+                if not current_derived_input_canonical_for_counts:
+                    current_derived_input_canonical_for_counts = "MISSING_OR_INVALID_URL_INPUT"
+
+                input_company_total_count = company_name_counts.get(current_input_company_name_for_counts, 0)
+                input_url_total_count = input_canonical_url_counts.get(current_derived_input_canonical_for_counts, 0)
+
+                is_dup_company_name = input_company_total_count > 1 and current_input_company_name_for_counts != "MISSING_COMPANY_NAME_INPUT"
+                is_dup_input_url = input_url_total_count > 1 and current_derived_input_canonical_for_counts != "MISSING_OR_INVALID_URL_INPUT"
+                is_overall_input_duplicate = is_dup_company_name or is_dup_input_url
+
+                attrition_data_list.append({
+                    "InputRowID": index,
+                    "CompanyName": company_name_for_attrition,
+                    "GivenURL": given_url_original_for_attrition,
+                    "Final_Row_Outcome_Reason": final_reason,
+                    "Determined_Fault_Category": fault_category,
+                    "Relevant_Canonical_URLs": canonical_url_summary if canonical_url_summary else "N/A",
+                    "LLM_Error_Detail_Summary": canonical_site_llm_exception_details.get(str(canonical_url_summary), "") if canonical_url_summary and fault_category == "LLM Issue" and "Error" in final_reason else "",
+                    "Timestamp_Of_Determination": datetime.now().isoformat(),
+                    "Input_CompanyName_Total_Count": input_company_total_count,
+                    "Input_CanonicalURL_Total_Count": input_url_total_count,
+                    "Is_Input_CompanyName_Duplicate": "Yes" if is_dup_company_name else "No",
+                    "Is_Input_CanonicalURL_Duplicate": "Yes" if is_dup_input_url else "No",
+                    "Is_Input_Row_Considered_Duplicate": "Yes" if is_overall_input_duplicate else "No"
+                })
+            else:
+                 logger.info(
+                    f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason}. GivenURL: '{given_url_original_for_attrition}'"
+                )
+
+
+            # --- Original_Number_Status logic (kept for now, might be simplified later) ---
+            original_norm_phone_summary = row_summary.get('NormalizedGivenPhoneNumber')
+            if original_norm_phone_summary and original_norm_phone_summary != "InvalidFormat":
+                found_original_in_top_llm = False
+                for top_num_item in unique_sorted_consolidated_numbers[:3]:
+                    if top_num_item.number == original_norm_phone_summary:
+                        found_original_in_top_llm = True
+                        break
+                if found_original_in_top_llm:
+                    df.at[index, 'Original_Number_Status'] = 'Verified'
+                elif unique_sorted_consolidated_numbers:
+                    df.at[index, 'Original_Number_Status'] = 'Corrected'
+                # The following conditions are now largely covered by Final_Row_Outcome_Reason
+                # We might simplify this or make it dependent on Final_Row_Outcome_Reason
+                elif final_reason == "LLM_Output_NoNumbersFound_AllAttempts" or final_reason == "LLM_Output_NumbersFound_NoneRelevant_AllAttempts":
+                     df.at[index, 'Original_Number_Status'] = 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' # Keep old status for compatibility if needed
+                elif final_reason.startswith("LLM_NoInput") or final_reason.startswith("LLM_Processing_Error") or final_reason.startswith("ScrapingFailed_Canonical") or final_reason == "Unknown_NoCanonicalURLDetermined":
+                     df.at[index, 'Original_Number_Status'] = 'LLM_Not_Run_Or_NoOutput_For_Canonical' # Keep old status
+                else: # Fallback if original phone was provided but no LLM match and not covered above
+                     df.at[index, 'Original_Number_Status'] = 'No Relevant Match Found by LLM'
+
+            elif original_norm_phone_summary == "InvalidFormat":
+                df.at[index, 'Original_Number_Status'] = 'Original_InvalidFormat'
+            else:
+                df.at[index, 'Original_Number_Status'] = 'Original_Not_Provided'
+            # --- End Original_Number_Status logic ---
+
+            # --- Overall_VerificationStatus logic (kept for now, review for simplification later) ---
+            # This logic might be redundant or can be derived from Final_Row_Outcome_Reason
+            overall_status = "Unverified"
+            scraper_status_for_true_base_domain_summary = true_base_scraper_status.get(str(canonical_url_summary), "Unknown") if canonical_url_summary else "Unknown_NoTrueBase"
+
+            if final_reason == "Contact_Successfully_Extracted":
+                overall_status = "Verified_LLM_Match_Found"
+            elif final_reason.startswith("ScrapingFailed_Canonical") or final_reason == "Scraping_AllAttemptsFailed_Network" or final_reason == "Scraping_AllAttemptsFailed_AccessDenied" or final_reason == "Scraping_ContentNotFound_AllAttempts":
+                overall_status = f"Unverified_Scrape_{scraper_status_for_true_base_domain_summary}"
+            elif final_reason == "LLM_Output_NumbersFound_NoneRelevant_AllAttempts" or final_reason == "LLM_Output_NoNumbersFound_AllAttempts":
+                overall_status = "Unverified_LLM_NoRelevantNumbers"
+            elif final_reason == "LLM_Processing_Error_AllAttempts": # Covers prompt missing too if helper sets it
+                overall_status = "Error_LLM_Processing_For_Canonical"
+            # Add more mappings from final_reason to overall_status if needed
+
+            original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
+            normalized_original_input_base = get_canonical_base_url(original_input_url_for_map, log_level_for_non_domain_input=logging.INFO) if original_input_url_for_map != "None_GivenURL_Input" else None
+            
+            if canonical_url_summary and normalized_original_input_base and normalized_original_input_base != canonical_url_summary:
+                if overall_status != "Verified_LLM_Match_Found" or not overall_status.startswith("RedirectedTo"): # Avoid double prefix
+                     overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
+            
+            df.at[index, 'Overall_VerificationStatus'] = overall_status
+            df.at[index, 'ScrapingStatus_Canonical'] = scraper_status_for_true_base_domain_summary
+            df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None and unique_sorted_consolidated_numbers else scraper_status_for_true_base_domain_summary
+
+        if all_flattened_rows:
+            df_detailed_flattened = pd.DataFrame(all_flattened_rows)
+            
+            classification_sort_order = ['Primary', 'Secondary', 'Support', 'Low Relevance', 'Non-Business']
+            df_detailed_flattened['LLM_Classification_Sort'] = pd.Categorical(
+                df_detailed_flattened['LLM_Classification'],
+                categories=classification_sort_order,
+                ordered=True
+            )
+            df_detailed_flattened = df_detailed_flattened.sort_values(
+                by=['CompanyName', 'LLM_Classification_Sort', 'Number'],
+                na_position='last'
+            ).drop(columns=['LLM_Classification_Sort'])
+            
+            for col in detailed_columns_order:
+                if col not in df_detailed_flattened.columns:
+                    df_detailed_flattened[col] = None
+            
+            df_detailed_export = df_detailed_flattened[detailed_columns_order].copy()
+
+            detailed_output_filename = f"All_LLM_Extractions_Report_{run_id}.xlsx"
+            detailed_output_excel_path = os.path.join(run_output_dir, detailed_output_filename)
+            try:
+                logger.info(f"Attempting to save detailed report to: {detailed_output_excel_path}")
+                with pd.ExcelWriter(detailed_output_excel_path, engine='openpyxl') as writer:
+                    df_detailed_export.to_excel(writer, index=False, sheet_name='Detailed_Phone_Data')
+                    worksheet_detailed = writer.sheets['Detailed_Phone_Data']
+                    for col_idx, col_name in enumerate(df_detailed_export.columns):
+                        series_data = df_detailed_export.iloc[:, col_idx]
+                        if series_data.empty:
+                            max_val_len = 0
+                        else:
+                            lengths = series_data.astype(str).map(len)
+                            max_val_len = lengths.max() if not lengths.empty else 0
+                        
+                        column_header_len = len(str(col_name))
+                        adjusted_width = max(max_val_len, column_header_len) + 2
+                        worksheet_detailed.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+                logger.info(f"Detailed report saved successfully to {detailed_output_excel_path}")
+            except Exception as e_detailed:
+                logger.error(f"Error saving detailed report to {detailed_output_excel_path}: {e_detailed}", exc_info=True)
+        else:
+            logger.info("No data for detailed flattened report. Skipping file creation.")
+        run_metrics["report_generation_stats"]["detailed_report_rows"] = len(all_flattened_rows)
+     
+        unique_summary_cols_needed = list(dict.fromkeys(summary_columns_order))
+
+        for col_name in unique_summary_cols_needed:
+            if col_name not in df.columns:
+                if col_name in ['Original_Number_Status', 'Overall_VerificationStatus',
+                                'CanonicalEntryURL', 'ScrapingStatus_Canonical', 'LLM_Processing_Status_Canonical',
+                                'Top_Number_1', 'Top_Type_1', 'Top_SourceURL_1',
+                                'Top_Number_2', 'Top_Type_2', 'Top_SourceURL_2',
+                                'Top_Number_3', 'Top_Type_3', 'Top_SourceURL_3']:
+                    df[col_name] = None
+                    logger.warning(f"Summary report column '{col_name}' was not found in DataFrame and was initialized to None. Check population logic.")
+                elif col_name == 'RunID':
+                    df[col_name] = run_id
+                elif col_name not in ['CompanyName', 'GivenURL', 'GivenPhoneNumber', 'Description', 'TargetCountryCodes']:
+                     logger.error(f"Unexpected summary column '{col_name}' missing and not covered by specific initialization. Defaulting to None.")
+                     df[col_name] = None
+
+
+        df_summary_export = df[summary_columns_order].copy()
+        
+        summary_output_filename = app_config.output_excel_file_name_template.format(run_id=run_id)
+        summary_output_excel_path = os.path.join(run_output_dir, summary_output_filename)
         try:
-            logger.info(f"Attempting to save tertiary report ('Final Contacts.xlsx') to: {tertiary_output_excel_path}")
-            with pd.ExcelWriter(tertiary_output_excel_path, engine='openpyxl') as writer_t:
-                df_tertiary_export.to_excel(writer_t, index=False, sheet_name='Contact_Focused_Report')
-                worksheet_tertiary = writer_t.sheets['Contact_Focused_Report']
-                for col_idx, col_name in enumerate(df_tertiary_export.columns):
-                    series_data = df_tertiary_export.iloc[:, col_idx]
+            logger.info(f"Attempting to save summary report to: {summary_output_excel_path}")
+            with pd.ExcelWriter(summary_output_excel_path, engine='openpyxl') as writer:
+                df_summary_export.to_excel(writer, index=False, sheet_name='Phone_Validation_Summary')
+                worksheet_summary = writer.sheets['Phone_Validation_Summary']
+                for col_idx, col_name in enumerate(df_summary_export.columns):
+                    series_data = df_summary_export.iloc[:, col_idx]
                     if series_data.empty:
                         max_val_len = 0
                     else:
@@ -1640,45 +1610,122 @@ def main() -> None:
                     
                     column_header_len = len(str(col_name))
                     adjusted_width = max(max_val_len, column_header_len) + 2
-                    worksheet_tertiary.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
-            logger.info(f"Tertiary report saved successfully to {tertiary_output_excel_path}")
-        except Exception as e_tertiary:
-            logger.error(f"Error saving tertiary report to {tertiary_output_excel_path}: {e_tertiary}", exc_info=True)
-            run_metrics["errors_encountered"].append(f"Error saving tertiary report: {str(e_tertiary)}")
-    else:
-        logger.info("No data for tertiary report. Skipping file creation.")
-    run_metrics["report_generation_stats"]["tertiary_report_rows"] = len(all_tertiary_rows)
-    run_metrics["tasks"]["pass2_report_generation_duration_seconds"] = time.time() - pass2_reports_start_time
-    
-    # Write Canonical Domain Summary Report
-    logger.info("Attempting to write Canonical Domain Summary Report...")
-    canonical_domain_summary_rows_written = write_canonical_domain_summary_report(
-        run_id=run_id,
-        domain_journey_data=canonical_domain_journey_data,
-        output_dir=run_output_dir
-    )
-    run_metrics["report_generation_stats"]["canonical_domain_summary_rows"] = canonical_domain_summary_rows_written
-    logger.info(f"Canonical Domain Summary Report: {canonical_domain_summary_rows_written} rows written.")
+                    worksheet_summary.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+            logger.info(f"Summary report saved successfully to {summary_output_excel_path}")
+        except Exception as e_summary:
+            logger.error(f"Error saving summary report to {summary_output_excel_path}: {e_summary}", exc_info=True)
+            run_metrics["errors_encountered"].append(f"Error saving summary report: {str(e_summary)}")
+        run_metrics["report_generation_stats"]["summary_report_rows"] = len(df_summary_export) if 'df_summary_export' in locals() else 0
+     
+        tertiary_output_filename = app_config.tertiary_report_file_name_template.format(run_id=run_id)
+        tertiary_output_excel_path = os.path.join(run_output_dir, tertiary_output_filename)
 
-    # Write Row Attrition Report before final metrics
-    num_attrition_rows = write_row_attrition_report(run_id, attrition_data_list, run_output_dir, canonical_domain_journey_data, input_to_canonical_map)
-    # Potentially add num_attrition_rows to run_metrics if needed for summary in run_metrics.md
-    run_metrics["data_processing_stats"]["rows_in_attrition_report"] = num_attrition_rows
+        if all_tertiary_rows:
+            df_tertiary_report = pd.DataFrame(all_tertiary_rows)
+            
+            for col_t in tertiary_report_columns_order:
+                if col_t not in df_tertiary_report.columns:
+                    df_tertiary_report[col_t] = None
+            
+            df_tertiary_export = df_tertiary_report[tertiary_report_columns_order].copy()
+
+            try:
+                logger.info(f"Attempting to save tertiary report ('Final Contacts.xlsx') to: {tertiary_output_excel_path}")
+                with pd.ExcelWriter(tertiary_output_excel_path, engine='openpyxl') as writer_t:
+                    df_tertiary_export.to_excel(writer_t, index=False, sheet_name='Contact_Focused_Report')
+                    worksheet_tertiary = writer_t.sheets['Contact_Focused_Report']
+                    for col_idx, col_name in enumerate(df_tertiary_export.columns):
+                        series_data = df_tertiary_export.iloc[:, col_idx]
+                        if series_data.empty:
+                            max_val_len = 0
+                        else:
+                            lengths = series_data.astype(str).map(len)
+                            max_val_len = lengths.max() if not lengths.empty else 0
+                        
+                        column_header_len = len(str(col_name))
+                        adjusted_width = max(max_val_len, column_header_len) + 2
+                        worksheet_tertiary.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+                logger.info(f"Tertiary report saved successfully to {tertiary_output_excel_path}")
+            except Exception as e_tertiary:
+                logger.error(f"Error saving tertiary report to {tertiary_output_excel_path}: {e_tertiary}", exc_info=True)
+                run_metrics["errors_encountered"].append(f"Error saving tertiary report: {str(e_tertiary)}")
+        else:
+            logger.info("No data for tertiary report. Skipping file creation.")
+        run_metrics["report_generation_stats"]["tertiary_report_rows"] = len(all_tertiary_rows)
+        run_metrics["tasks"]["pass2_report_generation_duration_seconds"] = time.time() - pass2_reports_start_time
+        
+        # Write Canonical Domain Summary Report
+        logger.info("Attempting to write Canonical Domain Summary Report...")
+        canonical_domain_summary_rows_written = write_canonical_domain_summary_report(
+            run_id=run_id,
+            domain_journey_data=canonical_domain_journey_data,
+            output_dir=run_output_dir
+        )
+        run_metrics["report_generation_stats"]["canonical_domain_summary_rows"] = canonical_domain_summary_rows_written
+        logger.info(f"Canonical Domain Summary Report: {canonical_domain_summary_rows_written} rows written.")
+
+        # Write Row Attrition Report before final metrics
+        num_attrition_rows = write_row_attrition_report(run_id, attrition_data_list, run_output_dir, canonical_domain_journey_data, input_to_canonical_map)
+        # Potentially add num_attrition_rows to run_metrics if needed for summary in run_metrics.md
+        run_metrics["data_processing_stats"]["rows_in_attrition_report"] = num_attrition_rows
  
-    write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, attrition_data_list, canonical_domain_journey_data)
+        write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, attrition_data_list, canonical_domain_journey_data)
 
-    logger.info("Attempting to generate 'Final Processed Contacts' report...")
-    if os.path.exists(tertiary_output_excel_path):
+        logger.info("Attempting to generate 'Final Processed Contacts' report...")
+        if os.path.exists(tertiary_output_excel_path):
+            try:
+                generate_processed_contacts_report(
+                    final_contacts_file_path=tertiary_output_excel_path,
+                    config=app_config,
+                    run_id=run_id
+                )
+            except Exception as e_processed_report:
+                logger.error(f"Error generating 'Final Processed Contacts' report: {e_processed_report}", exc_info=True)
+        else:
+            logger.warning(f"'Final Contacts.xlsx' not found at {tertiary_output_excel_path}. Skipping 'Final Processed Contacts' report generation.")
+
+        # Generate Augmented Input Report
+        logger.info("Attempting to generate Augmented Input Report...")
         try:
-            generate_processed_contacts_report(
-                final_contacts_file_path=tertiary_output_excel_path, 
-                config=app_config,
-                run_id=run_id
-            )
-        except Exception as e_processed_report:
-            logger.error(f"Error generating 'Final Processed Contacts' report: {e_processed_report}", exc_info=True)
-    else:
-        logger.warning(f"'Final Contacts.xlsx' not found at {tertiary_output_excel_path}. Skipping 'Final Processed Contacts' report generation.")
+            # Re-read the original input file to preserve its structure
+            original_input_df_for_aug: Optional[pd.DataFrame] = None
+            if INPUT_FILE_PATH.endswith('.csv'):
+                original_input_df_for_aug = pd.read_csv(INPUT_FILE_PATH)
+            elif INPUT_FILE_PATH.endswith(('.xls', '.xlsx')):
+                original_input_df_for_aug = pd.read_excel(INPUT_FILE_PATH, engine='openpyxl')
+            
+            if original_input_df_for_aug is not None and df is not None and original_phone_col_name_for_profile:
+                input_filename_path = Path(app_config.input_excel_file_path)
+                base_name, ext_name = os.path.splitext(input_filename_path.name)
+                # Ensure augmented report is .xlsx as per user request
+                augmented_filename = f"{base_name}_augmented_{run_id}.xlsx"
+                output_path_augmented_excel = Path(run_output_dir) / augmented_filename
+
+                generate_augmented_input_report(
+                    original_input_df=original_input_df_for_aug,
+                    processed_df=df, # The main DataFrame after all processing
+                    original_phone_col_name_for_profile=original_phone_col_name_for_profile,
+                    output_path_augmented_excel=str(output_path_augmented_excel)
+                )
+            elif original_input_df_for_aug is None:
+                logger.warning("Could not read original input file for augmented report generation.")
+            elif df is None:
+                logger.warning("Processed DataFrame (df) is None, cannot generate augmented report.")
+            elif not original_phone_col_name_for_profile:
+                logger.warning("Original phone column name for profile not available, cannot generate augmented report correctly.")
+
+        except Exception as e_aug_report:
+            logger.error(f"Error generating Augmented Input Report: {e_aug_report}", exc_info=True)
+            run_metrics["errors_encountered"].append(f"Error generating Augmented Input Report: {str(e_aug_report)}")
+
+
+    finally:
+        if failure_log_file_handle:
+            try:
+                failure_log_file_handle.close()
+                logger.info(f"Failure log CSV file '{failure_log_csv_path}' closed.")
+            except Exception as e_close:
+                logger.error(f"Error closing failure log CSV file '{failure_log_csv_path}': {e_close}")
 
     logger.info(f"Pipeline run {run_id} finished.")
     logger.info(f"Total pipeline duration: {run_metrics['total_duration_seconds']:.2f} seconds.")
@@ -2136,8 +2183,75 @@ def write_canonical_domain_summary_report(
         return 0
 
 
+def generate_augmented_input_report(
+    original_input_df: pd.DataFrame,
+    processed_df: pd.DataFrame,
+    original_phone_col_name_for_profile: str,
+    output_path_augmented_excel: str
+) -> None:
+    """
+    Generates an augmented version of the original input report.
+    It replaces the original phone number column with the best extracted/validated number.
+    If no number was found or validated, the field is left blank.
+    All other columns and formatting (as much as possible for Excel) are preserved.
+    """
+    logger.info(f"Starting generation of Augmented Input Report. Target column: '{original_phone_col_name_for_profile}'. Output: '{output_path_augmented_excel}'")
+
+    if original_phone_col_name_for_profile not in original_input_df.columns:
+        logger.error(f"Original phone column '{original_phone_col_name_for_profile}' not found in the re-read original input DataFrame. Cannot generate augmented report.")
+        return
+
+    augmented_df = original_input_df.copy()
+
+    # Create a mapping from original index (if available and consistent) to the best phone number
+    # Assuming processed_df maintains an index that corresponds to original_input_df rows.
+    # If not, a more robust mapping key (e.g., unique ID column if one exists) would be needed.
+    # For now, direct index mapping is assumed.
+    
+    update_map: Dict[Any, Optional[str]] = {}
+    for idx, p_row in processed_df.iterrows():
+        best_number: Optional[str] = None
+        # Prioritize Top_Number_1 if it's valid and not 'InvalidFormat' or similar
+        # This logic might need refinement based on how "best" number is defined (e.g., from 'Overall_VerificationStatus')
+        top_num_1 = p_row.get('Top_Number_1')
+        # A more robust check would be to see if Top_Number_1 is a valid E.164 or if Original_Number_Status is 'Verified'
+        # For simplicity now, if Top_Number_1 exists, we use it. Otherwise, blank.
+        if pd.notna(top_num_1) and isinstance(top_num_1, str) and top_num_1.strip():
+            best_number = top_num_1
+        
+        update_map[idx] = best_number # Store None if no best number, to blank it out
+
+    # Apply updates to the augmented_df
+    for idx, updated_phone in update_map.items():
+        if idx in augmented_df.index:
+            augmented_df.loc[idx, original_phone_col_name_for_profile] = updated_phone if updated_phone is not None else "" # Ensure blank for None
+        else:
+            logger.warning(f"Index {idx} from processed_df not found in original_input_df for augmented report. Skipping update for this row.")
+            
+    try:
+        with pd.ExcelWriter(output_path_augmented_excel, engine='openpyxl') as writer:
+            augmented_df.to_excel(writer, index=False, sheet_name='Augmented_Input')
+            # Auto-size columns for readability
+            worksheet = writer.sheets['Augmented_Input']
+            for col_idx, column_name_header in enumerate(augmented_df.columns):
+                series = augmented_df[column_name_header]
+                max_len = 0
+                if not series.empty:
+                    str_series_lengths = series.astype(str).map(len)
+                    if not str_series_lengths.empty:
+                         max_len_data = str_series_lengths.max()
+                         if pd.notna(max_len_data):
+                            max_len = int(max_len_data)
+                header_length = len(str(column_name_header))
+                adjusted_width = max(max_len, header_length) + 2
+                worksheet.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+        logger.info(f"Augmented Input Report successfully saved to {output_path_augmented_excel}")
+    except Exception as e:
+        logger.error(f"Failed to write Augmented Input Report to {output_path_augmented_excel}: {e}", exc_info=True)
+
+
 if __name__ == '__main__':
-    if not logger.hasHandlers(): 
+    if not logger.hasHandlers():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
     main()

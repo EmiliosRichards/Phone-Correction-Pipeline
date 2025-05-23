@@ -5,6 +5,7 @@ phonenumbers
 dotenv
 playwright
 beautifulsoup4
+tldextract
 requests
 google-generativeai
 pydantic

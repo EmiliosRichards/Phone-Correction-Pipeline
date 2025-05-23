@@ -84,12 +84,19 @@ def _is_row_empty(row_values: Iterable) -> bool:
         return True
     return all(pd.isna(value) or (isinstance(value, str) and not value.strip()) for value in row_values)
 
-def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppConfig] = None) -> pd.DataFrame | None:
+def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppConfig] = None) -> tuple[pd.DataFrame | None, str | None]:
     """
-    Loads data from a CSV or Excel file, standardizes column names, initializes
-    new columns required for the pipeline, and applies initial normalization
-    to any existing phone numbers. Implements smart reading for open-ended ranges
-    to stop after a configured number of consecutive empty rows.
+    Loads data from a CSV or Excel file, standardizes column names based on the
+    selected input profile from AppConfig, initializes new columns required for
+    the pipeline, and applies initial normalization to any existing phone numbers.
+    Implements smart reading for open-ended ranges to stop after a configured
+    number of consecutive empty rows.
+
+    Returns:
+        A tuple containing:
+        - pd.DataFrame | None: The processed DataFrame, or None on critical error.
+        - str | None: The original phone column name from the selected profile,
+                      or None if not found or profile is invalid.
     """
     current_config_instance: AppConfig
     if app_config_instance:
@@ -97,6 +104,7 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
     else:
         current_config_instance = AppConfig()
 
+    original_phone_col_name_from_profile: Optional[str] = None
     skip_rows_val: Optional[int] = None
     nrows_val: Optional[int] = None
     consecutive_empty_rows_to_stop: int = 3 # Default, will be overridden by config
@@ -211,7 +219,7 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
                         logger.info(f"CSV header read: {header}")
                     except StopIteration:
                         logger.warning(f"CSV file {file_path} seems empty (no header row).")
-                        return pd.DataFrame()
+                        return pd.DataFrame(), None
 
                     # 2. Skip initial data rows
                     for _ in range(actual_data_rows_to_skip):
@@ -244,7 +252,7 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
                 logger.info(f"Smart read from CSV resulted in {len(data_rows)} data rows.")
             else:
                 logger.error(f"Unsupported file type for smart read: {file_path}. Please use CSV or Excel.")
-                return None
+                return None, None
         else: # Original logic (fixed range or smart read disabled)
             logger.info(f"Using standard pandas read. Pandas skiprows argument: {pandas_skiprows_arg}, nrows: {nrows_val}")
             if file_path.endswith('.csv'):
@@ -253,11 +261,11 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
                 df = pd.read_excel(file_path, header=0, skiprows=pandas_skiprows_arg, nrows=nrows_val)
             else:
                 logger.error(f"Unsupported file type: {file_path}. Please use CSV or Excel.")
-                return None
+                return None, None
         
         if df is None: # Should only happen if smart read was attempted for unsupported file type
             logger.error(f"DataFrame is None after loading attempt for {file_path}. This indicates an issue with the loading logic.")
-            return None
+            return None, None
 
         logger.info(f"Columns loaded: {df.columns.tolist() if df is not None and not df.empty else 'N/A (DataFrame is None or empty)'}")
         
@@ -266,18 +274,27 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
             # If df is empty, we still want to ensure essential columns are present for later stages if they expect them.
             # The new_columns loop later will add them.
 
-        # --- Post-loading processing (rename_map, new_columns, etc.) ---
-        rename_map = {
-            "Unternehmen": "CompanyName",
-            "Webseite": "GivenURL",
-            "Telefonnummer": "GivenPhoneNumber",
-            "Beschreibung": "Description" # Keep description
-        }
+        # --- Post-loading processing (profile-based rename_map, new_columns, etc.) ---
+        active_profile_name = current_config_instance.input_file_profile_name
+        profile_mappings = current_config_instance.INPUT_COLUMN_PROFILES.get(active_profile_name)
+
+        if not profile_mappings:
+            logger.error(f"Input profile '{active_profile_name}' not found in AppConfig.INPUT_COLUMN_PROFILES. Falling back to 'default'.")
+            active_profile_name = "default"
+            profile_mappings = current_config_instance.INPUT_COLUMN_PROFILES.get("default")
+            if not profile_mappings: # Should not happen if "default" is always defined
+                 logger.error("Critical: Default input profile not found. Cannot map columns.")
+                 return pd.DataFrame(), None # Return empty DataFrame and None for phone col name
+
+        actual_rename_map = {k: v for k, v in profile_mappings.items() if not k.startswith('_') and k in df.columns}
+        original_phone_col_name_from_profile = profile_mappings.get("_original_phone_column_name")
+
+        if not original_phone_col_name_from_profile:
+            logger.warning(f"'_original_phone_column_name' not defined for profile '{active_profile_name}'. Augmented report may not update phone numbers correctly.")
         
-        actual_rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
         if actual_rename_map:
              df.rename(columns=actual_rename_map, inplace=True)
-        logger.info(f"DataFrame columns after renaming: {df.columns.tolist()}")
+        logger.info(f"DataFrame columns after renaming (profile: '{active_profile_name}'): {df.columns.tolist()}")
 
         new_columns = [
             "NormalizedGivenPhoneNumber", "ScrapingStatus",
@@ -322,16 +339,16 @@ def load_and_preprocess_data(file_path: str, app_config_instance: Optional[AppCo
                  df["NormalizedGivenPhoneNumber"] = None
 
 
-        return df
+        return df, original_phone_col_name_from_profile
     except FileNotFoundError:
         logger.error(f"Error: The file {file_path} was not found.")
-        return None
+        return None, None
     except pd.errors.EmptyDataError: # This might be caught by smart read logic earlier for empty files
         logger.error(f"Error: The file {file_path} is empty (pandas EmptyDataError).")
-        return pd.DataFrame() # Return empty DataFrame as per original behavior for this specific error
+        return pd.DataFrame(), None # Return empty DataFrame and None for phone col name
     except Exception as e:
         logger.error(f"An unexpected error occurred while loading data from {file_path}: {e}", exc_info=True)
-        return None
+        return None, None
 
 
 def normalize_phone_number(phone_number_str: str, region: str | None = None) -> str | None:

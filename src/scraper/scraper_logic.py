@@ -4,13 +4,14 @@ import re
 import logging
 import time
 import hashlib # Added for hashing long filenames
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, urlunparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 from bs4 import BeautifulSoup
 from bs4.element import Tag # Added for type checking
 import httpx # For asynchronous robots.txt checking
 from urllib.robotparser import RobotFileParser
 from typing import Set, Tuple, Optional, List, Dict, Any
+import tldextract # Added for DNS fallback logic
 
 # Assuming config.py is in src.core
 from ..core.config import AppConfig
@@ -284,198 +285,292 @@ def _classify_page_type(url_str: str, config: AppConfig) -> str:
     return "general_content"
 
 
-async def scrape_website(
-    given_url: str,
+async def _perform_scrape_for_entry_point(
+    entry_url_to_process: str,
+    playwright_context, # Existing Playwright browser context
     output_dir_for_run: str,
-    company_name_or_id: str, # This is the CompanyName
-    globally_processed_urls: Set[str],
-    input_row_id: Any # This is the InputRowID
+    company_name_or_id: str,
+    globally_processed_urls: Set[str], # Shared across all entry point attempts for the original given_url
+    input_row_id: Any
 ) -> Tuple[List[Tuple[str, str, str]], str, Optional[str]]:
-    start_time = time.time()
-    final_canonical_entry_url: Optional[str] = None
-    pages_scraped_for_this_domain_count = 0
-    high_priority_pages_scraped_after_limit = 0 # New counter
-    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Starting scrape for URL: {given_url}")
-
-    normalized_given_url = normalize_url(given_url)
-    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Original given_url: '{given_url}', Normalized to: '{normalized_given_url}'")
-
-    if not normalized_given_url or not isinstance(normalized_given_url, str) or \
-       not normalized_given_url.startswith(('http://', 'https://')):
-        logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Scraper received an invalid URL after normalization: {normalized_given_url}")
-        return [], "InvalidURL", None
-
-    async with httpx.AsyncClient(follow_redirects=True, verify=False) as http_client:
-        if not await is_allowed_by_robots(normalized_given_url, http_client, input_row_id, company_name_or_id):
-            return [], "RobotsDisallowed", None
-
+    """
+    Core scraping logic for a single entry point URL and its children.
+    This function contains the main `while urls_to_scrape` loop.
+    """
+    start_time_entry = time.time()
+    # final_canonical_entry_url_for_this_attempt will be the canonical URL derived *from this specific entry_url_to_process*
+    # if it's successfully scraped.
+    final_canonical_entry_url_for_this_attempt: Optional[str] = None
+    pages_scraped_this_entry_count = 0
+    high_priority_pages_scraped_after_limit_entry = 0
+    
     base_scraped_content_dir = os.path.join(output_dir_for_run, config_instance.scraped_content_subdir)
     cleaned_pages_storage_dir = os.path.join(base_scraped_content_dir, "cleaned_pages_text")
-    os.makedirs(cleaned_pages_storage_dir, exist_ok=True)
-    
+    # os.makedirs(cleaned_pages_storage_dir, exist_ok=True) # Already created in outer function
+
     company_safe_name = get_safe_filename(
         company_name_or_id,
         for_url=False,
         max_len=config_instance.filename_company_name_max_len
     )
- 
-    scraped_page_details: List[Tuple[str, str, str]] = [] # Modified type
+    scraped_page_details_for_this_entry: List[Tuple[str, str, str]] = []
     
-    # Queue stores: (url_string, depth_int, score_int)
-    # Initial URL gets a high score (e.g., 100) to ensure it's processed first.
-    urls_to_scrape: List[Tuple[str, int, int]] = [(normalized_given_url, 0, 100)] 
-    
-    processed_urls_this_call: Set[str] = {normalized_given_url}
+    # Queue for this specific entry point attempt
+    urls_to_scrape_q: List[Tuple[str, int, int]] = [(entry_url_to_process, 0, 100)]
+    # processed_urls_this_entry_call tracks URLs processed starting from *this* entry_url_to_process
+    # to avoid loops within its own scraping process.
+    processed_urls_this_entry_call: Set[str] = {entry_url_to_process}
 
-    browser = None
+    # Use the passed Playwright context to create a new page for this entry attempt
+    page = await playwright_context.new_page()
+    page.set_default_timeout(config_instance.default_page_timeout)
+    
+    entry_point_status_code: Optional[int] = None # To store status of the entry point itself
+
+    try:
+        while urls_to_scrape_q:
+            urls_to_scrape_q.sort(key=lambda x: (-x[2], x[1]))
+            current_url_from_queue, current_depth, current_score = urls_to_scrape_q.pop(0)
+            
+            logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Dequeuing URL: '{current_url_from_queue}' (Depth: {current_depth}, Score: {current_score}, Queue: {len(urls_to_scrape_q)})")
+
+            # Domain page limit checks
+            if config_instance.scraper_max_pages_per_domain > 0 and \
+               pages_scraped_this_entry_count >= config_instance.scraper_max_pages_per_domain:
+                if current_score < config_instance.scraper_score_threshold_for_limit_bypass or \
+                   high_priority_pages_scraped_after_limit_entry >= config_instance.scraper_max_high_priority_pages_after_limit:
+                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Page limit reached, skipping '{current_url_from_queue}'.")
+                    continue
+                else: # Bypass for high priority
+                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Page limit reached, but processing high-priority '{current_url_from_queue}'.")
+
+
+            html_content, status_code_fetch = await fetch_page_content(page, current_url_from_queue, input_row_id, company_name_or_id)
+            
+            if current_url_from_queue == entry_url_to_process and current_depth == 0: # This is the fetch for the entry point itself
+                entry_point_status_code = status_code_fetch
+
+
+            if html_content:
+                pages_scraped_this_entry_count += 1
+                if pages_scraped_this_entry_count > config_instance.scraper_max_pages_per_domain and \
+                   current_score >= config_instance.scraper_score_threshold_for_limit_bypass:
+                    high_priority_pages_scraped_after_limit_entry +=1
+
+                final_landed_url_raw = page.url
+                final_landed_url_normalized = normalize_url(final_landed_url_raw)
+                
+                logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Page fetch: Req='{current_url_from_queue}', LandedNorm='{final_landed_url_normalized}', Status: {status_code_fetch}")
+
+                if not final_canonical_entry_url_for_this_attempt and current_depth == 0:
+                    final_canonical_entry_url_for_this_attempt = final_landed_url_normalized
+                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Canonical URL for this entry attempt '{entry_url_to_process}' set to: '{final_canonical_entry_url_for_this_attempt}'")
+                
+                if final_landed_url_normalized in globally_processed_urls:
+                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Landed URL '{final_landed_url_normalized}' already globally processed. Skipping content save/link extraction.")
+                    continue
+                
+                globally_processed_urls.add(final_landed_url_normalized)
+                processed_urls_this_entry_call.add(final_landed_url_normalized)
+
+                # ... (rest of content saving and link extraction logic from original function, lines 394-433)
+                cleaned_text = extract_text_from_html(html_content)
+                parsed_landed_url = urlparse(final_landed_url_normalized)
+                source_domain = parsed_landed_url.netloc
+                safe_source_name = re.sub(r'^www\.', '', source_domain)
+                safe_source_name = re.sub(r'[^\w.-]', '_', safe_source_name)
+                source_specific_output_dir = os.path.join(cleaned_pages_storage_dir, safe_source_name)
+                os.makedirs(source_specific_output_dir, exist_ok=True)
+
+                landed_url_safe_name = get_safe_filename(final_landed_url_normalized, for_url=True)
+                cleaned_page_filename = f"{company_safe_name}__{landed_url_safe_name}_cleaned.txt"
+                cleaned_page_filepath = os.path.join(source_specific_output_dir, cleaned_page_filename)
+                
+                try:
+                    with open(cleaned_page_filepath, 'w', encoding='utf-8') as f_cleaned_page:
+                        f_cleaned_page.write(cleaned_text)
+                    page_type = _classify_page_type(final_landed_url_normalized, config_instance)
+                    scraped_page_details_for_this_entry.append((cleaned_page_filepath, final_landed_url_normalized, page_type))
+                except IOError as e:
+                    logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] IOError saving cleaned text for '{final_landed_url_normalized}': {e}")
+
+                if current_depth < config_instance.max_depth_internal_links:
+                    newly_found_links_with_scores = find_internal_links(html_content, final_landed_url_normalized, input_row_id, company_name_or_id)
+                    added_to_queue_count = 0
+                    for link_url, link_score in newly_found_links_with_scores:
+                        if link_url not in globally_processed_urls and link_url not in processed_urls_this_entry_call:
+                            urls_to_scrape_q.append((link_url, current_depth + 1, link_score))
+                            processed_urls_this_entry_call.add(link_url)
+                            added_to_queue_count +=1
+                    if added_to_queue_count > 0: urls_to_scrape_q.sort(key=lambda x: (-x[2], x[1]))
+            else: # html_content is None
+                logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Failed to fetch content from '{current_url_from_queue}'. Status code: {status_code_fetch}.")
+                if current_url_from_queue == entry_url_to_process and current_depth == 0: # Critical failure on the entry point itself
+                    status_map = {-1: "TimeoutError", -2: "DNSError", -3: "ConnectionRefused", -4: "PlaywrightError", -5: "GenericScrapeError", -6: "RequestAborted"}
+                    http_status_report = "UnknownScrapeError"
+                    if status_code_fetch is not None:
+                        if status_code_fetch > 0: http_status_report = f"HTTPError_{status_code_fetch}"
+                        elif status_code_fetch in status_map: http_status_report = status_map[status_code_fetch]
+                        else: http_status_report = "UnknownScrapeErrorCode"
+                    else: http_status_report = "NoStatusFromServer"
+                    
+                    logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Critical failure on entry point '{entry_url_to_process}'. Scraper status: {http_status_report}.")
+                    await page.close()
+                    return [], http_status_report, None # No canonical URL if entry point fails critically
+        
+        # After loop for this entry point
+        await page.close()
+        if scraped_page_details_for_this_entry:
+            logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] Successfully scraped {len(scraped_page_details_for_this_entry)} pages.")
+            return scraped_page_details_for_this_entry, "Success", final_canonical_entry_url_for_this_attempt
+        else: # No pages scraped for this entry point
+            final_status_for_this_entry = "NoContentScraped_Overall"
+            if entry_point_status_code is not None: # If the entry point itself had a specific failure status
+                 status_map = {-1: "TimeoutError", -2: "DNSError", -3: "ConnectionRefused", -4: "PlaywrightError", -5: "GenericScrapeError", -6: "RequestAborted"}
+                 if entry_point_status_code > 0: final_status_for_this_entry = f"HTTPError_{entry_point_status_code}"
+                 elif entry_point_status_code in status_map: final_status_for_this_entry = status_map[entry_point_status_code]
+                 else: final_status_for_this_entry = "UnknownScrapeErrorCode"
+
+            logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] No content scraped. Final status for this entry: {final_status_for_this_entry}")
+            return [], final_status_for_this_entry, final_canonical_entry_url_for_this_attempt # Return canonical if it was set by a successful landing, even if no sub-pages
+    except Exception as e_entry_scrape:
+        logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}, Entry: {entry_url_to_process}] General error during scraping process: {type(e_entry_scrape).__name__} - {e_entry_scrape}", exc_info=True)
+        if page.is_closed() == False : await page.close()
+        return [], f"GeneralScrapingError_{type(e_entry_scrape).__name__}", final_canonical_entry_url_for_this_attempt
+
+
+async def scrape_website(
+    given_url: str,
+    output_dir_for_run: str,
+    company_name_or_id: str,
+    globally_processed_urls: Set[str],
+    input_row_id: Any
+) -> Tuple[List[Tuple[str, str, str]], str, Optional[str]]:
+    start_time = time.time()
+    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Starting scrape_website for original URL: {given_url}")
+
+    normalized_given_url = normalize_url(given_url)
+    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Original: '{given_url}', Normalized to: '{normalized_given_url}'")
+
+    if not normalized_given_url or not normalized_given_url.startswith(('http://', 'https://')):
+        logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Invalid URL after normalization: {normalized_given_url}")
+        return [], "InvalidURL", None
+
+    # Initial robots.txt check for the very first normalized URL
+    async with httpx.AsyncClient(follow_redirects=True, verify=False) as http_client:
+        if not await is_allowed_by_robots(normalized_given_url, http_client, input_row_id, company_name_or_id):
+            return [], "RobotsDisallowed", None
+    
+    # Prepare directories once
+    base_scraped_content_dir = os.path.join(output_dir_for_run, config_instance.scraped_content_subdir)
+    cleaned_pages_storage_dir = os.path.join(base_scraped_content_dir, "cleaned_pages_text")
+    os.makedirs(cleaned_pages_storage_dir, exist_ok=True)
+
+    entry_candidates_queue: asyncio.Queue[str] = asyncio.Queue()
+    await entry_candidates_queue.put(normalized_given_url)
+    
+    # Tracks entry URLs attempted *within this specific call to scrape_website* to avoid loops from fallbacks
+    attempted_entry_candidates_this_call: Set[str] = {normalized_given_url}
+    
+    last_dns_error_status = "DNSError_AllFallbacksExhausted" # Default if all fallbacks lead to DNS errors
+
     async with async_playwright() as p:
+        browser = None
         try:
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             )
-            context = await browser.new_context(
+            # Create one context to be reused by _perform_scrape_for_entry_point attempts
+            # This means cookies/state might persist across fallback attempts for the same original given_url.
+            # If strict isolation is needed, context creation would move inside the loop.
+            playwright_context = await browser.new_context(
                 user_agent=config_instance.user_agent,
                 java_script_enabled=True,
                 ignore_https_errors=True
             )
-            page = await context.new_page()
-            page.set_default_timeout(config_instance.default_page_timeout)
-            
-            while urls_to_scrape:
-                urls_to_scrape.sort(key=lambda x: (-x[2], x[1])) 
+
+            while not entry_candidates_queue.empty():
+                current_entry_url_to_attempt = await entry_candidates_queue.get()
                 
-                current_url_from_queue, current_depth, current_score = urls_to_scrape.pop(0)
+                logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Trying entry point: {current_entry_url_to_attempt}")
+
+                details, status, canonical_landed = await _perform_scrape_for_entry_point(
+                    current_entry_url_to_attempt, playwright_context, output_dir_for_run,
+                    company_name_or_id, globally_processed_urls, input_row_id
+                )
+
+                if status != "DNSError": # Any success or non-DNS error is final for this given_url
+                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Entry point {current_entry_url_to_attempt} resulted in non-DNS status: {status}. Finalizing.")
+                    if browser.is_connected(): await browser.close()
+                    return details, status, canonical_landed
                 
-                logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Dequeuing URL: '{current_url_from_queue}' (Depth: {current_depth}, Score: {current_score}, Queue size: {len(urls_to_scrape)})")
+                # It was a DNSError for current_entry_url_to_attempt
+                last_dns_error_status = status # Store the most recent DNS error type
+                logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Entry point {current_entry_url_to_attempt} failed with DNSError. Status: {status}.")
 
-                if config_instance.scraper_max_pages_per_domain > 0 and \
-                   pages_scraped_for_this_domain_count >= config_instance.scraper_max_pages_per_domain:
-                    if current_score < config_instance.scraper_score_threshold_for_limit_bypass:
-                        logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Domain page limit ({config_instance.scraper_max_pages_per_domain}) reached. "
-                                    f"Skipping '{current_url_from_queue}' (score {current_score} < "
-                                    f"bypass threshold {config_instance.scraper_score_threshold_for_limit_bypass}).")
-                        continue
-                    else:
-                        if high_priority_pages_scraped_after_limit >= config_instance.scraper_max_high_priority_pages_after_limit:
-                            logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Domain page limit ({config_instance.scraper_max_pages_per_domain}) AND "
-                                        f"max high-priority pages after limit ({config_instance.scraper_max_high_priority_pages_after_limit}) reached. "
-                                        f"Skipping '{current_url_from_queue}' (score {current_score}).")
-                            continue
-                        else:
-                            logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Domain page limit reached, but '{current_url_from_queue}' (score {current_score}) "
-                                        f"meets bypass threshold. Processing as high-priority page "
-                                        f"({high_priority_pages_scraped_after_limit + 1}/{config_instance.scraper_max_high_priority_pages_after_limit}).")
-                
-                html_content, status_code = await fetch_page_content(page, current_url_from_queue, input_row_id, company_name_or_id)
-
-                if html_content:
-                    pages_scraped_for_this_domain_count += 1
-                    if pages_scraped_for_this_domain_count > config_instance.scraper_max_pages_per_domain and \
-                       current_score >= config_instance.scraper_score_threshold_for_limit_bypass:
-                        high_priority_pages_scraped_after_limit += 1
+                if config_instance.enable_dns_error_fallbacks:
+                    generated_fallbacks_for_current_failed_entry: List[str] = []
                     
-                    final_landed_url_raw = page.url
-                    final_landed_url_normalized = normalize_url(final_landed_url_raw)
-                    
-                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Page fetch report: Requested='{current_url_from_queue}', LandedRaw='{final_landed_url_raw}', LandedNormalized='{final_landed_url_normalized}', Status: {status_code}")
-
-                    if not final_canonical_entry_url and current_depth == 0: # Set canonical entry URL from the first successfully fetched page
-                        final_canonical_entry_url = final_landed_url_normalized
-                        logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Canonical entry URL for this scrape set to: '{final_canonical_entry_url}' (from initial URL '{given_url}')")
-                    
-                    if final_landed_url_normalized in globally_processed_urls:
-                        logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Landed URL '{final_landed_url_normalized}' (from requested '{current_url_from_queue}') has already been globally processed. Skipping content save and further link extraction from this instance.")
-                        continue
-                    
-                    globally_processed_urls.add(final_landed_url_normalized) # Add to global set to prevent re-processing across different scrape_website calls
-                    processed_urls_this_call.add(final_landed_url_normalized) # Add to local set for this specific scrape_website call
-
-                    cleaned_text = extract_text_from_html(html_content)
-                    parsed_landed_url = urlparse(final_landed_url_normalized)
-                    source_domain = parsed_landed_url.netloc
-                    safe_source_name = re.sub(r'^www\.', '', source_domain)
-                    safe_source_name = re.sub(r'[^\w.-]', '_', safe_source_name)
-                    source_specific_output_dir = os.path.join(cleaned_pages_storage_dir, safe_source_name)
-                    os.makedirs(source_specific_output_dir, exist_ok=True)
-                    logger.debug(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Ensured source-specific directory exists for saving content: {source_specific_output_dir}")
-
-                    landed_url_safe_name = get_safe_filename(final_landed_url_normalized, for_url=True)
-                    cleaned_page_filename = f"{company_safe_name}__{landed_url_safe_name}_cleaned.txt"
-                    cleaned_page_filepath = os.path.join(source_specific_output_dir, cleaned_page_filename)
-                    
+                    # Strategy 1: Hyphen Simplification
                     try:
-                        with open(cleaned_page_filepath, 'w', encoding='utf-8') as f_cleaned_page:
-                            f_cleaned_page.write(cleaned_text)
-                        logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Saved cleaned text from '{final_landed_url_normalized}' (requested as '{current_url_from_queue}') to {cleaned_page_filepath}")
-                        page_type = _classify_page_type(final_landed_url_normalized, config_instance)
-                        scraped_page_details.append((cleaned_page_filepath, final_landed_url_normalized, page_type))
-                        logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Classified '{final_landed_url_normalized}' as page type: {page_type}. Total pages for this domain: {pages_scraped_for_this_domain_count}.")
-                    except IOError as e:
-                        logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] IOError saving cleaned text for '{final_landed_url_normalized}' to {cleaned_page_filepath}: {e}")
-
-                    if current_depth < config_instance.max_depth_internal_links:
-                        newly_found_links_with_scores = find_internal_links(html_content, final_landed_url_normalized, input_row_id, company_name_or_id)
-                        added_to_queue_count = 0
-                        for link_url, link_score in newly_found_links_with_scores:
-                            if link_url not in globally_processed_urls and \
-                               link_url not in processed_urls_this_call: # Check against this call's processed set too
-                                urls_to_scrape.append((link_url, current_depth + 1, link_score))
-                                processed_urls_this_call.add(link_url) # Add to local set to avoid re-adding in this same scrape call
-                                added_to_queue_count +=1
+                        parsed_failed_entry = tldextract.extract(current_entry_url_to_attempt)
+                        domain_part = parsed_failed_entry.domain
+                        suffix_part = parsed_failed_entry.suffix
                         
-                        if added_to_queue_count > 0:
-                            urls_to_scrape.sort(key=lambda x: (-x[2], x[1]))
-                            logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] From '{final_landed_url_normalized}', added {added_to_queue_count} new unique links to queue. New queue size: {len(urls_to_scrape)}")
-                        else:
-                            logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] From '{final_landed_url_normalized}', no new unique links added to queue.")
-                    else:
-                        logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Reached max depth ({current_depth}) for link extraction from '{final_landed_url_normalized}'.")
-                else:
-                    logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Failed to fetch content from '{current_url_from_queue}' (normalized from original input). Status code: {status_code}. This URL will not be processed further.")
-                    if current_url_from_queue == normalized_given_url and current_depth == 0 : # Critical failure on the very first URL
-                        status_map = {
-                            -1: "TimeoutError", -2: "DNSError", -3: "ConnectionRefused",
-                            -4: "PlaywrightError", -5: "GenericScrapeError", -6: "RequestAborted"
-                        }
-                        http_status_report = "UnknownScrapeError"
-                        if status_code is not None:
-                            if status_code > 0: http_status_report = f"HTTPError_{status_code}"
-                            elif status_code in status_map: http_status_report = status_map[status_code]
-                            else: http_status_report = "UnknownScrapeErrorCode"
-                        else: http_status_report = "NoStatusFromServer" # Should not happen if fetch_page_content returns None for content
-                        logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Critical failure on initial URL '{normalized_given_url}'. Scraper status: {http_status_report}. No canonical URL determined.")
-                        return [], http_status_report, None # No canonical URL if initial fails
+                        if '-' in domain_part:
+                            simplified_domain_part = domain_part.split('-', 1)[0]
+                            if simplified_domain_part:
+                                variant1_domain = f"{simplified_domain_part}.{suffix_part}"
+                                parsed_original_for_reconstruct = urlparse(current_entry_url_to_attempt)
+                                variant1_url = urlunparse((parsed_original_for_reconstruct.scheme, variant1_domain, parsed_original_for_reconstruct.path, parsed_original_for_reconstruct.params, parsed_original_for_reconstruct.query, parsed_original_for_reconstruct.fragment))
+                                variant1_url_normalized = normalize_url(variant1_url)
+                                if variant1_url_normalized not in attempted_entry_candidates_this_call:
+                                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] DNS Fallback (Hyphen): Adding '{variant1_url_normalized}' to try.")
+                                    generated_fallbacks_for_current_failed_entry.append(variant1_url_normalized)
+                    except Exception as e_tld_hyphen:
+                        logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Error during hyphen simplification for {current_entry_url_to_attempt}: {e_tld_hyphen}")
 
-            # After loop finishes or breaks
-            if scraped_page_details:
-                logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Scraping completed. Successfully scraped and saved {len(scraped_page_details)} unique pages for domain derived from '{given_url}'. Total pages processed in this call: {pages_scraped_for_this_domain_count}.")
-                total_time = time.time() - start_time
-                logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Total scraping duration for this call: {total_time:.2f} seconds.")
-                return scraped_page_details, "Success", final_canonical_entry_url # final_canonical_entry_url should be set if any page was successful
-            else: # No pages were successfully scraped and saved
-                logger.warning(f"[RowID: {input_row_id}, Company: {company_name_or_id}] No content was successfully scraped and saved for the domain derived from '{given_url}'. Total pages attempted in this call: {pages_scraped_for_this_domain_count}.")
-                # Determine a more specific status if initial URL failed vs. sub-pages failed
-                if pages_scraped_for_this_domain_count == 0 and not final_canonical_entry_url: # Implies initial URL itself failed critically
-                    # The status from the initial URL failure would have been returned already if it was critical.
-                    # This path suggests maybe the initial URL was disallowed by robots, or some other pre-fetch issue.
-                    # If final_canonical_entry_url is None, it means the very first fetch failed to establish it.
-                    logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Initial URL '{normalized_given_url}' failed to yield any content or establish a canonical URL.")
-                    return [], "InitialURL_NoContentOrCanonical", None
-                else: # Some pages might have been processed but none saved, or initial URL was fine but no sub-pages yielded content
-                     return [], "NoContentScraped_Overall", final_canonical_entry_url # Use established canonical if available
-        except Exception as e:
-            logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] General error during Playwright scraping process for '{given_url}': {type(e).__name__} - {e}", exc_info=True)
-            return [], f"GeneralScrapingError_{type(e).__name__}", final_canonical_entry_url # Return established canonical if any
+                    # Strategy 2: TLD Swap (.de to .com) on current_entry_url_to_attempt (that just DNS-failed)
+                    try:
+                        parsed_failed_entry_for_tld_swap = tldextract.extract(current_entry_url_to_attempt)
+                        if parsed_failed_entry_for_tld_swap.suffix.lower() == 'de':
+                            variant2_domain = f"{parsed_failed_entry_for_tld_swap.domain}.com"
+                            parsed_original_for_reconstruct_tld = urlparse(current_entry_url_to_attempt)
+                            variant2_url = urlunparse((parsed_original_for_reconstruct_tld.scheme, variant2_domain, parsed_original_for_reconstruct_tld.path, parsed_original_for_reconstruct_tld.params, parsed_original_for_reconstruct_tld.query, parsed_original_for_reconstruct_tld.fragment))
+                            variant2_url_normalized = normalize_url(variant2_url)
+                            if variant2_url_normalized not in attempted_entry_candidates_this_call:
+                                logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] DNS Fallback (TLD Swap): Adding '{variant2_url_normalized}' to try.")
+                                generated_fallbacks_for_current_failed_entry.append(variant2_url_normalized)
+                    except Exception as e_tld_swap_main:
+                        logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Error during .de to .com TLD swap for {current_entry_url_to_attempt}: {e_tld_swap_main}")
+
+                    for fb_url in generated_fallbacks_for_current_failed_entry:
+                        if fb_url not in attempted_entry_candidates_this_call: # Double check before adding
+                           await entry_candidates_queue.put(fb_url)
+                           attempted_entry_candidates_this_call.add(fb_url)
+                else: # DNS fallbacks disabled
+                    logger.info(f"[RowID: {input_row_id}, Company: {company_name_or_id}] DNS fallbacks disabled. No further attempts for {current_entry_url_to_attempt}.")
+                    # If this was the last item in queue (i.e. normalized_given_url and no fallbacks added)
+                    # the loop will terminate and the last_dns_error_status will be returned.
+            
+            # If queue is exhausted
+            if browser and browser.is_connected(): await browser.close()
+            logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] All entry point attempts, including DNS fallbacks, exhausted for original URL: {given_url}. Last DNS status: {last_dns_error_status}")
+            return [], last_dns_error_status, None
+
+        except Exception as e_outer:
+            logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Outer error in scrape_website for '{given_url}': {type(e_outer).__name__} - {e_outer}", exc_info=True)
+            if browser and browser.is_connected(): await browser.close()
+            return [], f"OuterScrapingError_{type(e_outer).__name__}", None
         finally:
             if browser and browser.is_connected():
-                logger.debug(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Closing browser in 'finally' block.")
+                logger.debug(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Ensuring browser is closed in scrape_website's final 'finally' block.")
                 await browser.close()
-    
-    # This part should ideally not be reached if browser was initialized.
-    # If it is, it means Playwright setup itself failed.
-    logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Scraping ended unexpectedly for '{given_url}' (e.g., Playwright launch failed).")
-    return [], "ScraperSetupFailure", None # No canonical URL if setup failed
+
+    # Fallback if Playwright setup itself failed before entering the async with block
+    logger.error(f"[RowID: {input_row_id}, Company: {company_name_or_id}] Scrape_website ended, possibly due to Playwright launch failure for '{given_url}'.")
+    return [], "ScraperSetupFailure_Outer", None
 
 # TODO: [FutureEnhancement] The _test_scraper function below was for demonstrating and testing
 # the scrape_website functionality directly. It includes setup for logging and test output.

@@ -71,14 +71,19 @@ class AppConfig:
         llm_max_tokens (int): Maximum tokens for LLM response.
         llm_prompt_template_path (str): Path to the LLM prompt template file.
         llm_max_retries_on_number_mismatch (int): Max retries if LLM output number mismatches input.
+        llm_candidate_chunk_size (int): Number of regex candidates to send per LLM call.
+        llm_max_chunks_per_url (int): Maximum number of chunks (and thus LLM calls) per canonical URL.
         
         target_country_codes (List[str]): Target country codes for phone number parsing.
         default_region_code (Optional[str]): Default region code for phone number parsing.
         
         default_region_code (Optional[str]): Default region code for phone number parsing.
         url_probing_tlds (List[str]): Comma-separated list of TLDs to try appending to domain-like inputs that lack a TLD (e.g., "de,com,at,ch").
+        enable_dns_error_fallbacks (bool): Whether to enable DNS error fallback strategies (hyphen simplification, .de to .com swap).
         
         input_excel_file_path (str): Path to the input data file.
+        input_file_profile_name (str): Name of the input column mapping profile to use.
+        INPUT_COLUMN_PROFILES (dict): Class-level dictionary defining available input column mapping profiles.
         tertiary_report_file_name_template (str): Template for the new tertiary report Excel file name.
         processed_contacts_report_file_name_template (str): Template for the 'Final Processed Contacts' report Excel file name.
         skip_rows_config (Optional[int]): Number of rows to skip from the start of the input file (0-indexed).
@@ -97,6 +102,22 @@ class AppConfig:
         __init__(): Initializes the AppConfig instance by loading values from
                     environment variables or using defaults.
     """
+
+    INPUT_COLUMN_PROFILES = {
+        "default": {
+            "Unternehmen": "CompanyName",
+            "Webseite": "GivenURL",
+            "Telefonnummer": "GivenPhoneNumber",
+            "Beschreibung": "Description",
+            "_original_phone_column_name": "Telefonnummer"
+        },
+        "ManauvKlaus": {
+            "firma": "CompanyName",
+            "url": "GivenURL",
+            "Telefonnummer": "GivenPhoneNumber",
+            "_original_phone_column_name": "Telefonnummer"
+        }
+    }
 
     def __init__(self):
         """
@@ -159,6 +180,8 @@ class AppConfig:
         # Path to the prompt template, relative to the phone_validation_pipeline directory
         self.llm_prompt_template_path: str = os.getenv('LLM_PROMPT_TEMPLATE_PATH', 'prompts/gemini_phone_validation_v1.txt')
         self.llm_max_retries_on_number_mismatch: int = int(os.getenv('LLM_MAX_RETRIES_ON_NUMBER_MISMATCH', '1'))
+        self.llm_candidate_chunk_size: int = int(os.getenv('LLM_CANDIDATE_CHUNK_SIZE', '10'))
+        self.llm_max_chunks_per_url: int = int(os.getenv('LLM_MAX_CHUNKS_PER_URL', '10'))
 
         # --- Phone Number Normalization Configuration ---
         target_country_codes_str: str = os.getenv('TARGET_COUNTRY_CODES', 'DE,CH,AT') # Germany, Switzerland, Austria
@@ -168,9 +191,11 @@ class AppConfig:
         # --- URL Probing Configuration ---
         url_probing_tlds_str: str = os.getenv('URL_PROBING_TLDS', 'de,com,at,ch')
         self.url_probing_tlds: List[str] = [tld.strip().lower() for tld in url_probing_tlds_str.split(',') if tld.strip()]
+        self.enable_dns_error_fallbacks: bool = os.getenv('ENABLE_DNS_ERROR_FALLBACKS', 'True').lower() == 'true'
 
-        # --- Data Handling ---
+        # --- Data Handling & Input Profiling ---
         self.input_excel_file_path: str = os.getenv('INPUT_EXCEL_FILE_PATH', 'data_to_be_inputed.xlsx') # Relative to phone_validation_pipeline
+        self.input_file_profile_name: str = os.getenv("INPUT_FILE_PROFILE_NAME", "default")
         self.output_excel_file_name_template: str = os.getenv('OUTPUT_EXCEL_FILE_NAME_TEMPLATE', 'Pipeline_Summary_Report_{run_id}.xlsx')
         self.tertiary_report_file_name_template: str = os.getenv('TERTIARY_REPORT_FILE_NAME_TEMPLATE', 'Final Contacts.xlsx')
         self.processed_contacts_report_file_name_template: str = os.getenv('PROCESSED_CONTACTS_REPORT_FILE_NAME_TEMPLATE', 'Final_Processed_Contacts.xlsx')
