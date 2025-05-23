@@ -1,12 +1,14 @@
-# Enhanced Logging & Reporting System: Accomplishments & Guide
+h# Enhanced Logging & Reporting System: Accomplishments & Guide
 
 ## Comprehensive Overview of Accomplishments
 
 The "Strategic Plan: Enhanced Logging & Reporting System" has been fully implemented across all four phases. Key achievements include:
 
 *   **Standardized Logging:** Consistent log levels and configurable console output.
-*   **Detailed Error Reporting:** `failed_rows_{run_id}.csv` now contains comprehensive details like `CompanyName`, `GivenURL`, specific `stage_of_failure`, JSON `error_details`, and a `log_timestamp`.
-*   **Enhanced Metrics:** `run_metrics.md` provides clearer definitions, distinguishes global vs. row-level errors, and offers a hierarchical summary of failure types.
+*   **Detailed Error Reporting:**
+    *   `failed_rows_{run_id}.csv` now contains comprehensive details for *critically failed rows*, including `CompanyName`, `GivenURL`, specific `stage_of_failure`, JSON `error_details`, and a `log_timestamp`.
+    *   A new **`row_attrition_report_{run_id}.csv`** details all input rows that did *not* result in a final extracted contact, providing specific `Final_Row_Outcome_Reason` (e.g., `LLM_Output_NumbersFound_NoneRelevant_AllAttempts`) and a `Determined_Fault_Category`.
+*   **Enhanced Metrics:** `run_metrics.md` provides clearer definitions, distinguishes global vs. row-level errors, offers a hierarchical summary of critical failure types, and now includes an "Input Row Attrition Summary" detailing why rows didn't yield contacts.
 *   **Improved Log Traceability:** Main log files now include `InputRowID`, `CompanyName`, and a `file_identifier_prefix` for LLM logs, making it easier to follow individual data processing.
 *   **System Refinements:** Unused directory creation was removed, and log messages were refined for clarity.
 *   **Comprehensive Documentation:** [`README.md`](README.md) and [`USAGE.md`](USAGE.md) have been updated to reflect all changes.
@@ -23,8 +25,8 @@ Previously, while the pipeline had logging and reporting, there were areas for i
 
 *   **Log Clarity:** Log messages could sometimes be verbose or lack specific context, making it challenging to pinpoint issues for a particular input row without extensive searching.
 *   **Error Diagnosis:** Identifying the root cause of a failure for a specific company or URL often required manual correlation between different log entries and reports.
-*   **`run_metrics.md`:** This summary report provided some error information, but distinguishing between global pipeline issues and individual row failures wasn't always straightforward. Seeing patterns in row failures was difficult.
-*   **`failed_rows.csv`:** This file listed failed rows but lacked some immediate contextual information like company name or detailed, structured error messages.
+*   **`run_metrics.md`:** This summary report provided some error information, but distinguishing between global pipeline issues and individual row failures wasn't always straightforward. Seeing patterns in row failures or understanding overall row attrition was difficult.
+*   **`failed_rows.csv`:** This file listed rows with critical errors but lacked some immediate contextual information and didn't cover rows that completed processing but yielded no useful data.
 
 ### What's New & Improved? (The New Way)
 
@@ -43,17 +45,22 @@ The recent enhancements aim to make monitoring, debugging, and understanding pip
 
 #### 2. Supercharged Error Reports
 
-*   **`failed_rows_{run_id}.csv` - Your Primary Tool for Failed Rows:** This CSV file has been significantly upgraded:
-    *   **`CompanyName` and `GivenURL`:** Immediately identifies the problematic input row.
+*   **`failed_rows_{run_id}.csv` - For Critically Failed Rows:** This CSV file details input rows that encountered critical processing errors:
+    *   **`CompanyName` and `GivenURL`:** Immediately identifies the input row.
     *   **`stage_of_failure`:** Provides a specific code indicating *where* in the pipeline the failure occurred (e.g., `Scraping_Timeout_Error`, `LLM_JSON_Parsing_Error`, `URL_Validation_Invalid`).
     *   **`error_details`:** A JSON formatted string containing more technical details about the error, offering deeper insights.
     *   **`log_timestamp`:** Allows you to quickly find the corresponding detailed error messages in the main `.log` file.
-*   **`run_metrics.md` - Big Picture & Granular Failure Insights:**
-    *   This report still provides overall run statistics but now offers a clearer distinction between:
-        *   **"Global Pipeline Errors":** Issues that affect the entire pipeline run (e.g., configuration problems, LLM initialization failure).
-        *   **"Summary of Row-Level Failures":** A detailed breakdown of failures that occurred for individual input rows. This summary groups failures by broad categories (like "Scraping Failures," "LLM Failures") and then lists the counts for each specific `stage_of_failure` within those categories. This is excellent for spotting trends (e.g., "Are most of my scraping failures due to timeouts or DNS issues?").
+*   **New: `row_attrition_report_{run_id}.csv` - Understanding Why Contacts Aren't Found:**
+    *   This new report is key to understanding why an input row might not result in an extracted contact, even if it didn't "fail" with a critical error.
+    *   It includes `InputRowID`, `CompanyName`, `GivenURL`.
+    *   **`Final_Row_Outcome_Reason`**: Provides a specific reason like `LLM_Output_NumbersFound_NoneRelevant_AllAttempts`, `Scraping_AllAttemptsFailed_Network`, `Canonical_NoRegexCandidatesFound`, etc. (see `docs/20250522_170800_RowOutcomeReasons_And_FaultCategories.md` for full list).
+    *   **`Determined_Fault_Category`**: Categorizes the outcome (e.g., "Website Issue," "LLM Issue").
+*   **`run_metrics.md` - Big Picture & Comprehensive Failure/Attrition Insights:**
+    *   This report still provides overall run statistics but now offers:
+        *   Clearer distinction between **"Global Pipeline Errors"** and **"Summary of Row-Level Failures"** (for critical errors).
+        *   A new **"Input Row Attrition Summary"** section, which uses data from the `row_attrition_report_{run_id}.csv` to show counts of rows not yielding contacts, grouped by `Determined_Fault_Category`. This helps identify systemic reasons for data loss.
     *   **Important Note:** As identified during testing, if the pipeline encounters a critical error very early during startup (e.g., input file not found, invalid API key before processing starts), the `run_metrics.md` file might not be generated. In such cases, the console output and the main `.log` file are your primary sources for diagnosing these initial critical failures.
-
+*   **Granular Reasons in Main Output:** The main summary Excel output (e.g., `phone_validation_output_{RunID}.xlsx`) now also includes the `Final_Row_Outcome_Reason` and `Determined_Fault_Category` columns for each input row, providing direct insight into the outcome for each entry.
 #### 3. Developer-Friendly Logging
 
 *   For those contributing to the pipeline's codebase, there are now clearer guidelines (see [`README.md`](README.md) or [`USAGE.md`](USAGE.md)) on logging best practices, including how to effectively use the new `InputRowID`, `CompanyName`, and `file_identifier_prefix` in log messages.
@@ -63,9 +70,13 @@ The recent enhancements aim to make monitoring, debugging, and understanding pip
 
 ### What to Expect & How to Use the New System
 
-1.  **General Run Monitoring:** Start by checking the `run_metrics.md` file. It gives you a quick overview of the run's success, total rows processed, any global errors, and a summary of row-level failure types.
-2.  **Investigating Row-Specific Failures:**
-    *   If `run_metrics.md` indicates row failures, open the corresponding `failed_rows_{run_id}.csv` file.
+1.  **General Run Monitoring:** Start by checking the `run_metrics.md` file. It gives you a quick overview of the run's success, total rows processed, global errors, a summary of critical row-level failure types, and the new "Input Row Attrition Summary."
+2.  **Understanding Why Contacts Weren't Found (Attrition):**
+    *   Consult the "Input Row Attrition Summary" in `run_metrics.md` for a high-level view.
+    *   For detailed information on each input row that didn't yield a contact, open the `row_attrition_report_{run_id}.csv`. This report will give you the specific `Final_Row_Outcome_Reason` and `Determined_Fault_Category`.
+    *   The `Final_Row_Outcome_Reason` will also be present in your main output Excel (e.g., `phone_validation_output_{RunID}.xlsx`).
+3.  **Investigating Critically Failed Rows:**
+    *   If `run_metrics.md` (Summary of Row-Level Failures) or the `failed_rows_{run_id}.csv` indicates critical processing errors for specific rows, open `failed_rows_{run_id}.csv`.
     *   Use `CompanyName`, `GivenURL`, and `stage_of_failure` to understand which rows failed and why.
     *   For more context, use the `log_timestamp` from the CSV to locate the detailed error messages in the main `.log` file (e.g., `pipeline_run_{run_id}.log`).
 3.  **Deep Dive Debugging:**

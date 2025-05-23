@@ -29,6 +29,24 @@ EXCLUDED_TYPES_FOR_TOP_CONTACTS_REPORT: Set[str] = {
 logger = logging.getLogger(__name__) 
 app_config: AppConfig = AppConfig()
 
+FAULT_CATEGORY_MAP_DEFINITION: Dict[str, str] = {
+    "Input_URL_Invalid": "Input Data Issue",
+    "Input_URL_UnsupportedScheme": "Input Data Issue",
+    "Scraping_AllAttemptsFailed_Network": "Website Issue",
+    "Scraping_AllAttemptsFailed_AccessDenied": "Website Issue",
+    "Scraping_ContentNotFound_AllAttempts": "Website Issue",
+    "Scraping_Success_NoRelevantContentPagesFound": "Website Issue",
+    "Canonical_Duplicate_SkippedProcessing": "Pipeline Logic/Configuration",
+    "Canonical_NoRegexCandidatesFound": "Pipeline Logic/Configuration",
+    "LLM_NoInput_NoRegexCandidates": "Pipeline Logic/Configuration",
+    "LLM_Output_NoNumbersFound_AllAttempts": "LLM Issue",
+    "LLM_Output_NumbersFound_NoneRelevant_AllAttempts": "LLM Issue",
+    "LLM_Processing_Error_AllAttempts": "LLM Issue",
+    "DataConsolidation_Error_ForRow": "Pipeline Error",
+    "Pipeline_Skipped_MaxRedirects_ForInputURL": "Website Issue",
+    "Pipeline_Skipped_PreviouslyFailedInput": "Pipeline Logic/Configuration", # For future use
+    "Unknown_Processing_Gap_NoContact": "Unknown"
+}
 INPUT_FILE_PATH: str = app_config.input_excel_file_path
 if not os.path.isabs(INPUT_FILE_PATH):
     project_root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,6 +96,115 @@ def log_row_failure(
     else:
         logger.warning(f"Attempted to log row failure but failure_log_writer is None. Row ID: {input_row_identifier}, Stage: {stage_of_failure}, Timestamp: {log_timestamp}")
 
+
+def _determine_final_row_outcome_and_fault(
+    index: Any,
+    row_summary: pd.Series,
+    df_status_snapshot: Dict[str, Any], # Pass relevant df statuses for this row
+    company_contact_details_summary: Optional[CompanyContactDetails],
+    unique_sorted_consolidated_numbers: List[ConsolidatedPhoneNumber],
+    canonical_url_summary: Optional[str], # This is the true_base_domain for the input row
+    true_base_scraper_status_map: Dict[str, str], # Map of true_base_domain to its overall scraper status
+    true_base_to_pathful_map: Dict[str, List[str]],
+    canonical_site_pathful_scraper_status: Dict[str, str], # Map of pathful_url to its scraper status
+    canonical_site_raw_llm_outputs: Dict[str, List[PhoneNumberLLMOutput]],
+    canonical_site_regex_candidates_found_status: Dict[str, bool], # New
+    canonical_site_llm_exception_details: Dict[str, str] # New: For specific LLM error messages
+) -> Tuple[str, str]:
+    """
+    Determines the final outcome reason for an input row and its fault category.
+    """
+    # Priority 1: Initial Input URL issues (from earlier in the loop)
+    # df_status_snapshot should contain 'ScrapingStatus' set during initial URL processing for the row
+    initial_row_scrape_status = df_status_snapshot.get('ScrapingStatus', '')
+    if initial_row_scrape_status == 'InvalidURL': # This status is set if URL is fundamentally unprocessable
+        return "Input_URL_Invalid", FAULT_CATEGORY_MAP_DEFINITION["Input_URL_Invalid"]
+    if initial_row_scrape_status == 'MaxRedirects_InputURL': # Assuming this status is set if max redirects hit for input
+        return "Pipeline_Skipped_MaxRedirects_ForInputURL", FAULT_CATEGORY_MAP_DEFINITION["Pipeline_Skipped_MaxRedirects_ForInputURL"]
+    # Add other direct input URL failure checks here if they are set on df.at[index, 'ScrapingStatus'] early
+
+    # If a contact was successfully extracted for this input row's canonical URL
+    if unique_sorted_consolidated_numbers:
+        return "Contact_Successfully_Extracted", "N/A"
+
+    # If no canonical URL was determined for the input row (e.g., initial URL was invalid and didn't even lead to a scrape attempt)
+    if not canonical_url_summary:
+        # This case should ideally be caught by initial_row_scrape_status checks.
+        # If it wasn't (e.g. scraper returned no canonical_url but status wasn't 'InvalidURL'),
+        # it's a gap or a specific type of scraping failure for the input.
+        if initial_row_scrape_status and initial_row_scrape_status != "Success" and initial_row_scrape_status != "Not_Run":
+             # Use a more specific scraping failure if available from the initial pass
+            return f"ScrapingFailure_InputURL_{initial_row_scrape_status}", FAULT_CATEGORY_MAP_DEFINITION.get(f"Scraping_AllAttemptsFailed_Network", "Website Issue") # Default category
+        return "Unknown_NoCanonicalURLDetermined", FAULT_CATEGORY_MAP_DEFINITION["Unknown_Processing_Gap_NoContact"]
+
+
+    # Check status of the canonical URL
+    scraper_status_for_true_base = true_base_scraper_status_map.get(canonical_url_summary, "Unknown")
+
+    if scraper_status_for_true_base != "Success":
+        # Determine more specific scraping failure for the canonical URL
+        # This requires inspecting canonical_site_pathful_scraper_status for all pathfuls under canonical_url_summary
+        pathful_urls_for_canonical = true_base_to_pathful_map.get(canonical_url_summary, [])
+        all_network_fail = True
+        all_access_denied = True
+        all_not_found = True
+        if not pathful_urls_for_canonical: # No pathful URLs means scraping didn't really happen for this canonical
+             return "Scraping_NoPathfulURLs_ForCanonical", FAULT_CATEGORY_MAP_DEFINITION.get("Scraping_AllAttemptsFailed_Network", "Website Issue")
+
+
+        for p_url in pathful_urls_for_canonical:
+            p_status = canonical_site_pathful_scraper_status.get(p_url, "Unknown")
+            if "Timeout" not in p_status and "DNS" not in p_status and "Network" not in p_status and "Unreachable" not in p_status : all_network_fail = False
+            if "403" not in p_status and "AccessDenied" not in p_status and "Robots" not in p_status: all_access_denied = False
+            if "404" not in p_status and "NotFound" not in p_status : all_not_found = False
+        
+        if all_network_fail: return "Scraping_AllAttemptsFailed_Network", FAULT_CATEGORY_MAP_DEFINITION["Scraping_AllAttemptsFailed_Network"]
+        if all_access_denied: return "Scraping_AllAttemptsFailed_AccessDenied", FAULT_CATEGORY_MAP_DEFINITION["Scraping_AllAttemptsFailed_AccessDenied"]
+        if all_not_found: return "Scraping_ContentNotFound_AllAttempts", FAULT_CATEGORY_MAP_DEFINITION["Scraping_ContentNotFound_AllAttempts"]
+        # Fallback generic scrape failure for canonical if not fitting above
+        return f"ScrapingFailed_Canonical_{scraper_status_for_true_base}", FAULT_CATEGORY_MAP_DEFINITION.get("Scraping_AllAttemptsFailed_Network", "Website Issue")
+
+
+    # Scraping for canonical was "Success", now check LLM stages
+    if initial_row_scrape_status and "Already_Processed" in initial_row_scrape_status: # Check if this input row led to an already processed canonical
+        return "Canonical_Duplicate_SkippedProcessing", FAULT_CATEGORY_MAP_DEFINITION["Canonical_Duplicate_SkippedProcessing"]
+
+    # company_contact_details_summary is for the canonical_url_summary
+
+    # Check if regex found candidates for this canonical URL
+    if not canonical_site_regex_candidates_found_status.get(canonical_url_summary, False): # Default to False if missing
+        return "Canonical_NoRegexCandidatesFound", FAULT_CATEGORY_MAP_DEFINITION["Canonical_NoRegexCandidatesFound"]
+
+    # Regex candidates were found, so LLM should have been attempted or an error occurred
+    if company_contact_details_summary is None:
+        # This implies an LLM error for the canonical, or prompt missing
+        if scraper_status_for_true_base == "Error_LLM_PromptMissing":
+            return "LLM_Processing_Error_AllAttempts", FAULT_CATEGORY_MAP_DEFINITION["LLM_Processing_Error_AllAttempts"] # Consider specific "LLM_Prompt_Missing_For_Canonical"
+        if scraper_status_for_true_base == "Error_LLM_Processing":
+            return "LLM_Processing_Error_AllAttempts", FAULT_CATEGORY_MAP_DEFINITION["LLM_Processing_Error_AllAttempts"]
+        # If it reached here, it means regex had candidates, but LLM processing didn't result in a CompanyContactDetails object
+        # and it wasn't a logged LLM error for the canonical. This is unusual.
+        return "LLM_NoInput_NoRegexCandidates", FAULT_CATEGORY_MAP_DEFINITION["LLM_NoInput_NoRegexCandidates"] # This might be miscategorized now, more like an unknown LLM issue
+
+    # company_contact_details_summary exists, but no consolidated_numbers (LLM ran, results empty or all filtered)
+    if not company_contact_details_summary.consolidated_numbers: # Removed redundant company_contact_details_summary check
+        # Differentiate based on whether raw LLM output was empty vs. filtered
+        all_raw_llm_empty_for_canonical = True
+        pathful_urls_for_canonical = true_base_to_pathful_map.get(canonical_url_summary, [])
+        if not pathful_urls_for_canonical: # Should not happen if scrape was success
+            all_raw_llm_empty_for_canonical = True
+        else:
+            for p_url in pathful_urls_for_canonical:
+                if canonical_site_raw_llm_outputs.get(p_url): # If any pathful URL had non-empty raw LLM output list
+                    all_raw_llm_empty_for_canonical = False
+                    break
+        
+        if all_raw_llm_empty_for_canonical:
+            return "LLM_Output_NoNumbersFound_AllAttempts", FAULT_CATEGORY_MAP_DEFINITION["LLM_Output_NoNumbersFound_AllAttempts"]
+        else:
+            return "LLM_Output_NumbersFound_NoneRelevant_AllAttempts", FAULT_CATEGORY_MAP_DEFINITION["LLM_Output_NumbersFound_NoneRelevant_AllAttempts"]
+
+    return "Unknown_Processing_Gap_NoContact", FAULT_CATEGORY_MAP_DEFINITION["Unknown_Processing_Gap_NoContact"]
 
 def main() -> None:
     pipeline_start_time = time.time() 
@@ -199,13 +326,13 @@ def main() -> None:
             logger.error(f"Failed to load data from {INPUT_FILE_PATH}. DataFrame is None.")
             run_metrics["errors_encountered"].append(f"Data loading failed: DataFrame is None from {INPUT_FILE_PATH}")
             run_metrics["tasks"]["load_and_preprocess_data_duration_seconds"] = time.time() - task_start_time
-            write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time)
+            write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, []) # Pass empty list
             return
     except Exception as e:
         logger.error(f"Error loading data in main: {e}", exc_info=True)
         run_metrics["errors_encountered"].append(f"Data loading exception: {str(e)}")
         run_metrics["tasks"]["load_and_preprocess_data_duration_seconds"] = time.time() - task_start_time
-        write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time)
+        write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, []) # Pass empty list
         return
     run_metrics["tasks"]["load_and_preprocess_data_duration_seconds"] = time.time() - task_start_time
 
@@ -244,19 +371,22 @@ def main() -> None:
         df['GivenPhoneNumber'] = None
     if 'Description' not in df.columns:
         df['Description'] = None
-
+        df['Final_Row_Outcome_Reason'] = pd.Series([None] * len(df), dtype=object)
+        df['Determined_Fault_Category'] = pd.Series([None] * len(df), dtype=object)
 
     globally_processed_urls: Set[str] = set() 
     all_flattened_rows: List[Dict[str, Any]] = [] 
     all_tertiary_rows: List[Dict[str, Any]] = [] 
     canonical_site_raw_llm_outputs: Dict[str, List[PhoneNumberLLMOutput]] = {}
     canonical_site_pathful_scraper_status: Dict[str, str] = {}
-    input_to_canonical_map: Dict[str, Optional[str]] = {} 
+    input_to_canonical_map: Dict[str, Optional[str]] = {}
+    canonical_site_regex_candidates_found_status: Dict[str, bool] = {} # New: Track if regex found candidates for a canonical
+    canonical_site_llm_exception_details: Dict[str, str] = {} # New: Store specific LLM exception details
  
     pass1_loop_start_time = time.time()
     rows_processed_in_pass1 = 0
-    rows_failed_in_pass1 = 0 
-
+    rows_failed_in_pass1 = 0
+    attrition_data_list: List[Dict[str, Any]] = [] # For Row Attrition Report
     row_level_failure_counts: Dict[str, int] = {} # Initialize counter for stage_of_failure
 
     with open(failure_log_csv_path, 'w', newline='', encoding='utf-8') as f_failure_log:
@@ -463,9 +593,12 @@ def main() -> None:
                             if all_candidate_items_for_llm:
                                 run_metrics["regex_extraction_stats"]["sites_with_regex_candidates"] += 1
                                 run_metrics["regex_extraction_stats"]["total_regex_candidates_found"] += len(all_candidate_items_for_llm)
-                            logger.info(f"[RowID: {index}, Company: {company_name}] Generated {len(all_candidate_items_for_llm)} candidate items for LLM for canonical URL {final_canonical_entry_url}.")
+                                canonical_site_regex_candidates_found_status[final_canonical_entry_url] = True
+                            else:
+                                canonical_site_regex_candidates_found_status[final_canonical_entry_url] = False
+                            logger.info(f"[RowID: {index}, Company: {company_name}] Generated {len(all_candidate_items_for_llm)} candidate items for LLM for canonical URL {final_canonical_entry_url}. Regex candidates found: {canonical_site_regex_candidates_found_status[final_canonical_entry_url]}.")
      
-                        if all_candidate_items_for_llm:
+                        if canonical_site_regex_candidates_found_status.get(final_canonical_entry_url, False): # Check if regex found candidates
                             run_metrics["llm_processing_stats"]["sites_processed_for_llm"] += 1
                             llm_task_start_time = time.time()
                             try:
@@ -545,6 +678,10 @@ def main() -> None:
                                 logger.error(f"[RowID: {index}, Company: {company_name}] Error during LLM processing for pathful canonical {final_canonical_entry_url}: {llm_exc}", exc_info=True)
                                 canonical_site_raw_llm_outputs[final_canonical_entry_url] = []
                                 canonical_site_pathful_scraper_status[final_canonical_entry_url] = "Error_LLM_Processing"
+                                # Capture the exception detail for the attrition report
+                                exception_type_name = type(llm_exc).__name__
+                                exception_message_str = str(llm_exc)
+                                canonical_site_llm_exception_details[final_canonical_entry_url] = f"{exception_type_name}: {exception_message_str}"
                                 run_metrics["llm_processing_stats"]["llm_calls_failure_processing_error"] += 1
                                 run_metrics["errors_encountered"].append(f"LLM processing error for {final_canonical_entry_url}: {str(llm_exc)}")
                                 log_row_failure(
@@ -566,11 +703,17 @@ def main() -> None:
 
                                 run_metrics["tasks"].setdefault("llm_extraction_total_duration_seconds", 0)
                                 run_metrics["tasks"]["llm_extraction_total_duration_seconds"] += (time.time() - llm_task_start_time)
-                        else: # Corresponds to 'if all_candidate_items_for_llm:'
-                            logger.info(f"[RowID: {index}, Company: {company_name}] No candidate snippets for LLM from pathful canonical {final_canonical_entry_url}. Storing empty LLM result.")
-                            canonical_site_raw_llm_outputs[final_canonical_entry_url] = []
-                            canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status
-                            run_metrics["llm_processing_stats"]["llm_no_candidates_to_process"] += 1
+                        else: # Corresponds to 'if canonical_site_regex_candidates_found_status.get(final_canonical_entry_url, False):'
+                            logger.info(f"[RowID: {index}, Company: {company_name}] No regex candidate snippets for LLM from pathful canonical {final_canonical_entry_url}. Storing empty LLM result, LLM not called.")
+                            canonical_site_raw_llm_outputs[final_canonical_entry_url] = [] # Ensure it's an empty list
+                            canonical_site_pathful_scraper_status[final_canonical_entry_url] = current_row_scraper_status # Preserve scraper status
+                            # Ensure llm_no_candidates_to_process is incremented if this canonical URL was new
+                            # and would have been processed by LLM if candidates existed.
+                            # This metric might need to be site-based rather than call-based if not already.
+                            # For now, this correctly reflects that LLM was not called due to no candidates.
+                            if final_canonical_entry_url not in run_metrics["llm_processing_stats"].get("sites_already_attempted_llm_or_skipped", set()):
+                                run_metrics["llm_processing_stats"]["llm_no_candidates_to_process"] += 1
+                                run_metrics["llm_processing_stats"].setdefault("sites_already_attempted_llm_or_skipped", set()).add(final_canonical_entry_url)
                     else: 
                         logger.info(f"[RowID: {index}, Company: {company_name}] Raw LLM data for pathful canonical URL {final_canonical_entry_url} already cached. Input row {given_url_original} maps to it.")
                 
@@ -893,23 +1036,31 @@ def main() -> None:
 
 
     for index, row_summary in df.iterrows():
-        given_url_summary = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
-        canonical_url_summary = row_summary.get('CanonicalEntryURL')
-        scraper_status_summary_original_pass1 = row_summary.get('ScrapingStatus')
+        # Preserve original values needed by the helper or for other logic
+        given_url_original_for_attrition = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else ""
+        company_name_for_attrition = str(row_summary.get('CompanyName', f"Row_{index}"))
+        canonical_url_summary = row_summary.get('CanonicalEntryURL') # This is the true_base_domain
+
+        # Snapshot of relevant df statuses for this row before they might be overwritten
+        df_status_snapshot_for_helper = {
+            'ScrapingStatus': row_summary.get('ScrapingStatus'), # Initial scrape status for the input URL
+            # Add other df statuses if _determine_final_row_outcome_and_fault needs them
+        }
 
         company_contact_details_summary: Optional[CompanyContactDetails] = None
-        if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base: 
+        if canonical_url_summary and canonical_url_summary in final_consolidated_data_by_true_base:
             company_contact_details_summary = final_consolidated_data_by_true_base[canonical_url_summary]
 
         unique_sorted_consolidated_numbers: List[ConsolidatedPhoneNumber] = []
         if company_contact_details_summary:
             unique_sorted_consolidated_numbers = company_contact_details_summary.consolidated_numbers
 
+        # --- Populate Top Numbers (existing logic, kept for now) ---
         if len(unique_sorted_consolidated_numbers) > 0:
             top_item_1 = unique_sorted_consolidated_numbers[0]
             df.at[index, 'Top_Number_1'] = top_item_1.number
-            df.at[index, 'Top_Type_1'] = ", ".join(list(set(s.type for s in top_item_1.sources))) 
-            df.at[index, 'Top_SourceURL_1'] = ", ".join(list(set(s.original_full_url for s in top_item_1.sources))) 
+            df.at[index, 'Top_Type_1'] = ", ".join(list(set(s.type for s in top_item_1.sources)))
+            df.at[index, 'Top_SourceURL_1'] = ", ".join(list(set(s.original_full_url for s in top_item_1.sources)))
         if len(unique_sorted_consolidated_numbers) > 1:
             top_item_2 = unique_sorted_consolidated_numbers[1]
             df.at[index, 'Top_Number_2'] = top_item_2.number
@@ -920,99 +1071,100 @@ def main() -> None:
             df.at[index, 'Top_Number_3'] = top_item_3.number
             df.at[index, 'Top_Type_3'] = ", ".join(list(set(s.type for s in top_item_3.sources)))
             df.at[index, 'Top_SourceURL_3'] = ", ".join(list(set(s.original_full_url for s in top_item_3.sources)))
+        # --- End Populate Top Numbers ---
 
+        # --- Determine Final Row Outcome Reason and Fault Category ---
+        final_reason, fault_category = _determine_final_row_outcome_and_fault(
+            index=index,
+            row_summary=row_summary,
+            df_status_snapshot=df_status_snapshot_for_helper,
+            company_contact_details_summary=company_contact_details_summary,
+            unique_sorted_consolidated_numbers=unique_sorted_consolidated_numbers,
+            canonical_url_summary=canonical_url_summary,
+            true_base_scraper_status_map=true_base_scraper_status,
+            true_base_to_pathful_map=true_base_to_pathful_map,
+            canonical_site_pathful_scraper_status=canonical_site_pathful_scraper_status,
+            canonical_site_raw_llm_outputs=canonical_site_raw_llm_outputs,
+            canonical_site_regex_candidates_found_status=canonical_site_regex_candidates_found_status, # Pass new dict
+            canonical_site_llm_exception_details=canonical_site_llm_exception_details # Pass new dict
+        )
+        df.at[index, 'Final_Row_Outcome_Reason'] = final_reason
+        df.at[index, 'Determined_Fault_Category'] = fault_category
+
+        # --- Log the determined outcome for the input row ---
+        if final_reason != "Contact_Successfully_Extracted":
+            logger.info(
+                f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason} (Fault: {fault_category}). GivenURL: '{given_url_original_for_attrition}'"
+            )
+            # --- Populate Attrition Data List ---
+            attrition_data_list.append({
+                "InputRowID": index,
+                "CompanyName": company_name_for_attrition,
+                "GivenURL": given_url_original_for_attrition,
+                "Final_Row_Outcome_Reason": final_reason,
+                "Determined_Fault_Category": fault_category,
+                "Relevant_Canonical_URLs": canonical_url_summary if canonical_url_summary else "N/A",
+                "LLM_Error_Detail_Summary": canonical_site_llm_exception_details.get(str(canonical_url_summary), "") if canonical_url_summary and fault_category == "LLM Issue" and "Error" in final_reason else "",
+                "Timestamp_Of_Determination": datetime.now().isoformat()
+            })
+        else:
+             logger.info(
+                f"[RowID: {index}, Company: {company_name_for_attrition}] Input row outcome: {final_reason}. GivenURL: '{given_url_original_for_attrition}'"
+            )
+
+
+        # --- Original_Number_Status logic (kept for now, might be simplified later) ---
         original_norm_phone_summary = row_summary.get('NormalizedGivenPhoneNumber')
-        found_original_in_top_llm = False
         if original_norm_phone_summary and original_norm_phone_summary != "InvalidFormat":
-            for top_num_item in unique_sorted_consolidated_numbers[:3]: 
+            found_original_in_top_llm = False
+            for top_num_item in unique_sorted_consolidated_numbers[:3]:
                 if top_num_item.number == original_norm_phone_summary:
                     found_original_in_top_llm = True
                     break
-        
-        if original_norm_phone_summary and original_norm_phone_summary != "InvalidFormat":
             if found_original_in_top_llm:
                 df.at[index, 'Original_Number_Status'] = 'Verified'
-            elif unique_sorted_consolidated_numbers: 
+            elif unique_sorted_consolidated_numbers:
                 df.at[index, 'Original_Number_Status'] = 'Corrected'
-            elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers:
-                 df.at[index, 'Original_Number_Status'] = 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' 
-            elif company_contact_details_summary: 
-                 df.at[index, 'Original_Number_Status'] = 'No Relevant Match Found by LLM' 
-            else: 
-                 df.at[index, 'Original_Number_Status'] = 'LLM_Not_Run_Or_NoOutput_For_Canonical'
+            # The following conditions are now largely covered by Final_Row_Outcome_Reason
+            # We might simplify this or make it dependent on Final_Row_Outcome_Reason
+            elif final_reason == "LLM_Output_NoNumbersFound_AllAttempts" or final_reason == "LLM_Output_NumbersFound_NoneRelevant_AllAttempts":
+                 df.at[index, 'Original_Number_Status'] = 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' # Keep old status for compatibility if needed
+            elif final_reason.startswith("LLM_NoInput") or final_reason.startswith("LLM_Processing_Error") or final_reason.startswith("ScrapingFailed_Canonical") or final_reason == "Unknown_NoCanonicalURLDetermined":
+                 df.at[index, 'Original_Number_Status'] = 'LLM_Not_Run_Or_NoOutput_For_Canonical' # Keep old status
+            else: # Fallback if original phone was provided but no LLM match and not covered above
+                 df.at[index, 'Original_Number_Status'] = 'No Relevant Match Found by LLM'
+
         elif original_norm_phone_summary == "InvalidFormat":
             df.at[index, 'Original_Number_Status'] = 'Original_InvalidFormat'
-        else: 
+        else:
             df.at[index, 'Original_Number_Status'] = 'Original_Not_Provided'
-            if df.at[index, 'Original_Number_Status'] == 'LLM_Not_Run_Or_NoOutput_For_Canonical' and canonical_url_summary:
-                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
-                specific_reasons = [
-                    f"{pathful_url}: {canonical_site_pathful_scraper_status.get(pathful_url, 'Status_Unknown')}"
-                    for pathful_url in pathful_urls_for_true_base
-                ]
-                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Original_Number_Status set to LLM_Not_Run_Or_NoOutput_For_Canonical for true_base '{canonical_url_summary}'. Contributing pathful statuses: {'; '.join(specific_reasons) if specific_reasons else 'No specific pathful statuses found.'}")
-            elif df.at[index, 'Original_Number_Status'] == 'LLM_OutputEmpty_Or_NoRelevant_For_Canonical' and canonical_url_summary:
-                all_raw_llm_empty_for_base = True
-                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
-                if not pathful_urls_for_true_base: # No pathful URLs means no LLM data could have been fetched
-                     all_raw_llm_empty_for_base = True # Treat as if LLM returned nothing
-                else:
-                    for pathful_url in pathful_urls_for_true_base:
-                        if canonical_site_raw_llm_outputs.get(pathful_url): # If any pathful URL had non-empty raw output
-                            all_raw_llm_empty_for_base = False
-                            break
-                reason_for_empty = "LLM returned no raw candidates for any constituent pathful URLs." if all_raw_llm_empty_for_base else "LLM returned raw candidates, but all were filtered out by data_handler or other post-processing."
-                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Original_Number_Status set to LLM_OutputEmpty_Or_NoRelevant_For_Canonical for true_base '{canonical_url_summary}'. Reason: {reason_for_empty}")
+        # --- End Original_Number_Status logic ---
 
+        # --- Overall_VerificationStatus logic (kept for now, review for simplification later) ---
+        # This logic might be redundant or can be derived from Final_Row_Outcome_Reason
         overall_status = "Unverified"
         scraper_status_for_true_base_domain_summary = true_base_scraper_status.get(str(canonical_url_summary), "Unknown") if canonical_url_summary else "Unknown_NoTrueBase"
 
-        if scraper_status_for_true_base_domain_summary != "Success":
-            overall_status = f"Unverified_Scrape_{scraper_status_for_true_base_domain_summary}"
-            if canonical_url_summary: # Log for scrape failures affecting canonical
-                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
-                specific_reasons = [
-                    f"{pathful_url}: {canonical_site_pathful_scraper_status.get(pathful_url, 'Status_Unknown')}"
-                    for pathful_url in pathful_urls_for_true_base
-                ]
-                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. Contributing pathful statuses: {'; '.join(specific_reasons) if specific_reasons else 'No specific pathful statuses found.'}")
-        elif unique_sorted_consolidated_numbers:
+        if final_reason == "Contact_Successfully_Extracted":
             overall_status = "Verified_LLM_Match_Found"
-        elif company_contact_details_summary and not company_contact_details_summary.consolidated_numbers:
+        elif final_reason.startswith("ScrapingFailed_Canonical") or final_reason == "Scraping_AllAttemptsFailed_Network" or final_reason == "Scraping_AllAttemptsFailed_AccessDenied" or final_reason == "Scraping_ContentNotFound_AllAttempts":
+            overall_status = f"Unverified_Scrape_{scraper_status_for_true_base_domain_summary}"
+        elif final_reason == "LLM_Output_NumbersFound_NoneRelevant_AllAttempts" or final_reason == "LLM_Output_NoNumbersFound_AllAttempts":
             overall_status = "Unverified_LLM_NoRelevantNumbers"
-            if canonical_url_summary: # Log for LLM_OutputEmpty_Or_NoRelevant
-                all_raw_llm_empty_for_base = True
-                pathful_urls_for_true_base = true_base_to_pathful_map.get(canonical_url_summary, [])
-                if not pathful_urls_for_true_base:
-                    all_raw_llm_empty_for_base = True
-                else:
-                    for pathful_url in pathful_urls_for_true_base:
-                        if canonical_site_raw_llm_outputs.get(pathful_url):
-                            all_raw_llm_empty_for_base = False
-                            break
-                reason_for_empty = "LLM returned no raw candidates for any constituent pathful URLs." if all_raw_llm_empty_for_base else "LLM returned raw candidates, but all were filtered out by data_handler or other post-processing."
-                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. Reason: {reason_for_empty}")
-        elif scraper_status_for_true_base_domain_summary == "Error_LLM_Processing":
+        elif final_reason == "LLM_Processing_Error_AllAttempts": # Covers prompt missing too if helper sets it
             overall_status = "Error_LLM_Processing_For_Canonical"
-            if canonical_url_summary:
-                 logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. Check LLM processing logs for this canonical.")
-        elif scraper_status_for_true_base_domain_summary == "Error_LLM_PromptMissing":
-            overall_status = "Error_LLM_PromptMissing_For_Canonical"
-            if canonical_url_summary:
-                logger.warning(f"[RowID: {index}, Company: {str(row_summary.get('CompanyName', f'Row_{index}'))}] Overall_VerificationStatus is '{overall_status}' for true_base '{canonical_url_summary}'. LLM prompt template was missing.")
-        
-        original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
-        true_base_domain_from_map = input_to_canonical_map.get(original_input_url_for_map)
+        # Add more mappings from final_reason to overall_status if needed
 
+        original_input_url_for_map = str(row_summary.get('GivenURL')) if row_summary.get('GivenURL') is not None else "None_GivenURL_Input"
         normalized_original_input_base = get_canonical_base_url(original_input_url_for_map, log_level_for_non_domain_input=logging.INFO) if original_input_url_for_map != "None_GivenURL_Input" else None
         
         if canonical_url_summary and normalized_original_input_base and normalized_original_input_base != canonical_url_summary:
-            overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
+            if overall_status != "Verified_LLM_Match_Found" or not overall_status.startswith("RedirectedTo"): # Avoid double prefix
+                 overall_status = f"RedirectedTo[{canonical_url_summary}]_" + overall_status
         
         df.at[index, 'Overall_VerificationStatus'] = overall_status
-        df.at[index, 'ScrapingStatus_Canonical'] = scraper_status_for_true_base_domain_summary 
-        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None else scraper_status_for_true_base_domain_summary
-
+        df.at[index, 'ScrapingStatus_Canonical'] = scraper_status_for_true_base_domain_summary
+        df.at[index, 'LLM_Processing_Status_Canonical'] = "Processed" if company_contact_details_summary is not None and unique_sorted_consolidated_numbers else scraper_status_for_true_base_domain_summary
 
     if all_flattened_rows:
         df_detailed_flattened = pd.DataFrame(all_flattened_rows)
@@ -1139,8 +1291,13 @@ def main() -> None:
         logger.info("No data for tertiary report. Skipping file creation.")
     run_metrics["report_generation_stats"]["tertiary_report_rows"] = len(all_tertiary_rows)
     run_metrics["tasks"]["pass2_report_generation_duration_seconds"] = time.time() - pass2_reports_start_time
+    
+    # Write Row Attrition Report before final metrics
+    num_attrition_rows = write_row_attrition_report(run_id, attrition_data_list, run_output_dir)
+    # Potentially add num_attrition_rows to run_metrics if needed for summary in run_metrics.md
+    run_metrics["data_processing_stats"]["rows_in_attrition_report"] = num_attrition_rows
  
-    write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time)
+    write_run_metrics(run_metrics, run_output_dir, run_id, pipeline_start_time, attrition_data_list)
 
     logger.info("Attempting to generate 'Final Processed Contacts' report...")
     if os.path.exists(tertiary_output_excel_path):
@@ -1160,7 +1317,55 @@ def main() -> None:
     logger.info(f"Run metrics file created at: {os.path.join(run_output_dir, f'run_metrics_{run_id}.md')}")
 
 
-def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pipeline_start_time: float) -> None:
+def write_row_attrition_report(run_id: str, attrition_data: List[Dict[str, Any]], output_dir: str) -> int:
+    """Writes the collected row attrition data to an Excel file with auto-width columns."""
+    if not attrition_data:
+        logger.info("No data for row attrition report. Skipping file creation.")
+        return 0
+
+    report_filename = f"row_attrition_report_{run_id}.xlsx"
+    report_path = os.path.join(output_dir, report_filename)
+    report_df = pd.DataFrame(attrition_data)
+    
+    # Ensure consistent column order, including LLM_Error_Detail_Summary
+    columns_order = [
+        "InputRowID", "CompanyName", "GivenURL",
+        "Final_Row_Outcome_Reason", "Determined_Fault_Category",
+        "Relevant_Canonical_URLs", "LLM_Error_Detail_Summary", # Added
+        "Timestamp_Of_Determination"
+    ]
+    
+    # Add any missing columns to the DataFrame with None, and reorder
+    for col in columns_order:
+        if col not in report_df.columns:
+            report_df[col] = None # Initialize missing columns with None
+    report_df = report_df[columns_order]
+
+    try:
+        with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+            report_df.to_excel(writer, index=False, sheet_name='Attrition_Report')
+            worksheet = writer.sheets['Attrition_Report']
+            for col_idx, col_name in enumerate(report_df.columns):
+                series_data = report_df.iloc[:, col_idx]
+                if series_data.empty:
+                    max_val_len = 0
+                else:
+                    # Ensure all data is string for length calculation
+                    lengths = series_data.astype(str).map(len)
+                    max_val_len = lengths.max() if not lengths.empty else 0
+                
+                column_header_len = len(str(col_name))
+                adjusted_width = max(max_val_len, column_header_len) + 2 # Add a little padding
+                worksheet.column_dimensions[get_column_letter(col_idx + 1)].width = adjusted_width
+        
+        logger.info(f"Row attrition report successfully saved to {report_path}")
+        return len(report_df)
+    except Exception as e: # Changed from IOError to general Exception for broader catch
+        logger.error(f"Failed to write row attrition report to {report_path}: {e}", exc_info=True)
+        return 0
+
+
+def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pipeline_start_time: float, attrition_data_list_for_metrics: List[Dict[str, Any]]) -> None:
     """Writes the collected run metrics to a Markdown file."""
     metrics["total_duration_seconds"] = time.time() - pipeline_start_time
     metrics_file_path = os.path.join(output_dir, f"run_metrics_{run_id}.md")
@@ -1347,6 +1552,41 @@ def write_run_metrics(metrics: Dict[str, Any], output_dir: str, run_id: str, pip
                     f.write(f"- {error_msg}\n")
             else:
                 f.write("- No significant global pipeline errors recorded.\n")
+            f.write("\n")
+
+            f.write("## Input Row Attrition Summary:\n")
+            if attrition_data_list_for_metrics:
+                total_input_rows = metrics.get("data_processing_stats", {}).get("input_rows_count", 0)
+                rows_not_yielding_contact = len(attrition_data_list_for_metrics)
+                rows_yielding_contact = total_input_rows - rows_not_yielding_contact
+
+                f.write(f"- **Total Input Rows Processed:** {total_input_rows}\n")
+                f.write(f"- **Input Rows Yielding at Least One Contact:** {rows_yielding_contact}\n")
+                f.write(f"- **Input Rows Not Yielding Any Contact:** {rows_not_yielding_contact}\n\n")
+
+                if rows_not_yielding_contact > 0:
+                    f.write("### Reasons for Non-Extraction (Fault Categories):\n")
+                    fault_category_counts: Dict[str, int] = {}
+                    for item in attrition_data_list_for_metrics:
+                        fault = item.get("Determined_Fault_Category", "Unknown")
+                        fault_category_counts[fault] = fault_category_counts.get(fault, 0) + 1
+                    
+                    for fault, count in sorted(fault_category_counts.items()):
+                        f.write(f"  - **{fault}:** {count}\n")
+                    f.write("\n")
+
+                    # Optional: Top N specific reasons
+                    # f.write("### Top Specific Reasons for Non-Extraction:\n")
+                    # specific_reason_counts: Dict[str, int] = {}
+                    # for item in attrition_data_list_for_metrics:
+                    #     reason = item.get("Final_Row_Outcome_Reason", "Unknown")
+                    #     specific_reason_counts[reason] = specific_reason_counts.get(reason, 0) + 1
+                    # sorted_reasons = sorted(specific_reason_counts.items(), key=lambda x: x[1], reverse=True)
+                    # for reason, count in sorted_reasons[:5]: # Top 5
+                    #    f.write(f"  - *{reason.replace('_', ' ').title()}:* {count}\n")
+                    # f.write("\n")
+            else:
+                f.write("- No input rows recorded in the attrition report (all rows presumably yielded contacts or failed critically before attrition tracking).\n")
             f.write("\n")
 
         logger.info(f"Run metrics successfully written to {metrics_file_path}")

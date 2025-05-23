@@ -24,9 +24,9 @@ The pipeline follows these main stages:
         *   **Summary Report** (`phone_validation_output_{RunID}.xlsx`): One row per original input entry, showing top numbers found for its corresponding true base domain and verification statuses.
         *   **Detailed LLM Extractions Report** (`All_LLM_Extractions_Report_{RunID}.xlsx`): Lists all unique phone numbers found by the LLM for each true base domain, with aggregated types and source URLs.
     *   **Run Metrics Report** (`run_metrics.md`): A Markdown file summarizing the overall health of the pipeline run, including processing statistics, global errors, and a hierarchical summary of row-level failures by stage.
-    *   **Failed Rows Report** (`failed_rows_{run_id}.csv`): A CSV file detailing rows that encountered errors during processing, including company information, the stage of failure, and specific error messages.
+    *   **Failed Rows Report** (`failed_rows_{run_id}.csv`): A CSV file detailing input rows that encountered critical processing errors that halted their progress, including company information, the stage of failure, and specific error messages.
+    *   **Row Attrition Report** (`row_attrition_report_{run_id}.csv`): A new CSV file detailing all input rows that did *not* result in a final extracted contact, providing specific reasons for non-extraction (e.g., `LLM_Output_NumbersFound_NoneRelevant_AllAttempts`, `Scraping_AllAttemptsFailed_Network`) and a fault category (e.g., "Website Issue", "LLM Issue"). This report helps track why input rows might be "lost" during the pipeline.
     Additionally, detailed (and now rotating) logs are created for traceability and debugging.
-
 ## Key Features & Technologies
 
 *   **Automated Phone Number Retrieval**: Scrapes websites and intelligently extracts phone numbers.
@@ -41,6 +41,7 @@ The pipeline follows these main stages:
     *   `Detailed_LLM_Extractions_Report`: Comprehensive log of all numbers found by LLM per true base domain.
 *   **Robust LLM Interaction**: Includes retry mechanisms for API calls to Google Gemini.
 *   **Enhanced Logging**: Features rotating log files, configurable log levels (for file and console via `CONSOLE_LOG_LEVEL` environment variable), and detailed contextual information in logs (e.g., `InputRowID`, `CompanyName`, `file_identifier_prefix`) to aid debugging.
+*   **Granular Outcome Reasons**: The main output Excel file (e.g., `phone_validation_output_{RunID}.xlsx`) now includes a `Final_Row_Outcome_Reason` column, providing specific explanations for rows that did not yield a contact.
 *   **Advanced Scraper Configuration**: Includes options like `SCRAPER_MAX_HIGH_PRIORITY_PAGES_AFTER_LIMIT` for fine-tuned scraping.
 *   **Highly Configurable**: Behavior can be customized extensively via a `.env` file.
 *   **Configurable Filename Lengths**: Prevents path length errors by allowing configuration of company name length in output filenames.
@@ -88,8 +89,9 @@ phone_validation_pipeline/
 └── output_data/           # Default directory for pipeline outputs (created on run)
     └── [RunID]/           # Outputs for a specific pipeline run (e.g., 20240520_110000)
         ├── pipeline_run_{RunID}.log # Main, rotating log file for the run
-        ├── run_metrics.md           # Run metrics and failure summary report
-        ├── failed_rows_{RunID}.csv  # Detailed report of rows that failed processing
+        ├── run_metrics.md           # Run metrics, failure summary, and input row attrition summary
+        ├── failed_rows_{RunID}.csv  # Detailed report of rows that critically failed processing
+        ├── row_attrition_report_{RunID}.csv # New: Report detailing why input rows didn't yield contacts
         ├── scraped_content/
         │   └── cleaned_pages_text/  # Cleaned text from scraped pages
         ├── llm_context/
@@ -154,6 +156,7 @@ This script will:
     *   The Detailed LLM Extractions Report (`All_LLM_Extractions_Report_{RunID}.xlsx`).
     *   The Run Metrics Report (`run_metrics.md`).
     *   The Failed Rows Report (`failed_rows_{RunID}.csv`).
+    *   The Row Attrition Report (`row_attrition_report_{RunID}.csv`).
     *   A comprehensive, rotating run log (`pipeline_run_{RunID}.log`).
     *   Subdirectories for scraped content and LLM context (prompts, raw responses).
 
